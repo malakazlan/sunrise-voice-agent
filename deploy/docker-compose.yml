@@ -1,14 +1,19 @@
 name: sunrise-voice-agent
 
-# Both services read the repo's .env. The postgres image takes POSTGRES_DB, POSTGRES_USER and
-# POSTGRES_PASSWORD from it, and the app takes the same values, so there is one set of database
-# credentials. Inside Compose the app always reaches the database as db:5432.
+# Run from the repo root: docker compose --env-file .env -f deploy/docker-compose.yml up --build
+#
+# The three database credentials are interpolated from --env-file .env (or the shell) and
+# Compose refuses to start without them. The db container receives only these three; the app
+# receives the same three plus the rest of .env, so there is one set of database credentials.
+x-database-credentials: &database-credentials
+  POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
+  POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set; pass --env-file .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set; pass --env-file .env}
+
 services:
   db:
     image: postgres:16
-    env_file:
-      - path: ../.env
-        required: false
+    environment: *database-credentials
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
@@ -27,6 +32,8 @@ services:
       - path: ../.env
         required: false
     environment:
+      <<: *database-credentials
+      # Inside Compose the app always reaches the database as db:5432.
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
     depends_on:

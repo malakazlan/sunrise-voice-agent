@@ -107,13 +107,22 @@ jobs:
             exit 1
           fi
           echo "no .env files under /app"
+      - name: Compose refuses to start without the database variables
+        run: |
+          code=0
+          output=$(docker compose -f deploy/docker-compose.yml config 2>&1) || code=$?
+          echo "$output" | tail -n 3
+          echo "exit code: $code"
+          test "$code" != "0"
+          echo "$output" | grep -q "required variable POSTGRES_PASSWORD is missing a value"
       - name: Write the Compose env file
         run: |
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
-            POSTGRES_DB=sunrise POSTGRES_USER=sunrise POSTGRES_PASSWORD=ci-compose-only > .env
+            POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
+            POSTGRES_PASSWORD=ci-compose-only-password-0001 > .env
       - name: Smoke test through Compose
         run: |
-          docker compose -f deploy/docker-compose.yml up -d --build
+          docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
           status=000
           for _ in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
@@ -125,10 +134,10 @@ jobs:
           docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          uid=$(docker compose -f deploy/docker-compose.yml exec -T app id -u)
+          uid=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
-          app=$(docker compose -f deploy/docker-compose.yml ps -q app)
+          app=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q app)
           health=none
           for _ in $(seq 1 30); do
             health=$(docker inspect --format '{{.State.Health.Status}}' "$app")
@@ -137,10 +146,32 @@ jobs:
           done
           echo "HEALTHCHECK -> $health"
           test "$health" = "healthy"
-          patients=$(docker compose -f deploy/docker-compose.yml exec -T db \
+          patients=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
             psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
           echo "patients: $patients"
           test "$patients" = "5"
+      - name: The db container holds only the database variables
+        run: |
+          db=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q db)
+          image=$(docker inspect --format '{{.Config.Image}}' "$db")
+          # Allowed: what the Postgres image sets itself, plus the three credentials.
+          {
+            docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image"
+            printf '%s\n' POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD=
+          } | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/allowed-env"
+          # Names only; values are never printed.
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$db" \
+            | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/db-env"
+          echo "db environment names: $(tr '\n' ' ' < "$RUNNER_TEMP/db-env")"
+          unexpected=$(comm -23 "$RUNNER_TEMP/db-env" "$RUNNER_TEMP/allowed-env")
+          if [ -n "$unexpected" ]; then
+            echo "unexpected variables in the db container: $unexpected"
+            exit 1
+          fi
+          for name in POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD; do
+            grep -qx "$name" "$RUNNER_TEMP/db-env"
+          done
+          echo "db environment holds only the database variables"
       - name: Container without APP_ENV must not start
         run: |
           code=0
@@ -161,4 +192,4 @@ jobs:
           done
       - name: Compose logs
         if: always()
-        run: docker compose -f deploy/docker-compose.yml logs || true
+        run: docker compose --env-file .env -f deploy/docker-compose.yml logs || true
