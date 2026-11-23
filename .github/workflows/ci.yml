@@ -179,15 +179,18 @@ jobs:
             grep -qx "$name" "$RUNNER_TEMP/db-env"
           done
           echo "db environment holds only the database variables"
-      - name: Postgres keeps row values out of its log
+      - name: Postgres logs no ERROR or WARNING lines, details or failing statements
         run: |
           show() {
             docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
               psql -U sunrise -d sunrise -tAc "SHOW $1"
           }
+          messages=$(show log_min_messages)
           verbosity=$(show log_error_verbosity)
           statements=$(show log_min_error_statement)
-          echo "log_error_verbosity=$verbosity log_min_error_statement=$statements"
+          echo "log_min_messages=$messages log_error_verbosity=$verbosity" \
+            "log_min_error_statement=$statements"
+          test "$messages" = "log"
           test "$verbosity" = "terse"
           test "$statements" = "panic"
       - name: Container without APP_ENV must not start

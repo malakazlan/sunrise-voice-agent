@@ -13,9 +13,18 @@ x-database-credentials: &database-credentials
 services:
   db:
     image: postgres:16
-    # Keep row values out of the server log: terse drops DETAIL (the failing row), HINT,
-    # QUERY and CONTEXT; panic stops the failing statement from being logged.
-    command: ["postgres", "-c", "log_error_verbosity=terse", "-c", "log_min_error_statement=panic"]
+    # Keep statement errors out of the server log, since their text can quote a value:
+    # log_min_messages=log drops ERROR and WARNING lines but keeps LOG, FATAL and PANIC (for
+    # example failed logins); terse drops DETAIL, HINT, QUERY and CONTEXT from what is still
+    # logged; panic stops the failing statement from being logged.
+    command:
+      - postgres
+      - -c
+      - log_min_messages=log
+      - -c
+      - log_error_verbosity=terse
+      - -c
+      - log_min_error_statement=panic
     environment: *database-credentials
     volumes:
       - db-data:/var/lib/postgresql/data
