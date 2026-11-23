@@ -16,7 +16,8 @@ All data used by this project is synthetic. No real customer or personal data is
   - A patient that is missing is inserted together with that patient's medications and
     appointment.
   - A patient that already exists is never changed, and nothing is added to it: no
-    medication or appointment is inserted for an existing patient, even one that was deleted.
+    medication or appointment is inserted for an existing patient, even if a medication or
+    appointment of that patient was deleted after an earlier seed.
   - Slots that are missing are added; existing slots are never changed.
   - Nothing is ever deleted. Only the last four digits of an SSN are stored.
 
