@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import VOICE_SECRETS
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -14,9 +15,21 @@ from app.main import create_app
 DOCS_PATHS = ["/docs", "/redoc", "/openapi.json"]
 
 
+def make_settings(app_env: AppEnv, log_level: LogLevel = "INFO") -> Settings:
+    if app_env == "dev":
+        return Settings(_env_file=None, app_env=app_env, log_level=log_level)
+    return Settings(
+        _env_file=None,
+        app_env=app_env,
+        log_level=log_level,
+        demo_access_token=VOICE_SECRETS["DEMO_ACCESS_TOKEN"],
+        turn_host=VOICE_SECRETS["TURN_HOST"],
+        turn_shared_secret=VOICE_SECRETS["TURN_SHARED_SECRET"],
+    )
+
+
 def make_client(app_env: AppEnv) -> TestClient:
-    settings = Settings(_env_file=None, app_env=app_env, log_level="INFO")
-    return TestClient(create_app(settings))
+    return TestClient(create_app(make_settings(app_env)))
 
 
 def test_health_returns_only_status() -> None:
@@ -45,7 +58,7 @@ def test_log_level_is_applied(log_level: LogLevel, expected: int) -> None:
     root = logging.getLogger()
     original = root.level
     try:
-        create_app(Settings(_env_file=None, app_env="prod", log_level=log_level))
+        create_app(make_settings("prod", log_level))
         assert root.level == expected
     finally:
         root.setLevel(original)
@@ -69,7 +82,7 @@ def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path
         module.create_app()
 
 
-@pytest.mark.usefixtures("clean_env")
+@pytest.mark.usefixtures("voice_env")
 def test_factory_reads_settings_from_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
