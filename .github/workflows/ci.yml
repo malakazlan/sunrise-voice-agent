@@ -114,7 +114,9 @@ jobs:
           echo "$output" | tail -n 3
           echo "exit code: $code"
           test "$code" != "0"
-          echo "$output" | grep -q "required variable POSTGRES_PASSWORD is missing a value"
+          # Compose versions differ: some stop at the first missing variable, others list all.
+          pattern="required variable (POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD) is missing a value"
+          echo "$output" | grep -Eq "$pattern"
       - name: Write the Compose env file
         run: |
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
