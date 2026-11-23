@@ -14,22 +14,22 @@ Nothing else is built yet.
 
 ## Configuration
 
-| Variable    | Allowed values                     | Default |
-|-------------|------------------------------------|---------|
-| `APP_ENV`   | `dev`, `demo`, `prod`              | `dev`   |
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO`  |
+| Variable    | Allowed values                      | Default        |
+|-------------|-------------------------------------|----------------|
+| `APP_ENV`   | `dev`, `demo`, `prod`               | none, required |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO`         |
 
-Copy `.env.example` to `.env` to override values. An invalid value stops startup.
-Environment variables take precedence over `.env`. When the app reads `.env` itself (the uv
-route below), a key in it that is not a setting also stops startup.
+Settings come from the environment or `.env`, and `APP_ENV` is required. An invalid or
+missing value stops startup. Environment variables take precedence over `.env`.
 
 ## Run locally with uv
 
 Requires [uv](https://docs.astral.sh/uv/).
 
 ```sh
+cp .env.example .env
 uv sync
-uv run uvicorn app.main:app --port 8000
+uv run uvicorn app.main:create_app --factory --port 8000
 curl http://127.0.0.1:8000/health
 ```
 
@@ -45,9 +45,7 @@ uv run pytest
 ## Run with Docker
 
 ```sh
+cp .env.example .env
 docker compose -f deploy/docker-compose.yml up --build
 curl http://127.0.0.1:8000/health
 ```
-
-Compose passes `.env` to the container as environment variables when the file exists. The
-image does not contain `.env`, so in this route an unknown key is not detected.
