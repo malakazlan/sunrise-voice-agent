@@ -17,14 +17,17 @@ class ClockSettings(Protocol):
 
 def is_open(at: datetime) -> bool:
     """Monday to Friday, 09:00 up to but not including 17:00, in clinic time."""
-    if at.tzinfo is None:
+    if at.utcoffset() is None:
         raise ValueError("is_open needs a timezone-aware datetime")
     local = at.astimezone(CLINIC_TZ)
     return local.weekday() <= FRIDAY and OPENS <= local.time() < CLOSES
 
 
 def clinic_now(settings: ClockSettings) -> datetime:
-    """The current time, or the configured simulated time when there is one."""
-    if settings.simulated_now is not None:
-        return settings.simulated_now
-    return datetime.now(CLINIC_TZ)
+    """The current clinic time, or the configured simulated time in clinic time."""
+    simulated = settings.simulated_now
+    if simulated is None:
+        return datetime.now(CLINIC_TZ)
+    if simulated.utcoffset() is None:
+        raise ValueError("simulated_now needs a timezone")
+    return simulated.astimezone(CLINIC_TZ)

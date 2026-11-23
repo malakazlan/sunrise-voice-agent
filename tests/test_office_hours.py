@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -84,18 +85,54 @@ def test_year_boundary_and_leap_day() -> None:
     assert wrong_answers(rows) == []
 
 
+class NoOffset(tzinfo):
+    """A tzinfo that is set but gives no offset: the datetime is still naive."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return None
+
+
+@dataclass(frozen=True)
+class FixedClock:
+    simulated_now: datetime | None
+
+
 def test_naive_datetime_is_rejected() -> None:
-    with pytest.raises(ValueError, match="timezone"):
-        is_open(datetime(2026, 11, 24, 10, 0))
+    for naive in (datetime(2026, 11, 24, 10, 0), datetime(2026, 11, 24, 10, 0, tzinfo=NoOffset())):
+        with pytest.raises(ValueError, match="timezone"):
+            is_open(naive)
 
 
 @pytest.mark.usefixtures("db_env")
 def test_simulated_now_is_honoured_in_demo() -> None:
-    simulated = utc("2026-11-28T16:00:00Z")
-    settings = Settings(_env_file=None, app_env="demo", simulated_now=simulated)
+    settings = Settings(_env_file=None, app_env="demo", simulated_now="2026-11-28T16:00:00Z")
 
-    assert clinic_now(settings) == simulated
+    assert clinic_now(settings) == utc("2026-11-28T16:00:00Z")
     assert is_open(clinic_now(settings)) is False
+
+
+@pytest.mark.usefixtures("db_env")
+def test_clinic_now_is_clinic_time() -> None:
+    settings = Settings(_env_file=None, app_env="demo", simulated_now="2026-11-24T03:00:00Z")
+
+    now = clinic_now(settings)
+
+    assert now.tzinfo is CLINIC_TZ
+    assert now.date() == date(2026, 11, 23)
+    assert (now.hour, now.minute) == (22, 0)
+    assert clinic_now(FixedClock(utc("2026-11-24T03:00:00Z"))).tzinfo is CLINIC_TZ
+
+
+def test_clinic_now_rejects_a_simulated_value_without_a_zone() -> None:
+    for naive in (datetime(2026, 11, 24, 10, 0), datetime(2026, 11, 24, 10, 0, tzinfo=NoOffset())):
+        with pytest.raises(ValueError, match="timezone"):
+            clinic_now(FixedClock(naive))
 
 
 @pytest.mark.usefixtures("db_env")
@@ -107,5 +144,6 @@ def test_real_clock_when_simulated_now_unset() -> None:
     now = clinic_now(settings)
     after = datetime.now(UTC)
 
-    assert now.utcoffset() is not None
+    assert now.tzinfo is CLINIC_TZ
     assert before <= now <= after
+    assert clinic_now(FixedClock(None)).tzinfo is CLINIC_TZ

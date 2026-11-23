@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -13,6 +14,12 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 # The POSTGRES_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_PASSWORD = "change-me-to-a-long-random-value"  # noqa: S105 (a published placeholder)
 MIN_PASSWORD_LENGTH = 16
+
+# SIMULATED_NOW: a date and a time, never a bare number or a date alone.
+ISO_DATE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}"
+    r"(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
 
 
 class Settings(BaseSettings):
@@ -32,8 +39,15 @@ class Settings(BaseSettings):
 
     @field_validator("simulated_now", mode="before")
     @classmethod
-    def blank_simulated_now_is_unset(cls, value: object) -> object:
-        return None if value == "" else value
+    def simulated_now_is_iso_text(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str) and ISO_DATE_TIME.fullmatch(value):
+            return value
+        raise ValueError(
+            "simulated_now must be an ISO date and time: YYYY-MM-DDTHH:MM[:SS[.ffffff]],"
+            " T or a space between, optionally Z or +HH:MM"
+        )
 
     @field_validator("simulated_now")
     @classmethod
@@ -44,7 +58,7 @@ class Settings(BaseSettings):
             return None
         if info.data.get("app_env") not in ("dev", "demo"):
             raise ValueError("simulated_now is only allowed when app_env is dev or demo")
-        if value.tzinfo is not None:
+        if value.utcoffset() is not None:
             return value
         # Without a zone the value is clinic time. A wall time that a clock change skips or
         # repeats has no single instant, so it is refused rather than guessed.

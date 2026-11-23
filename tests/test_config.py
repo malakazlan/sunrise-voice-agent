@@ -352,3 +352,45 @@ def test_blank_simulated_now_means_unset(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.chdir(tmp_path)
 
     assert Settings().simulated_now is None
+
+
+@pytest.mark.usefixtures("db_env")
+def test_simulated_now_accepts_only_an_iso_date_and_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "demo")
+    refused = [
+        "0",
+        "1764000000",
+        "2026-11-24",
+        "2026-11-24T10",
+        "20261124T103000",
+        "2026-11-24T10:30:00+05",
+        "tomorrow at 10",
+    ]
+    for value in refused:
+        monkeypatch.setenv("SIMULATED_NOW", value)
+
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("simulated_now",)], value
+        if len(value) >= 8:
+            assert value not in str(excinfo.value)
+
+    monkeypatch.delenv("SIMULATED_NOW")
+    for not_text in (0, 1764000000, datetime(2026, 11, 24, 15, 0, tzinfo=UTC)):
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None, simulated_now=not_text)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("simulated_now",)]
+
+    accepted = [
+        ("2026-11-24T10:30:00", datetime(2026, 11, 24, 15, 30, tzinfo=UTC)),
+        ("2026-11-24 10:30:00", datetime(2026, 11, 24, 15, 30, tzinfo=UTC)),
+        ("2026-11-24T10:30", datetime(2026, 11, 24, 15, 30, tzinfo=UTC)),
+        ("2026-11-24T15:30:00Z", datetime(2026, 11, 24, 15, 30, tzinfo=UTC)),
+        ("2026-11-24T10:30:00.5-05:00", datetime(2026, 11, 24, 15, 30, 0, 500000, tzinfo=UTC)),
+    ]
+    for value, expected in accepted:
+        monkeypatch.setenv("SIMULATED_NOW", value)
+
+        assert Settings(_env_file=None).simulated_now == expected, value

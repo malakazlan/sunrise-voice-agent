@@ -22,14 +22,23 @@ All data used by this project is synthetic. No real customer or personal data is
   - Nothing is ever deleted. Only the last four digits of an SSN are stored.
 - Pure decision functions in `app/domain/` (no database, network or settings file):
   - `office_hours.is_open`: Monday to Friday, 09:00 up to but not including 17:00, clinic
-    time; `office_hours.clinic_now` gives the current or simulated time.
+    time; `office_hours.clinic_now` gives the current or simulated time, in clinic time.
   - `matching.pick_patient`: which of the records already matched on date of birth and SSN
-    last four the claimed name belongs to. One exact match wins, otherwise one match that
-    sounds the same; two at the same level is no match. `matching.name_key` is the phonetic
-    key for a claimed name.
-  - `matching.match_medication`: which of the caller's own medications a spoken name means,
-    ignoring strength and form words and absorbing one-letter speech-to-text errors; two
-    matches is no match.
+    last four the claimed name belongs to. A name is its first and last word, ignoring case,
+    accents, punctuation, titles (`Dr`, `Mr`, `Mrs`, `Ms`, `Miss`) and suffixes (`Jr`, `Sr`,
+    `II`, `III`, `IV`). One exact match wins; otherwise one match with the same
+    spelling-variant form (for example Sarah and Sara, Garcia and Garsia, Smith and Smyth);
+    two at the same level is no match. An initial only ever matches exactly.
+    `matching.name_key` is that spelling-variant form of a claimed name.
+  - `matching.match_medication`: which of the caller's own medications a spoken name means.
+    It ignores case, numbers, units (`mg`, `mcg`, `g`, `ml`, `milligram(s)`, `microgram(s)`,
+    `gram(s)`, `unit(s)`, `iu`) and form words (`tablet(s)`, `tab(s)`, `capsule(s)`,
+    `cap(s)`, `pill(s)`, `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`,
+    `drops`, `spray`). The remaining words must match one for one, in order; a word of only
+    letters, seven or more of them, may differ by one letter added, dropped, changed or
+    swapped with its neighbour, never the first letter. A spoken name split in two
+    (`met formin`) is joined when the listed name is one word. Zero or two matches is no
+    match. Filler words (`my albuterol`) are not removed.
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
@@ -58,10 +67,13 @@ Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and mus
 placeholder from `.env.example`; startup stops otherwise.
 
 `SIMULATED_NOW` fixes the clinic clock for dev and demo, for example to show the office
-closed on a weekday afternoon. Empty means the real clock. A value without a zone, such as
-`2026-11-24T10:30:00`, is clinic time (America/New_York); a wall time that a clock change
-skips or repeats is refused, so give an offset for those. Startup stops if it is set and
-`APP_ENV` is `prod`.
+closed on a weekday afternoon. Empty means the real clock. Otherwise it must be an ISO 8601
+date and time: `YYYY-MM-DDTHH:MM`, optionally with `:SS` and up to six decimals of a second,
+`T` or a space between date and time, and optionally `Z` or an offset `+HH:MM` / `-HH:MM`.
+Anything else, such as a bare number or a date alone, stops startup. A value without a zone,
+such as `2026-11-24T10:30:00`, is clinic time (America/New_York); a wall time that a clock
+change skips or repeats is refused, so give an offset for those. Startup stops if it is set
+and `APP_ENV` is `prod`.
 
 ## Run with Docker
 
