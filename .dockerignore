@@ -1,0 +1,8 @@
+# Allowlist: only what the image needs enters the build context.
+# This keeps .env, .git, .venv and caches out of every build.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!app/
+**/__pycache__
