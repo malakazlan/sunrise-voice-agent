@@ -191,7 +191,7 @@ def test_database_password_is_hidden(
     settings = build(server_settings.postgres_port)
     url = settings.database_url
 
-    assert settings.postgres_password.get_secret_value() == password
+    assert url.password == password
     for rendered in (
         repr(settings),
         str(settings),
