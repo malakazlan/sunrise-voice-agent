@@ -36,6 +36,26 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sunrise
+          POSTGRES_USER: sunrise
+          POSTGRES_PASSWORD: ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U sunrise -d sunrise"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: sunrise
+      POSTGRES_USER: sunrise
+      POSTGRES_PASSWORD: ci-test-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -87,11 +107,15 @@ jobs:
             exit 1
           fi
           echo "no .env files under /app"
-      - name: Smoke test the container
+      - name: Write the Compose env file
         run: |
-          docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci
+          printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
+            POSTGRES_DB=sunrise POSTGRES_USER=sunrise POSTGRES_PASSWORD=ci-compose-only > .env
+      - name: Smoke test through Compose
+        run: |
+          docker compose -f deploy/docker-compose.yml up -d --build
           status=000
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
             [ "$status" = "200" ] && break
             sleep 1
@@ -101,17 +125,22 @@ jobs:
           docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          uid=$(docker exec app id -u)
+          uid=$(docker compose -f deploy/docker-compose.yml exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
+          app=$(docker compose -f deploy/docker-compose.yml ps -q app)
           health=none
           for _ in $(seq 1 30); do
-            health=$(docker inspect --format '{{.State.Health.Status}}' app)
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$app")
             [ "$health" = "healthy" ] && break
             sleep 1
           done
           echo "HEALTHCHECK -> $health"
           test "$health" = "healthy"
+          patients=$(docker compose -f deploy/docker-compose.yml exec -T db \
+            psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
+          echo "patients: $patients"
+          test "$patients" = "5"
       - name: Container without APP_ENV must not start
         run: |
           code=0
@@ -120,6 +149,16 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
-      - name: Container logs
+      - name: Container without database settings must not start
+        run: |
+          code=0
+          output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 12
+          echo "exit code: $code"
+          test "$code" = "1"
+          for name in postgres_host postgres_db postgres_user postgres_password; do
+            echo "$output" | grep -q "$name"
+          done
+      - name: Compose logs
         if: always()
-        run: docker logs app || true
+        run: docker compose -f deploy/docker-compose.yml logs || true
