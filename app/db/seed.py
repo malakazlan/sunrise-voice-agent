@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -210,10 +211,17 @@ async def _run(settings: Settings, today: date) -> None:
         await engine.dispose()
 
 
-def main() -> None:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def main(clock: Callable[[], datetime] = _utc_now) -> None:
+    """Seed the database from the environment's settings. The slot window starts from
+    today's date at the clinic, taken from `clock` (the real clock unless a test passes one).
+    """
     settings = Settings()
     logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
-    today = clinic_date(datetime.now(UTC))
+    today = clinic_date(clock())
     # psycopg's async mode needs a selector event loop; Windows defaults to the proactor loop.
     asyncio.run(_run(settings, today), loop_factory=asyncio.SelectorEventLoop)
 

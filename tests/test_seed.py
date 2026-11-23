@@ -5,6 +5,7 @@ import traceback
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -15,10 +16,11 @@ from pydantic import ValidationError
 from sqlalchemy import Text, column, select, table, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.pool import NullPool
 
 from app.config import Settings
-from app.db.seed import ensure_generated_slots, load_seed_data, seed
-from app.db.session import create_database_engine, create_session_factory
+from app.db.seed import ensure_generated_slots, load_seed_data, main, seed
+from app.db.session import create_database_engine, create_session_factory, create_sync_engine
 
 pytestmark = pytest.mark.anyio
 
@@ -561,3 +563,43 @@ async def test_loader_rejects_bad_values_without_echoing_them(session: AsyncSess
         "appointments": 0,
         "available_slots": 0,
     }
+
+
+GENERATED_DAYS = text("SELECT starts_at FROM available_slots WHERE source = 'generated'")
+
+
+@pytest.mark.parametrize(
+    ("instant", "first_day", "last_day"),
+    [
+        # 02:30 UTC on Nov 25 is still Tuesday Nov 24 in New York (EST, UTC-5).
+        (datetime(2026, 11, 25, 2, 30, tzinfo=UTC), date(2026, 11, 25), date(2026, 12, 14)),
+        # 03:30 UTC on Jul 1 is still Tuesday Jun 30 in New York (EDT, UTC-4).
+        (datetime(2026, 7, 1, 3, 30, tzinfo=UTC), date(2026, 7, 1), date(2026, 7, 20)),
+    ],
+    ids=["winter", "summer"],
+)
+def test_entry_point_uses_clinic_local_today(
+    database: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    instant: datetime,
+    first_day: date,
+    last_day: date,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("POSTGRES_HOST", database.postgres_host)
+    monkeypatch.setenv("POSTGRES_PORT", str(database.postgres_port))
+    monkeypatch.setenv("POSTGRES_DB", database.postgres_db)
+    monkeypatch.setenv("POSTGRES_USER", database.postgres_user)
+    monkeypatch.setenv("POSTGRES_PASSWORD", database.postgres_password.get_secret_value())
+
+    main(clock=lambda: instant)
+
+    engine = create_sync_engine(database, poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            days = sorted({clinic_day(at) for at in connection.scalars(GENERATED_DAYS)})
+    finally:
+        engine.dispose()
+    assert (days[0], days[-1], len(days)) == (first_day, last_day, 14)
