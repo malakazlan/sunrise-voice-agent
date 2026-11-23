@@ -491,7 +491,7 @@ async def test_database_errors_do_not_carry_row_values(session: AsyncSession) ->
     await session.rollback()
 
     text_of_error = rendered(refused.value)
-    assert "refused by the test trigger" in text_of_error
+    assert "RaiseException (SQLSTATE P0001)" in text_of_error
     assert "[parameters:" not in text_of_error
     for value in SEEDED_VALUES:
         assert value not in text_of_error, value
