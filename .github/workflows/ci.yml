@@ -68,7 +68,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Plant decoy env files that must not reach the image
+        run: |
+          printf 'DECOY=1\n' > app/.env
+          printf 'DECOY=1\n' > app/.env.local
       - run: docker build -t sunrise-voice-agent:ci .
+      - name: No .env file in the image
+        run: |
+          found=$(docker run --rm --entrypoint find sunrise-voice-agent:ci /app -name '.env*')
+          if [ -n "$found" ]; then
+            echo ".env files found in the image:"
+            echo "$found"
+            exit 1
+          fi
+          echo "no .env files under /app"
       - name: Smoke test the container
         run: |
           docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci

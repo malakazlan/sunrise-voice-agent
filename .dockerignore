@@ -6,3 +6,4 @@
 !.python-version
 !app/
 **/__pycache__
+**/.env*
