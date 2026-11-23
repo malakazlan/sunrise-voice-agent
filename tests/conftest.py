@@ -81,6 +81,7 @@ def database_env(settings: Settings) -> dict[str, str]:
     """Process environment that points the app's settings at the given database."""
     return {
         **os.environ,
+        "PYTHONPATH": str(REPO_ROOT),
         "APP_ENV": "dev",
         "POSTGRES_HOST": settings.postgres_host,
         "POSTGRES_PORT": str(settings.postgres_port),

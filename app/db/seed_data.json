@@ -1,0 +1,103 @@
+{
+  "patients": [
+    {
+      "id": "P001",
+      "first_name": "Sarah",
+      "last_name": "Johnson",
+      "dob": "1985-03-14",
+      "ssn_last4": "3344",
+      "phone": "555-201-3344",
+      "medications": [
+        {
+          "name": "Lisinopril 10mg",
+          "refills_remaining": 2,
+          "last_filled": "2026-10-20",
+          "pharmacy": "CVS Main St"
+        },
+        {
+          "name": "Metformin 500mg",
+          "refills_remaining": 0,
+          "last_filled": "2026-10-02",
+          "pharmacy": "CVS Main St"
+        }
+      ],
+      "next_appointment": "2026-12-03 10:30 AM with Dr. Patel",
+      "lab_results_status": "Ready - doctor will call to discuss",
+      "balance_due": 45.00
+    },
+    {
+      "id": "P002",
+      "first_name": "Michael",
+      "last_name": "Brown",
+      "dob": "1972-11-08",
+      "ssn_last4": "1020",
+      "phone": "555-887-1020",
+      "medications": [
+        {
+          "name": "Atorvastatin 20mg",
+          "refills_remaining": 1,
+          "last_filled": "2026-09-15",
+          "pharmacy": "Walgreens Oak Ave"
+        }
+      ],
+      "next_appointment": null,
+      "lab_results_status": "Pending",
+      "balance_due": 0.00
+    },
+    {
+      "id": "P003",
+      "first_name": "Maria",
+      "last_name": "Garcia",
+      "dob": "1990-07-22",
+      "ssn_last4": "9081",
+      "phone": "555-443-9081",
+      "medications": [
+        {
+          "name": "Levothyroxine 50mcg",
+          "refills_remaining": 3,
+          "last_filled": "2026-11-01",
+          "pharmacy": "Rite Aid 5th St"
+        }
+      ],
+      "next_appointment": "2026-11-28 2:00 PM with Dr. Lee",
+      "lab_results_status": "No recent labs",
+      "balance_due": 120.50
+    },
+    {
+      "id": "P004",
+      "first_name": "James",
+      "last_name": "Carter",
+      "dob": "1968-01-30",
+      "ssn_last4": "7712",
+      "phone": "555-310-7712",
+      "medications": [],
+      "next_appointment": null,
+      "lab_results_status": "Pending",
+      "balance_due": 0.00
+    },
+    {
+      "id": "P005",
+      "first_name": "Emily",
+      "last_name": "Nguyen",
+      "dob": "2001-09-05",
+      "ssn_last4": "4406",
+      "phone": "555-672-4406",
+      "medications": [
+        {
+          "name": "Albuterol inhaler",
+          "refills_remaining": 0,
+          "last_filled": "2026-08-11",
+          "pharmacy": "CVS Main St"
+        }
+      ],
+      "next_appointment": null,
+      "lab_results_status": "No recent labs",
+      "balance_due": 15.25
+    }
+  ],
+  "available_slots": [
+    {"doctor": "Dr. Patel", "date": "2026-12-01", "times": ["9:30 AM", "11:00 AM", "3:00 PM"]},
+    {"doctor": "Dr. Lee", "date": "2026-12-02", "times": ["10:00 AM", "1:30 PM"]},
+    {"doctor": "Dr. Patel", "date": "2026-12-04", "times": ["9:00 AM", "2:30 PM"]}
+  ]
+}
