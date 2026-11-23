@@ -205,8 +205,28 @@ DOMAIN_ALLOWED_IMPORTS = {
     "jellyfish",
     DOMAIN_PACKAGE,
 }
-# Builtins that read files or load modules by name.
-DOMAIN_FORBIDDEN_CALLS = {"open", "__import__", "exec", "eval"}
+# Builtins that read files, run code, or reach modules and attributes by name.
+DOMAIN_FORBIDDEN_CALLS = {
+    "open",
+    "__import__",
+    "exec",
+    "eval",
+    "compile",
+    "getattr",
+    "globals",
+    "vars",
+}
+# Names that reach other modules, the environment or the builtins through an allowed module:
+# as an attribute (dataclasses.sys), as a name, or as a from-import (from typing import sys).
+DOMAIN_FORBIDDEN_NAMES = {
+    "sys",
+    "os",
+    "modules",
+    "environ",
+    "__builtins__",
+    "__import__",
+    "importlib",
+}
 
 
 def imported_modules(source: str, package: str) -> list[str]:
@@ -220,15 +240,25 @@ def imported_modules(source: str, package: str) -> list[str]:
             modules.append(".".join([*base, *([node.module] if node.module else [])]))
         elif isinstance(node, ast.ImportFrom):
             modules.append(node.module or "")
-        elif (
-            isinstance(node, ast.Call) and getattr(node.func, "id", None) in DOMAIN_FORBIDDEN_CALLS
-        ):
-            modules.append(f"{getattr(node.func, 'id', '')}()")
     return modules
 
 
+def forbidden_uses(source: str) -> list[str]:
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) in DOMAIN_FORBIDDEN_CALLS:
+            uses.append(f"{getattr(node.func, 'id', '')}()")
+        elif isinstance(node, ast.Name) and node.id in DOMAIN_FORBIDDEN_NAMES:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in DOMAIN_FORBIDDEN_NAMES:
+            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.ImportFrom):
+            uses += [alias.name for alias in node.names if alias.name in DOMAIN_FORBIDDEN_NAMES]
+    return uses
+
+
 def impure_imports(source: str, package: str = DOMAIN_PACKAGE) -> list[str]:
-    return [
+    disallowed = [
         module
         for module in imported_modules(source, package)
         if not any(
@@ -236,6 +266,7 @@ def impure_imports(source: str, package: str = DOMAIN_PACKAGE) -> list[str]:
             for allowed in DOMAIN_ALLOWED_IMPORTS
         )
     ]
+    return disallowed + forbidden_uses(source)
 
 
 def test_domain_is_pure() -> None:
@@ -261,6 +292,16 @@ def test_domain_is_pure() -> None:
         "open('settings.toml')\n",
         "__import__('socket')\n",
         "import collections\n",
+        # Reaching other modules, the environment or the builtins through allowed modules.
+        "import dataclasses\ndataclasses.sys.modules['app.config'].Settings()\n",
+        "import typing\ntyping.__builtins__['open']('.env')\n",
+        "from dataclasses import sys\n",
+        "import zoneinfo\nzoneinfo._tzpath.os.environ['APP_ENV']\n",
+        "import typing\ngetattr(typing, 'sys')\n",
+        "globals()['__builtins__']\n",
+        "import typing\nvars(typing)['sys']\n",
+        "exec(compile('import socket', 'x', 'exec'))\n",
+        "import re\nre.importlib\n",
     ):
         assert impure_imports(sample), sample
     assert not impure_imports(
@@ -269,6 +310,8 @@ def test_domain_is_pure() -> None:
         "from datetime import datetime\n"
         "from zoneinfo import ZoneInfo\n"
         "import jellyfish\n"
+        "import re\n"
+        "WORD = re.compile('[a-z]+')\n"
         "from app.domain.clinic import CLINIC_TZ\n"
         "from .clinic import CLINIC_TZ\n"
         "from . import clinic\n"
