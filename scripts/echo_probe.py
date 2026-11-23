@@ -1,7 +1,8 @@
 """Call the running app as a WebRTC client, send a tone, and check the same tone comes back.
 
-Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. Each concurrent call
-sends its own tone, so a call that hears another call's audio fails.
+Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. Each call sends a tone
+at a frequency chosen at random for that run and no other call, so a call that hears another
+call's audio, or a recording, fails. A call that ends before the requested length fails too.
 
     uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2 [--relay]
 
@@ -14,6 +15,7 @@ import asyncio
 import fractions
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -35,7 +37,9 @@ from av import AudioFrame
 
 SAMPLE_RATE = 48_000
 SAMPLES_PER_FRAME = 960  # 20 ms
-TONES_HZ = [440.0, 660.0, 880.0, 1100.0]
+# Candidate tones 60 Hz apart, so each call's tone is far from every other call's.
+TONES_HZ = [float(hz) for hz in range(300, 1500, 60)]
+MAX_CALLS = 4
 SKIP_FRAMES = 25  # the first half second while the jitter buffers fill
 MIN_RMS = 500.0  # full-scale int16 is 32767; the tone is sent at half scale
 MAX_PEAK_ERROR_HZ = 10.0
@@ -147,8 +151,8 @@ async def one_call(
     finally:
         await pc.close()
 
-    if len(received) <= SKIP_FRAMES:
-        print(f"{label}: FAILED only {len(received)} frames received")
+    if len(received) < wanted:
+        print(f"{label}: FAILED the call ended after {len(received)} of {wanted} frames")
         return False
     samples = np.concatenate(received[SKIP_FRAMES:]).astype(np.float64)
     rms = float(np.sqrt(np.mean(samples**2)))
@@ -162,7 +166,7 @@ async def one_call(
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--url", default="http://127.0.0.1:8000")
-    parser.add_argument("--calls", type=int, default=1, choices=range(1, len(TONES_HZ) + 1))
+    parser.add_argument("--calls", type=int, default=1, choices=range(1, MAX_CALLS + 1))
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--relay", action="store_true", help="use TURN relay candidates only")
     args = parser.parse_args()
@@ -171,7 +175,7 @@ async def main() -> int:
     results = await asyncio.gather(
         *(
             one_call(args.url.rstrip("/"), token, tone, args.relay, args.seconds)
-            for tone in TONES_HZ[: args.calls]
+            for tone in random.SystemRandom().sample(TONES_HZ, args.calls)
         )
     )
     print(f"{sum(results)}/{len(results)} calls heard their own tone back")
