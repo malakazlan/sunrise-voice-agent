@@ -1,0 +1,42 @@
+[project]
+name = "sunrise-voice-agent"
+version = "0.1.0"
+description = "Sunrise voice agent service."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.165.0",
+    "uvicorn==0.54.0",
+    "pydantic-settings==2.16.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "httpx2==2.16.2",
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S603"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = ["error"]

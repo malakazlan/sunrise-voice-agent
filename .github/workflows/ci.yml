@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.10.4"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.10.4"
+      - run: uv sync --locked
+      - run: uv run mypy --strict app tests
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.10.4"
+      - run: uv sync --locked
+      - run: uv run pytest
+
+  gitleaks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Without safe.directory, git refuses the mounted checkout (different owner). When git
+      # cannot read the repo, gitleaks reports "0 commits scanned" and exits 0, so the step
+      # also requires a non-zero commit count.
+      - name: Scan full git history
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --verbose --no-banner --no-color 2>&1 | tee "$RUNNER_TEMP/gitleaks.log"
+          scanned=$(sed -n 's/.* \([0-9][0-9]*\) commits scanned\..*/\1/p' "$RUNNER_TEMP/gitleaks.log")
+          echo "commits scanned: ${scanned:-none}"
+          test "${scanned:-0}" -gt 0
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plant decoy env files that must not reach the image
+        run: |
+          printf 'DECOY=1\n' > app/.env
+          printf 'DECOY=1\n' > app/.env.local
+      - run: docker build -t sunrise-voice-agent:ci .
+      - name: No .env file in the image
+        run: |
+          found=$(docker run --rm --entrypoint find sunrise-voice-agent:ci /app -name '.env*')
+          if [ -n "$found" ]; then
+            echo ".env files found in the image:"
+            echo "$found"
+            exit 1
+          fi
+          echo "no .env files under /app"
+      - name: Smoke test the container
+        run: |
+          docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci
+          status=000
+          for _ in $(seq 1 30); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
+            [ "$status" = "200" ] && break
+            sleep 1
+          done
+          echo "GET /health -> $status"
+          test "$status" = "200"
+          docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
+          echo "GET /docs -> $docs"
+          test "$docs" = "404"
+          uid=$(docker exec app id -u)
+          echo "container uid: $uid"
+          test "$uid" != "0"
+          health=none
+          for _ in $(seq 1 30); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' app)
+            [ "$health" = "healthy" ] && break
+            sleep 1
+          done
+          echo "HEALTHCHECK -> $health"
+          test "$health" = "healthy"
+      - name: Container without APP_ENV must not start
+        run: |
+          code=0
+          output=$(timeout 60 docker run --rm sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 5
+          echo "exit code: $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "app_env"
+      - name: Container logs
+        if: always()
+        run: docker logs app || true
