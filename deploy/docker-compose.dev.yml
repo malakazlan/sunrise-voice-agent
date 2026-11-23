@@ -1,0 +1,6 @@
+# Local development and tests: publish the database on the loopback interface only.
+#   docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up -d db
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"

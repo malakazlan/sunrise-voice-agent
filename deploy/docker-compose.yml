@@ -1,6 +1,39 @@
 name: sunrise-voice-agent
 
+# Run from the repo root: docker compose --env-file .env -f deploy/docker-compose.yml up --build
+#
+# The three database credentials are interpolated from --env-file .env (or the shell) and
+# Compose refuses to start without them. The db container receives only these three; the app
+# receives the same three plus the rest of .env, so there is one set of database credentials.
+x-database-credentials: &database-credentials
+  POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
+  POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set; pass --env-file .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set; pass --env-file .env}
+
 services:
+  db:
+    image: postgres:16
+    # Keep statement errors out of the server log, since their text can quote a value:
+    # log_min_messages=log drops ERROR and WARNING lines but keeps LOG, FATAL and PANIC (for
+    # example failed logins); terse drops DETAIL, HINT, QUERY and CONTEXT from what is still
+    # logged; panic stops the failing statement from being logged.
+    command:
+      - postgres
+      - -c
+      - log_min_messages=log
+      - -c
+      - log_error_verbosity=terse
+      - -c
+      - log_min_error_statement=panic
+    environment: *database-credentials
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   app:
     build:
       context: ..
@@ -10,3 +43,14 @@ services:
     env_file:
       - path: ../.env
         required: false
+    environment:
+      <<: *database-credentials
+      # Inside Compose the app always reaches the database as db:5432.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

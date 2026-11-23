@@ -14,9 +14,21 @@ from app.main import create_app
 DOCS_PATHS = ["/docs", "/redoc", "/openapi.json"]
 
 
+def offline_settings(app_env: AppEnv, log_level: LogLevel = "INFO") -> Settings:
+    # The health check never connects, so the database values only have to be present.
+    return Settings(
+        _env_file=None,
+        app_env=app_env,
+        log_level=log_level,
+        postgres_host="db.invalid",
+        postgres_db="sunrise_offline",
+        postgres_user="sunrise_offline",
+        postgres_password="offline-test-password",
+    )
+
+
 def make_client(app_env: AppEnv) -> TestClient:
-    settings = Settings(_env_file=None, app_env=app_env, log_level="INFO")
-    return TestClient(create_app(settings))
+    return TestClient(create_app(offline_settings(app_env)))
 
 
 def test_health_returns_only_status() -> None:
@@ -45,7 +57,7 @@ def test_log_level_is_applied(log_level: LogLevel, expected: int) -> None:
     root = logging.getLogger()
     original = root.level
     try:
-        create_app(Settings(_env_file=None, app_env="prod", log_level=log_level))
+        create_app(offline_settings("prod", log_level))
         assert root.level == expected
     finally:
         root.setLevel(original)
@@ -69,7 +81,7 @@ def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path
         module.create_app()
 
 
-@pytest.mark.usefixtures("clean_env")
+@pytest.mark.usefixtures("db_env")
 def test_factory_reads_settings_from_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

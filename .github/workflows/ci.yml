@@ -36,6 +36,26 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sunrise
+          POSTGRES_USER: sunrise
+          POSTGRES_PASSWORD: ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U sunrise -d sunrise"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: sunrise
+      POSTGRES_USER: sunrise
+      POSTGRES_PASSWORD: ci-test-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,13 +76,18 @@ jobs:
       # Without safe.directory, git refuses the mounted checkout (different owner). When git
       # cannot read the repo, gitleaks reports "0 commits scanned" and exits 0, so the step
       # also requires a non-zero commit count.
-      - name: Scan full git history
+      # By default gitleaks runs `git log -p -U0 --full-history --all --diff-filter=tuxdb`, so it
+      # would scan every fetched branch. --log-opts replaces everything after -U0: the same
+      # options with HEAD scan only the commit under test and its ancestors (on pull_request
+      # the merge ref, on push main).
+      - name: Scan the history of the checked-out commit
         run: |
           set -o pipefail
           docker run --rm -v "$PWD:/repo" \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
             ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
-            git /repo --redact --verbose --no-banner --no-color 2>&1 | tee "$RUNNER_TEMP/gitleaks.log"
+            git /repo --redact --verbose --no-banner --no-color \
+            --log-opts="--full-history --diff-filter=tuxdb HEAD" 2>&1 | tee "$RUNNER_TEMP/gitleaks.log"
           scanned=$(sed -n 's/.* \([0-9][0-9]*\) commits scanned\..*/\1/p' "$RUNNER_TEMP/gitleaks.log")
           echo "commits scanned: ${scanned:-none}"
           test "${scanned:-0}" -gt 0
@@ -87,11 +112,26 @@ jobs:
             exit 1
           fi
           echo "no .env files under /app"
-      - name: Smoke test the container
+      - name: Compose refuses to start without the database variables
         run: |
-          docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci
+          code=0
+          output=$(docker compose -f deploy/docker-compose.yml config 2>&1) || code=$?
+          echo "$output" | tail -n 3
+          echo "exit code: $code"
+          test "$code" != "0"
+          # Compose versions differ: some stop at the first missing variable, others list all.
+          pattern="required variable (POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD) is missing a value"
+          echo "$output" | grep -Eq "$pattern"
+      - name: Write the Compose env file
+        run: |
+          printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
+            POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
+            POSTGRES_PASSWORD=ci-compose-only-password-0001 > .env
+      - name: Smoke test through Compose
+        run: |
+          docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
           status=000
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
             [ "$status" = "200" ] && break
             sleep 1
@@ -101,17 +141,58 @@ jobs:
           docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          uid=$(docker exec app id -u)
+          uid=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
+          app=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q app)
           health=none
           for _ in $(seq 1 30); do
-            health=$(docker inspect --format '{{.State.Health.Status}}' app)
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$app")
             [ "$health" = "healthy" ] && break
             sleep 1
           done
           echo "HEALTHCHECK -> $health"
           test "$health" = "healthy"
+          patients=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
+            psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
+          echo "patients: $patients"
+          test "$patients" = "5"
+      - name: The db container holds only the database variables
+        run: |
+          db=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q db)
+          image=$(docker inspect --format '{{.Config.Image}}' "$db")
+          # Allowed: what the Postgres image sets itself, plus the three credentials.
+          {
+            docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image"
+            printf '%s\n' POSTGRES_DB= POSTGRES_USER= POSTGRES_PASSWORD=
+          } | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/allowed-env"
+          # Names only; values are never printed.
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$db" \
+            | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/db-env"
+          echo "db environment names: $(tr '\n' ' ' < "$RUNNER_TEMP/db-env")"
+          unexpected=$(comm -23 "$RUNNER_TEMP/db-env" "$RUNNER_TEMP/allowed-env")
+          if [ -n "$unexpected" ]; then
+            echo "unexpected variables in the db container: $unexpected"
+            exit 1
+          fi
+          for name in POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD; do
+            grep -qx "$name" "$RUNNER_TEMP/db-env"
+          done
+          echo "db environment holds only the database variables"
+      - name: Postgres logs no ERROR or WARNING lines, details or failing statements
+        run: |
+          show() {
+            docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
+              psql -U sunrise -d sunrise -tAc "SHOW $1"
+          }
+          messages=$(show log_min_messages)
+          verbosity=$(show log_error_verbosity)
+          statements=$(show log_min_error_statement)
+          echo "log_min_messages=$messages log_error_verbosity=$verbosity" \
+            "log_min_error_statement=$statements"
+          test "$messages" = "log"
+          test "$verbosity" = "terse"
+          test "$statements" = "panic"
       - name: Container without APP_ENV must not start
         run: |
           code=0
@@ -120,6 +201,16 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
-      - name: Container logs
+      - name: Container without database settings must not start
+        run: |
+          code=0
+          output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 12
+          echo "exit code: $code"
+          test "$code" = "1"
+          for name in postgres_host postgres_db postgres_user postgres_password; do
+            echo "$output" | grep -q "$name"
+          done
+      - name: Compose logs
         if: always()
-        run: docker logs app || true
+        run: docker compose --env-file .env -f deploy/docker-compose.yml logs || true
