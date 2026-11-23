@@ -80,8 +80,10 @@ docker compose -f deploy/docker-compose.yml --env-file .env up --build
 curl http://127.0.0.1:8000/health
 ```
 
-The Compose file reads its values from the environment or the `--env-file`. The app port is
-published on `127.0.0.1` only. coturn uses host networking (Linux hosts) and needs
-`TURN_HOST` and `TURN_SHARED_SECRET`; it relays on UDP 49160-49200 and refuses to relay to
+The Compose file reads its values from the environment or the `--env-file`, and always needs
+`TURN_HOST` and `TURN_SHARED_SECRET` (for dev without TURN, run with uv as above). The app
+port is published on `127.0.0.1` only. coturn uses host networking (Linux hosts; Docker
+Desktop on Windows and macOS does not give it the host's addresses) and relays on UDP
+49160-49200. It refuses to relay to
 private, loopback and link-local addresses. coturn's own logging is switched off because it
 records caller addresses.
