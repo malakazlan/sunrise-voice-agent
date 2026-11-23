@@ -302,6 +302,9 @@ def test_domain_is_pure() -> None:
         "import typing\nvars(typing)['sys']\n",
         "exec(compile('import socket', 'x', 'exec'))\n",
         "import re\nre.importlib\n",
+        "typing.sys.modules['os'].environ\n",
+        "dataclasses.inspect.os.environ\n",
+        "getattr(__builtins__, 'open', None)\n",
     ):
         assert impure_imports(sample), sample
     assert not impure_imports(

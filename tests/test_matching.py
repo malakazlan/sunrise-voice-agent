@@ -173,7 +173,6 @@ def test_names_that_must_not_match() -> None:
         ("Jo Smith", j_smith),
         ("John Doe Jr", JOHN_SMITH_JR),
         ("John Jr", JOHN_SMITH_JR),
-        # Not in the spec tables; each pins one rule that no row above depends on.
         # ch, sh and th are kept as units: Chen is not Ken, Smith is not Smit.
         ("Wei Ken", wei),
         ("John Smit", JOHN_SMITH),
@@ -306,6 +305,8 @@ def test_medications_that_match() -> None:
         ("metformin er", METFORMIN_AND_ER, "Metformin ER 500mg"),
         ("metformin", METFORMIN_AND_ER, "Metformin 500mg"),
         ("vitamin b12", ["Vitamin B12 1000mcg"], "Vitamin B12 1000mcg"),
+        # Seven letters, one edit: the shortest token that may differ.
+        ("lipitar", ["Lipitor 20mg"], "Lipitor 20mg"),
         ("humulin n", ["Humulin N", "Humulin R"], "Humulin N"),
         (SPOKEN_100, LISINOPRIL_AND_METFORMIN, "Lisinopril 10mg"),
     ]
@@ -335,6 +336,11 @@ def test_medications_that_must_not_match() -> None:
         ("losartan", ["Lisinopril 10mg"], None),
         ("simvastatin", ["Atorvastatin 20mg"], None),
         ("lipitor", ["Atorvastatin 20mg"], None),
+        # One edit, but shorter than seven letters.
+        ("plavex", ["Plavix 75mg"], None),
+        ("paxel", ["Paxil 20mg"], None),
+        # One edit, but the tokens mix letters and digits.
+        ("vitaminb1", ["VitaminB12 1000mcg"], None),
         ("humulin r", ["Humulin N"], None),
         ("novolin r", ["Novolin N"], None),
         ("vitamin e", ["Vitamin D 50mcg"], None),
@@ -362,7 +368,7 @@ def test_medications_that_must_not_match() -> None:
         ("duloxetine", ["Fluoxetine 20mg"], None),
         ("lorazepam", ["Clonazepam 0.5mg"], None),
         ("folinic acid", ["Folic acid 1mg"], None),
-        # Not in the spec table: pins the same-first-letter rule (xylenol is an antiseptic).
+        # The first letter must agree (xylenol is an antiseptic).
         ("xylenol", ["Tylenol 500mg"], None),
     ]
     lists = [
