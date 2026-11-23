@@ -12,7 +12,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest==9.2.0",
-    "httpx==0.28.1",
+    "httpx2==2.16.2",
     "ruff==0.17.6",
     "mypy==2.4.1",
 ]
@@ -39,3 +39,4 @@ python_version = "3.12"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+filterwarnings = ["error"]
