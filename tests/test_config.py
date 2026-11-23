@@ -30,8 +30,11 @@ def test_missing_app_env_is_rejected() -> None:
 def test_unknown_app_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "staging")
 
-    with pytest.raises(ValidationError, match="app_env"):
+    with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [("literal_error", ("app_env",))]
 
 
 @pytest.mark.usefixtures("clean_env")
@@ -39,8 +42,11 @@ def test_unknown_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("LOG_LEVEL", "TRACE")
 
-    with pytest.raises(ValidationError, match="log_level"):
+    with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [("literal_error", ("log_level",))]
 
 
 @pytest.mark.usefixtures("clean_env")
