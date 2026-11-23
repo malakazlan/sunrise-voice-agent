@@ -2,14 +2,14 @@ import asyncio
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import Connection, Engine, text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
@@ -26,33 +26,42 @@ OFFLINE_DB_ENV = {
 }
 
 
-# No test may end skipped, xfailed or xpassed, however the skip was written (marker, call,
-# alias, exception, collection-time skip). Each one is recorded and the run fails at the end.
-NOT_RUN: list[str] = []
+# pytest's own plugin for running an inner test session (tests/test_skip_hook.py).
+pytest_plugins = ["pytester"]
 
 
-def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    if hasattr(report, "wasxfail"):
-        NOT_RUN.append(f"{report.nodeid}: xfailed or xpassed")
-    elif report.skipped:
-        NOT_RUN.append(f"{report.nodeid}: skipped")
+class NoSkipsPlugin:
+    """No test may end skipped, xfailed or xpassed, however the skip was written (marker,
+    call, alias, exception, collection-time skip). Each one is recorded and the run fails at
+    the end. The record belongs to the instance, so an inner session gets its own.
+    """
+
+    def __init__(self) -> None:
+        self.not_run: list[str] = []
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if hasattr(report, "wasxfail"):
+            self.not_run.append(f"{report.nodeid}: xfailed or xpassed")
+        elif report.skipped:
+            self.not_run.append(f"{report.nodeid}: skipped")
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        if report.skipped:
+            self.not_run.append(f"{report.nodeid}: skipped at collection")
+
+    def pytest_terminal_summary(self, terminalreporter: pytest.TerminalReporter) -> None:
+        if self.not_run:
+            terminalreporter.section("tests that must run but did not", red=True)
+            for line in self.not_run:
+                terminalreporter.line(line)
+
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        if self.not_run and session.exitstatus == pytest.ExitCode.OK:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
-def pytest_collectreport(report: pytest.CollectReport) -> None:
-    if report.skipped:
-        NOT_RUN.append(f"{report.nodeid}: skipped at collection")
-
-
-def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
-    if NOT_RUN:
-        terminalreporter.section("tests that must run but did not", red=True)
-        for line in NOT_RUN:
-            terminalreporter.line(line)
-
-
-def pytest_sessionfinish(session: pytest.Session) -> None:
-    if NOT_RUN and session.exitstatus == pytest.ExitCode.OK:
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+def pytest_configure(config: pytest.Config) -> None:
+    config.pluginmanager.register(NoSkipsPlugin(), "no-skips")
 
 
 @pytest.fixture
@@ -226,3 +235,29 @@ async def session(database: Settings) -> AsyncIterator[AsyncSession]:
             yield session
     finally:
         await engine.dispose()
+
+
+# Tests reach the driver connection under an engine only through these two fixtures; the
+# repo hygiene test allows raw-connection access in this file and in app/db/session.py only.
+@pytest.fixture
+def close_driver_connection() -> Callable[[Connection], None]:
+    """Close the libpq connection under a live connection, as a lost link would."""
+
+    def close(connection: Connection) -> None:
+        driver = connection.connection.driver_connection
+        assert driver is not None
+        driver.pgconn.finish()
+
+    return close
+
+
+@pytest.fixture
+def close_async_driver_connection() -> Callable[[AsyncConnection], Awaitable[None]]:
+    """The same for a connection from the async engine."""
+
+    async def close(connection: AsyncConnection) -> None:
+        driver = (await connection.get_raw_connection()).driver_connection
+        assert driver is not None
+        driver.pgconn.finish()
+
+    return close

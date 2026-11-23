@@ -1,12 +1,23 @@
 import traceback
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import date
 from typing import Any
 
 import pytest
 from psycopg import errors
-from sqlalchemy import TextClause, event, text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy import (
+    Connection,
+    Dialect,
+    Text,
+    TextClause,
+    TypeDecorator,
+    event,
+    literal,
+    select,
+    text,
+)
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, StatementError
+from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
@@ -202,3 +213,118 @@ def test_every_engine_withholds_row_values_from_errors() -> None:
 
     assert event.contains(async_engine, "handle_error", withhold_row_values)
     assert event.contains(sync_engine, "handle_error", withhold_row_values)
+
+
+class RefusesValues(TypeDecorator[str]):
+    """A validating type: it refuses every value and quotes it, as careless code would."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: str | None, dialect: Dialect) -> str:
+        raise ValueError(f"refusing {value!r}")
+
+
+BOUND_VALUE = "Zebulon Quackenbush 1933-03-03"
+REFUSED = select(literal(BOUND_VALUE, type_=RefusesValues()))
+
+
+async def non_driver_error(settings: Settings, kind: str) -> StatementError:
+    if kind == "sync":
+        engine = create_sync_engine(settings, poolclass=NullPool)
+        try:
+            with pytest.raises(StatementError) as excinfo, engine.connect() as connection:
+                connection.execute(REFUSED)
+        finally:
+            engine.dispose()
+        return excinfo.value
+    async_engine = create_database_engine(settings)
+    try:
+        with pytest.raises(StatementError) as excinfo:
+            async with async_engine.connect() as connection:
+                await connection.execute(REFUSED)
+    finally:
+        await async_engine.dispose()
+    return excinfo.value
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_non_driver_error_does_not_carry_values(database: Settings, kind: str) -> None:
+    error = await non_driver_error(database, kind)
+
+    assert type(error) is StatementError
+    assert type(error.orig) is ValueError
+    rendered = [str(error), repr(error), "".join(traceback.format_exception(error))]
+    rendered += [text_of for linked in chain(error) for text_of in (str(linked), repr(linked))]
+    for text_of_error in rendered:
+        assert "Zebulon" not in text_of_error
+        assert "1933" not in text_of_error
+    assert "ValueError" in str(error)
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_lost_connection_reason_passes_through(
+    database: Settings,
+    kind: str,
+    close_driver_connection: Callable[[Connection], None],
+    close_async_driver_connection: Callable[[AsyncConnection], Awaitable[None]],
+) -> None:
+    if kind == "sync":
+        engine = create_sync_engine(database, poolclass=NullPool)
+        try:
+            with pytest.raises(OperationalError) as excinfo, engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+                close_driver_connection(connection)
+                connection.execute(text("SELECT 1"))
+        finally:
+            engine.dispose()
+    else:
+        async_engine = create_database_engine(database)
+        try:
+            with pytest.raises(OperationalError) as excinfo:
+                async with async_engine.connect() as async_connection:
+                    await async_connection.execute(text("SELECT 1"))
+                    await close_async_driver_connection(async_connection)
+                    await async_connection.execute(text("SELECT 1"))
+        finally:
+            await async_engine.dispose()
+
+    # A client-side failure: no server result, no SQLSTATE, the driver's own words.
+    assert isinstance(excinfo.value.orig, errors.OperationalError)
+    assert excinfo.value.orig.sqlstate is None
+    assert "the connection is closed" in str(excinfo.value)
+    assert "withheld" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_administrator_kill_reports_class_and_sqlstate(database: Settings, kind: str) -> None:
+    admin = create_sync_engine(database, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+
+    def kill(pid: int) -> None:
+        with admin.connect() as killer:
+            killer.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+
+    try:
+        if kind == "sync":
+            engine = create_sync_engine(database, poolclass=NullPool)
+            try:
+                with pytest.raises(OperationalError) as excinfo, engine.connect() as connection:
+                    kill(connection.execute(text("SELECT pg_backend_pid()")).scalar_one())
+                    connection.execute(text("SELECT 1"))
+            finally:
+                engine.dispose()
+        else:
+            async_engine = create_database_engine(database)
+            try:
+                with pytest.raises(OperationalError) as excinfo:
+                    async with async_engine.connect() as async_connection:
+                        pid = await async_connection.execute(text("SELECT pg_backend_pid()"))
+                        kill(pid.scalar_one())
+                        await async_connection.execute(text("SELECT 1"))
+            finally:
+                await async_engine.dispose()
+    finally:
+        admin.dispose()
+
+    assert type(excinfo.value.orig) is errors.AdminShutdown
+    assert "AdminShutdown (SQLSTATE 57P01)" in str(excinfo.value)

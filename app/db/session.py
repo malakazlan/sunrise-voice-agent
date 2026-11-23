@@ -6,7 +6,7 @@ from psycopg import Error as DriverError
 from psycopg.pq import DiagnosticField
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import ExceptionContext
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, StatementError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -47,22 +47,57 @@ def _summary(error: DriverError) -> str:
     return ", ".join(parts) + "; server message and row values withheld"
 
 
-def withhold_row_values(context: ExceptionContext) -> DBAPIError | None:
-    """Replace a database error with one that names the failure but carries no row values.
+def withhold_row_values(context: ExceptionContext) -> StatementError | None:
+    """Make sure no error leaving the engine carries row values.
 
-    SQLAlchemy raises the returned exception `from` the driver's original error, so that
-    original is scrubbed in place: its message becomes the summary, and its diagnostics keep
-    only KEPT_DIAGNOSTICS. psycopg accepts a dict for this (it is the form it pickles).
-    The SQLAlchemy exception class, the driver's exception class, the SQLSTATE and the
-    constraint name all stay as they were.
+    SQLAlchemy raises the exception a handler returns `from` the original error, so the
+    original is always scrubbed in place as well. Exceptions that are not `Exception`
+    (interrupts, cancellation) are left alone.
     """
     original = context.original_exception
     wrapped = context.sqlalchemy_exception
-    if not isinstance(original, DriverError) or not isinstance(wrapped, DBAPIError):
+    if isinstance(original, DriverError):
+        return _withhold_driver_error(original, wrapped)
+    if isinstance(original, Exception):
+        return _withhold_other_error(original, wrapped)
+    return None
+
+
+def _withhold_other_error(
+    original: Exception, wrapped: StatementError | None
+) -> StatementError | None:
+    """An error raised inside the engine by something other than the driver, for example a
+    value refused by a validating type. Its message may quote the value, so only its class
+    is kept, and whatever was chained to it is cut off.
+    """
+    original.args = (f"{type(original).__name__}: message withheld",)
+    original.__cause__ = None
+    original.__context__ = None
+    original.__suppress_context__ = True
+    if type(wrapped) is not StatementError:
         return None
-    if context.connection is None and original.pgresult is None:
-        # Failed to connect: no row was involved, and the reason (for example a refused
-        # login) is needed as it is.
+    original_class = f"{type(original).__module__}.{type(original).__qualname__}"
+    return StatementError(
+        f"({original_class}) message withheld",
+        wrapped.statement,
+        None,
+        original,
+        hide_parameters=True,
+        ismulti=wrapped.ismulti,
+    )
+
+
+def _withhold_driver_error(
+    original: DriverError, wrapped: StatementError | None
+) -> StatementError | None:
+    """A driver error: its message becomes the summary, and its diagnostics keep only
+    KEPT_DIAGNOSTICS. psycopg accepts a dict for this (it is the form it pickles). The
+    SQLAlchemy exception class, the driver's exception class, the SQLSTATE and the
+    constraint name all stay as they were.
+    """
+    if original.pgresult is None and original.sqlstate is None:
+        # Client side, for example a lost connection: the driver's own words, which carry
+        # no row values and are needed as they are.
         return None
 
     diag = original.diag
@@ -79,6 +114,8 @@ def withhold_row_values(context: ExceptionContext) -> DBAPIError | None:
     original._encoding = "utf-8"
     original._pgconn = None
 
+    if not isinstance(wrapped, DBAPIError):
+        return None
     return type(wrapped)(
         wrapped.statement,
         None,
