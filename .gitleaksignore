@@ -1,0 +1,5 @@
+# TURN credential test vector: HMAC-SHA1 of a fake secret ("fake-turn-secret-for-tests"),
+# computed by hand for tests/test_turn.py. Not a credential for any server.
+c9241c1b03e64be2f9a9b033bc2b162f85a1409c:tests/test_turn.py:generic-api-key:30
+c9241c1b03e64be2f9a9b033bc2b162f85a1409c:tests/test_turn.py:generic-api-key:42
+c9241c1b03e64be2f9a9b033bc2b162f85a1409c:tests/test_turn.py:generic-api-key:56
