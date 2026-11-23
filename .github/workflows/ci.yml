@@ -32,7 +32,7 @@ jobs:
         with:
           version: "0.10.4"
       - run: uv sync --locked
-      - run: uv run mypy --strict app tests
+      - run: uv run mypy --strict app tests scripts
 
   test:
     runs-on: ubuntu-24.04
@@ -126,7 +126,9 @@ jobs:
         run: |
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
             POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
-            POSTGRES_PASSWORD=ci-compose-only-password-0001 > .env
+            POSTGRES_PASSWORD=ci-compose-only-password-0001 \
+            TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
+            DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 > .env
       - name: Smoke test through Compose
         run: |
           docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
@@ -201,14 +203,15 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
-      - name: Container without database settings must not start
+      - name: Container without database or voice settings must not start
         run: |
           code=0
           output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
           echo "$output" | tail -n 12
           echo "exit code: $code"
           test "$code" = "1"
-          for name in postgres_host postgres_db postgres_user postgres_password; do
+          for name in postgres_host postgres_db postgres_user postgres_password \
+            turn_shared_secret turn_host demo_access_token; do
             echo "$output" | grep -q "$name"
           done
       - name: Compose logs

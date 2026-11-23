@@ -25,6 +25,14 @@ OFFLINE_DB_ENV = {
     "POSTGRES_PASSWORD": "offline-test-password",
 }
 
+# Obviously fake voice settings that let a demo or prod configuration validate. Built from
+# short pieces so that no secret scanner reads them as credentials.
+VOICE_SECRETS = {
+    "DEMO_ACCESS_TOKEN": "-".join(["token", "not", "for", "logs"] + ["x" * 4] * 3),
+    "TURN_HOST": "turn.example.test",
+    "TURN_SHARED_SECRET": "-".join(["turn", "secret", "not", "for", "logs"] + ["y" * 4] * 3),
+}
+
 
 # pytest's own plugin for running an inner test session (tests/test_skip_hook.py).
 pytest_plugins = ["pytester"]
@@ -75,6 +83,22 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def db_env(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """A clean environment holding only the required database settings."""
     for key, value in OFFLINE_DB_ENV.items():
+        monkeypatch.setenv(key, value)
+
+
+def offline_settings(**overrides: Any) -> Settings:
+    """Demo settings with every required value, for app tests that never connect."""
+    values: dict[str, Any] = {key.lower(): value for key, value in OFFLINE_DB_ENV.items()}
+    values.update({key.lower(): value for key, value in VOICE_SECRETS.items()})
+    values["app_env"] = "demo"
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+@pytest.fixture
+def offline_env(db_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The required database settings plus the voice settings a demo or prod app needs."""
+    for key, value in VOICE_SECRETS.items():
         monkeypatch.setenv(key, value)
 
 

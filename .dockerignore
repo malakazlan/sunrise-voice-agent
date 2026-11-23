@@ -6,5 +6,6 @@
 !.python-version
 !alembic.ini
 !app/
+!web/
 **/__pycache__
 **/.env*
