@@ -57,16 +57,19 @@ def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     module = importlib.reload(app.main)
 
+    assert "app" not in vars(module)
     with pytest.raises(ValidationError, match="app_envv"):
-        _ = module.app
+        module.create_app()
 
 
 @pytest.mark.usefixtures("clean_env")
-def test_module_app_starts_on_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_factory_reads_settings_from_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("APP_ENV", "prod")
 
-    client = TestClient(importlib.reload(app.main).app)
+    client = TestClient(create_app())
 
-    assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/docs").status_code == 200
+    assert client.get("/health").status_code == 200
+    assert client.get("/docs").status_code == 404

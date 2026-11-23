@@ -5,7 +5,10 @@ from fastapi import FastAPI
 from app.config import Settings
 
 
-def create_app(settings: Settings) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
+    if settings is None:
+        settings = Settings()
+
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger().setLevel(settings.log_level)
 
@@ -22,11 +25,3 @@ def create_app(settings: Settings) -> FastAPI:
         return {"status": "ok"}
 
     return app
-
-
-def __getattr__(name: str) -> FastAPI:
-    # uvicorn resolves "app.main:app" through this hook, so settings are read when the
-    # server starts rather than whenever the module is imported (tests import it too).
-    if name == "app":
-        return create_app(Settings())
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
