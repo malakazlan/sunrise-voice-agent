@@ -1,5 +1,6 @@
 import importlib
 import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -55,7 +56,13 @@ def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path
     (tmp_path / ".env").write_text("APP_ENVV=prod\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    module = importlib.reload(app.main)
+    # Import app.main and everything it imports afresh. The originals are put back after
+    # the test, both in sys.modules and as attributes of the app package.
+    for name in ("main", "config"):
+        monkeypatch.setattr(app, name, getattr(app, name))
+        monkeypatch.delitem(sys.modules, f"app.{name}")
+
+    module = importlib.import_module("app.main")
 
     assert "app" not in vars(module)
     with pytest.raises(ValidationError, match="app_envv"):
