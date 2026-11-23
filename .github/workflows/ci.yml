@@ -32,7 +32,7 @@ jobs:
         with:
           version: "0.10.4"
       - run: uv sync --locked
-      - run: uv run mypy --strict app tests
+      - run: uv run mypy --strict app tests scripts
 
   test:
     runs-on: ubuntu-24.04
@@ -89,7 +89,10 @@ jobs:
           echo "no .env files under /app"
       - name: Smoke test the container
         run: |
-          docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci
+          docker run -d --name app -e APP_ENV=prod \
+            -e DEMO_ACCESS_TOKEN=ci-fake-token -e TURN_HOST=turn.example.test \
+            -e TURN_SHARED_SECRET=ci-fake-turn-secret \
+            -p 8000:8000 sunrise-voice-agent:ci
           status=000
           for _ in $(seq 1 30); do
             status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
@@ -120,6 +123,14 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
+      - name: Container without voice secrets outside dev must not start
+        run: |
+          code=0
+          output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 5
+          echo "exit code: $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "demo_access_token is required unless app_env is dev"
       - name: Container logs
         if: always()
         run: docker logs app || true

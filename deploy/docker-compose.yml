@@ -1,12 +1,65 @@
 name: sunrise-voice-agent
 
+# Values come from the environment, or from an env file passed with --env-file. Empty values
+# count as unset, so the app's own defaults and required-setting checks apply.
 services:
   app:
     build:
       context: ..
       dockerfile: Dockerfile
+    # Loopback only: on a server the app is reached through the HTTPS proxy, not this port.
     ports:
-      - "8000:8000"
-    env_file:
-      - path: ../.env
-        required: false
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENV: ${APP_ENV:?APP_ENV is required}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+      DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
+      MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
+      MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
+
+  coturn:
+    image: coturn/coturn:4.19.2@sha256:ccdbc51e6f072130b0fc9eebda21f8d026d0a25581746c52557e887818011a3f
+    # Host networking, as the coturn image recommends: relayed addresses are the server's own
+    # and relay-to-relay traffic stays on the host. Open 3478/udp, 3478/tcp and
+    # 49160-49200/udp in the server firewall.
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TURN_HOST: ${TURN_HOST:?TURN_HOST is required}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?TURN_SHARED_SECRET is required}
+    # The image's entrypoint expands $VAR in each argument; $$ keeps Compose from doing it,
+    # so the secret is read from the container environment.
+    command:
+      - -n
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --use-auth-secret
+      - --static-auth-secret=$${TURN_SHARED_SECRET}
+      - --realm=$${TURN_HOST}
+      - --fingerprint
+      # No TLS listeners; DTLS is off unless --dtls is given.
+      - --no-tls
+      - --no-tcp-relay
+      - --no-multicast-peers
+      # No relaying to private, loopback, link-local or shared address ranges.
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.0.0.0-192.0.0.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=198.18.0.0-198.19.255.255
+      - --denied-peer-ip=::1
+      - --denied-peer-ip=64:ff9b::-64:ff9b::ffff:ffff
+      - --denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      # coturn logs every peer address; caller addresses are kept out of the logs.
+      - --no-stdout-log
+      - --simple-log
+      - --log-file=/dev/null
