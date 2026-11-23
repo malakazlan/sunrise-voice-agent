@@ -24,4 +24,9 @@ def create_app(settings: Settings) -> FastAPI:
     return app
 
 
-app = create_app(Settings())
+def __getattr__(name: str) -> FastAPI:
+    # uvicorn resolves "app.main:app" through this hook, so settings are read when the
+    # server starts rather than whenever the module is imported (tests import it too).
+    if name == "app":
+        return create_app(Settings())
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

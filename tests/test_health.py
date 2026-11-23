@@ -1,8 +1,12 @@
+import importlib
 import logging
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
+import app.main
 from app.config import AppEnv, LogLevel, Settings
 from app.main import create_app
 
@@ -44,3 +48,24 @@ def test_log_level_is_applied(log_level: LogLevel, expected: int) -> None:
         assert root.level == expected
     finally:
         root.setLevel(original)
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("APP_ENVV=prod\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    module = importlib.reload(app.main)
+
+    with pytest.raises(ValidationError, match="app_envv"):
+        _ = module.app
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_module_app_starts_on_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    client = TestClient(importlib.reload(app.main).app)
+
+    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/docs").status_code == 200

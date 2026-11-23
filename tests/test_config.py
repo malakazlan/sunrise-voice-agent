@@ -89,3 +89,17 @@ def test_env_example_matches_settings() -> None:
 def test_env_example_values_are_the_defaults() -> None:
     assert ENV_EXAMPLE.is_file()
     assert Settings(_env_file=ENV_EXAMPLE) == Settings(_env_file=None)
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_rejection_does_not_echo_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "APP_ENVV=not-for-logs-1\nLOG_LEVEL=not-for-logs-2\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    assert excinfo.value.error_count() == 2
+    assert "not-for-logs" not in str(excinfo.value)
