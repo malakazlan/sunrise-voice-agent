@@ -20,6 +20,16 @@ All data used by this project is synthetic. No real customer or personal data is
     appointment of that patient was deleted after an earlier seed.
   - Slots that are missing are added; existing slots are never changed.
   - Nothing is ever deleted. Only the last four digits of an SSN are stored.
+- Pure decision functions in `app/domain/` (no database, network or settings file):
+  - `office_hours.is_open`: Monday to Friday, 09:00 up to but not including 17:00, clinic
+    time; `office_hours.clinic_now` gives the current or simulated time.
+  - `matching.pick_patient`: which of the records already matched on date of birth and SSN
+    last four the claimed name belongs to. One exact match wins, otherwise one match that
+    sounds the same; two at the same level is no match. `matching.name_key` is the phonetic
+    key for a claimed name.
+  - `matching.match_medication`: which of the caller's own medications a spoken name means,
+    ignoring strength and form words and absorbing one-letter speech-to-text errors; two
+    matches is no match.
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
@@ -33,6 +43,7 @@ A generated slot never replaces an existing slot at the same doctor and time.
 |---------------------|-------------------------------------|----------------|
 | `APP_ENV`           | `dev`, `demo`, `prod`               | none, required |
 | `LOG_LEVEL`         | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO`         |
+| `SIMULATED_NOW`     | ISO date and time, or empty         | empty (unset)  |
 | `POSTGRES_HOST`     | host name                           | none, required |
 | `POSTGRES_PORT`     | port                                | `5432`         |
 | `POSTGRES_DB`       | database name                       | none, required |
@@ -45,6 +56,12 @@ the database container in Compose, so there is one set of database credentials.
 
 Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
 placeholder from `.env.example`; startup stops otherwise.
+
+`SIMULATED_NOW` fixes the clinic clock for dev and demo, for example to show the office
+closed on a weekday afternoon. Empty means the real clock. A value without a zone, such as
+`2026-11-24T10:30:00`, is clinic time (America/New_York); a wall time that a clock change
+skips or repeats is refused, so give an offset for those. Startup stops if it is set and
+`APP_ENV` is `prod`.
 
 ## Run with Docker
 

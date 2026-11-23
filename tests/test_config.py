@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -274,3 +275,80 @@ def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPa
         settings = Settings(_env_file=None)
 
         assert settings.database_url.password == password
+
+
+@pytest.mark.usefixtures("db_env")
+def test_simulated_now_refused_in_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "prod")
+    for value in ("2026-11-24T10:00:00", "2026-11-24T15:00:00Z", "2026-11-24T10:00:00-05:00"):
+        monkeypatch.setenv("SIMULATED_NOW", value)
+
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("simulated_now",)]
+        assert value not in str(excinfo.value)
+        assert "2026-11-24" not in str(excinfo.value)
+
+    monkeypatch.setenv("APP_ENV", "staging")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert sorted(error["loc"] for error in excinfo.value.errors()) == [
+        ("app_env",),
+        ("simulated_now",),
+    ]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_simulated_now_allowed_in_dev_and_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIMULATED_NOW", "2026-11-24T15:00:00Z")
+    for app_env in ("dev", "demo"):
+        monkeypatch.setenv("APP_ENV", app_env)
+
+        settings = Settings(_env_file=None)
+
+        assert settings.simulated_now == datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
+
+
+@pytest.mark.usefixtures("db_env")
+def test_simulated_now_without_zone_is_clinic_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "demo")
+    rows = [
+        ("2026-11-24T08:59:00", datetime(2026, 11, 24, 13, 59, tzinfo=UTC)),  # EST
+        ("2026-07-01T09:00:00", datetime(2026, 7, 1, 13, 0, tzinfo=UTC)),  # EDT
+    ]
+    for value, expected in rows:
+        monkeypatch.setenv("SIMULATED_NOW", value)
+
+        simulated = Settings(_env_file=None).simulated_now
+
+        assert simulated is not None
+        assert simulated.utcoffset() is not None
+        assert simulated == expected
+
+
+@pytest.mark.usefixtures("db_env")
+def test_simulated_now_inside_a_clock_change_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "demo")
+    # 02:30 on 2026-03-08 does not exist in New York; 01:30 on 2026-11-01 happens twice.
+    for value in ("2026-03-08T02:30:00", "2026-11-01T01:30:00"):
+        monkeypatch.setenv("SIMULATED_NOW", value)
+
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("simulated_now",)]
+        assert value not in str(excinfo.value)
+
+    # With an explicit offset the same wall time is unambiguous.
+    monkeypatch.setenv("SIMULATED_NOW", "2026-11-01T01:30:00-05:00")
+    assert Settings(_env_file=None).simulated_now == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+
+
+@pytest.mark.usefixtures("db_env")
+def test_blank_simulated_now_means_unset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("APP_ENV=prod\nSIMULATED_NOW=\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert Settings().simulated_now is None

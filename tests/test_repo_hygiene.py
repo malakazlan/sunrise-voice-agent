@@ -187,3 +187,100 @@ def test_raw_driver_connections_only_in_allowed_modules() -> None:
     }
 
     assert users <= RAW_CONNECTION_ALLOWED, users - RAW_CONNECTION_ALLOWED
+
+
+# app/domain/ decides office hours and identity from its arguments alone: no database, no
+# network, no settings or other files. Everything it may import is listed; anything else fails.
+DOMAIN_PACKAGE = "app.domain"
+DOMAIN_DIR = REPO_ROOT / "app" / "domain"
+DOMAIN_ALLOWED_IMPORTS = {
+    "__future__",
+    "collections.abc",
+    "dataclasses",
+    "datetime",
+    "re",
+    "typing",
+    "unicodedata",
+    "zoneinfo",
+    "jellyfish",
+    DOMAIN_PACKAGE,
+}
+# Builtins that read files or load modules by name.
+DOMAIN_FORBIDDEN_CALLS = {"open", "__import__", "exec", "eval"}
+
+
+def imported_modules(source: str, package: str) -> list[str]:
+    modules = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level:
+            parts = package.split(".")
+            base = parts[: len(parts) - node.level + 1]
+            modules.append(".".join([*base, *([node.module] if node.module else [])]))
+        elif isinstance(node, ast.ImportFrom):
+            modules.append(node.module or "")
+        elif (
+            isinstance(node, ast.Call) and getattr(node.func, "id", None) in DOMAIN_FORBIDDEN_CALLS
+        ):
+            modules.append(f"{getattr(node.func, 'id', '')}()")
+    return modules
+
+
+def impure_imports(source: str, package: str = DOMAIN_PACKAGE) -> list[str]:
+    return [
+        module
+        for module in imported_modules(source, package)
+        if not any(
+            module == allowed or module.startswith(f"{allowed}.")
+            for allowed in DOMAIN_ALLOWED_IMPORTS
+        )
+    ]
+
+
+def test_domain_is_pure() -> None:
+    for sample in (
+        "import sqlalchemy\n",
+        "from sqlalchemy.ext.asyncio import AsyncSession\n",
+        "import psycopg\n",
+        "from app.db.models import Patient\n",
+        "from app.db import session\n",
+        "from app.config import Settings\n",
+        "from app import config\n",
+        "from .. import config\n",
+        "from ..db.session import create_database_engine\n",
+        "import pydantic_settings\n",
+        "from dotenv import load_dotenv\n",
+        "import os\n",
+        "from pathlib import Path\n",
+        "import socket\n",
+        "import urllib.request\n",
+        "import httpx2\n",
+        "import asyncio\n",
+        "import importlib\n",
+        "open('settings.toml')\n",
+        "__import__('socket')\n",
+        "import collections\n",
+    ):
+        assert impure_imports(sample), sample
+    assert not impure_imports(
+        "from __future__ import annotations\n"
+        "from collections.abc import Iterable\n"
+        "from datetime import datetime\n"
+        "from zoneinfo import ZoneInfo\n"
+        "import jellyfish\n"
+        "from app.domain.clinic import CLINIC_TZ\n"
+        "from .clinic import CLINIC_TZ\n"
+        "from . import clinic\n"
+    )
+
+    sources = sorted(DOMAIN_DIR.rglob("*.py"))
+    assert {path.name for path in sources} >= {"clinic.py", "office_hours.py", "matching.py"}
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix(): found
+        for path in sources
+        if (found := impure_imports(path.read_text(encoding="utf-8")))
+    }
+
+    assert offenders == {}
