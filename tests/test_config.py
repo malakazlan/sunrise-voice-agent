@@ -36,6 +36,7 @@ def test_unknown_app_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.usefixtures("clean_env")
 def test_unknown_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("LOG_LEVEL", "TRACE")
 
     with pytest.raises(ValidationError, match="log_level"):
