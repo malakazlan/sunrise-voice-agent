@@ -9,11 +9,21 @@ ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
 
 @pytest.mark.usefixtures("clean_env")
-def test_defaults_apply_without_env_file() -> None:
+def test_defaults_apply_without_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "prod")
+
     settings = Settings(_env_file=None)
 
-    assert settings.app_env == "dev"
+    assert settings.app_env == "prod"
     assert settings.log_level == "INFO"
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_missing_app_env_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="app_env") as excinfo:
+        Settings(_env_file=None)
+
+    assert [error["type"] for error in excinfo.value.errors()] == ["missing"]
 
 
 @pytest.mark.usefixtures("clean_env")
@@ -46,21 +56,22 @@ def test_unknown_key_in_env_file_is_rejected(
 
 
 @pytest.mark.usefixtures("clean_env")
-def test_missing_env_file_gives_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_missing_env_file_is_fine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "demo")
 
     settings = Settings()
 
-    assert settings.app_env == "dev"
+    assert settings.app_env == "demo"
     assert settings.log_level == "INFO"
 
 
 @pytest.mark.usefixtures("clean_env")
 def test_env_file_value_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text("APP_ENV=demo\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("APP_ENV=demo\nLOG_LEVEL=DEBUG\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    assert Settings().app_env == "demo"
+    assert Settings().log_level == "DEBUG"
 
 
 @pytest.mark.usefixtures("clean_env")
@@ -86,15 +97,20 @@ def test_env_example_matches_settings() -> None:
 
 
 @pytest.mark.usefixtures("clean_env")
-def test_env_example_values_are_the_defaults() -> None:
+def test_env_example_loads_and_carries_defaults() -> None:
     assert ENV_EXAMPLE.is_file()
-    assert Settings(_env_file=ENV_EXAMPLE) == Settings(_env_file=None)
+
+    example = Settings(_env_file=ENV_EXAMPLE)
+
+    for name, field in Settings.model_fields.items():
+        if not field.is_required():
+            assert getattr(example, name) == field.default, name
 
 
 @pytest.mark.usefixtures("clean_env")
 def test_rejection_does_not_echo_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".env").write_text(
-        "APP_ENVV=not-for-logs-1\nLOG_LEVEL=not-for-logs-2\n", encoding="utf-8"
+        "APP_ENV=demo\nAPP_ENVV=not-for-logs-1\nLOG_LEVEL=not-for-logs-2\n", encoding="utf-8"
     )
     monkeypatch.chdir(tmp_path)
 

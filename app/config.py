@@ -9,5 +9,5 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="forbid", hide_input_in_errors=True)
 
-    app_env: AppEnv = "dev"
+    app_env: AppEnv
     log_level: LogLevel = "INFO"

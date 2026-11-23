@@ -64,6 +64,7 @@ def test_import_does_not_read_settings(monkeypatch: pytest.MonkeyPatch, tmp_path
 @pytest.mark.usefixtures("clean_env")
 def test_module_app_starts_on_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "dev")
 
     client = TestClient(importlib.reload(app.main).app)
 

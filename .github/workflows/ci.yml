@@ -71,7 +71,7 @@ jobs:
       - run: docker build -t sunrise-voice-agent:ci .
       - name: Smoke test the container
         run: |
-          docker run -d --name app -p 8000:8000 sunrise-voice-agent:ci
+          docker run -d --name app -e APP_ENV=prod -p 8000:8000 sunrise-voice-agent:ci
           status=000
           for _ in $(seq 1 30); do
             status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
@@ -80,6 +80,9 @@ jobs:
           done
           echo "GET /health -> $status"
           test "$status" = "200"
+          docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
+          echo "GET /docs -> $docs"
+          test "$docs" = "404"
           uid=$(docker exec app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
@@ -91,6 +94,14 @@ jobs:
           done
           echo "HEALTHCHECK -> $health"
           test "$health" = "healthy"
+      - name: Container without APP_ENV must not start
+        run: |
+          code=0
+          output=$(timeout 60 docker run --rm sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 5
+          echo "exit code: $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "app_env"
       - name: Container logs
         if: always()
         run: docker logs app || true
