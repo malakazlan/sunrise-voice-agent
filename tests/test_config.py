@@ -3,11 +3,12 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
+from app.db.session import create_sync_engine
 
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
@@ -156,7 +157,7 @@ def test_database_url_is_built_from_the_parts(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("POSTGRES_PORT", "6543")
     monkeypatch.setenv("POSTGRES_DB", "clinic")
     monkeypatch.setenv("POSTGRES_USER", "clinic_app")
-    monkeypatch.setenv("POSTGRES_PASSWORD", "p@ss:word/1")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "p@ss:word/long-enough-1")
 
     url = Settings(_env_file=None).database_url
 
@@ -167,7 +168,7 @@ def test_database_url_is_built_from_the_parts(monkeypatch: pytest.MonkeyPatch) -
         "clinic",
         "clinic_app",
     )
-    assert url.password == "p@ss:word/1"
+    assert url.password == "p@ss:word/long-enough-1"
 
 
 def test_database_password_is_hidden(
@@ -204,7 +205,7 @@ def test_database_password_is_hidden(
     # A refused login: neither the error nor the engine's log lines carry the password.
     caplog.set_level(logging.DEBUG)
     caplog.set_level(logging.DEBUG, logger="sqlalchemy")
-    engine = create_engine(url, poolclass=NullPool)
+    engine = create_sync_engine(settings, poolclass=NullPool)
     with pytest.raises(OperationalError) as connect_error:
         engine.connect()
 
@@ -216,7 +217,7 @@ def test_database_password_is_hidden(
 
     # A working connection logs at debug level; the real password is not in those lines.
     real_password = server_settings.postgres_password.get_secret_value()
-    working = create_engine(server_settings.database_url, poolclass=NullPool)
+    working = create_sync_engine(server_settings, poolclass=NullPool)
     with working.connect() as connection:
         connection.execute(text("SELECT 1"))
 
@@ -230,3 +231,46 @@ def test_database_password_is_hidden(
 
     assert [error["loc"] for error in rejected.value.errors()] == [("postgres_port",)]
     assert password not in str(rejected.value)
+
+
+def example_password() -> str:
+    for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("POSTGRES_PASSWORD="):
+            return line.split("=", 1)[1]
+    raise AssertionError("POSTGRES_PASSWORD missing from .env.example")
+
+
+@pytest.mark.usefixtures("db_env")
+def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPatch) -> None:
+    placeholder = example_password()
+    # The placeholder is long enough to pass the length rule, so only its own check stops it.
+    assert len(placeholder) >= 16
+
+    refused = [
+        ("prod", "fifteen-chars-x"),
+        ("demo", "short"),
+        ("prod", placeholder),
+        ("demo", placeholder),
+    ]
+    for app_env, password in refused:
+        monkeypatch.setenv("APP_ENV", app_env)
+        monkeypatch.setenv("POSTGRES_PASSWORD", password)
+
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("postgres_password",)]
+        assert password not in str(excinfo.value), (app_env, password)
+
+    accepted = [
+        ("prod", "sixteen-chars-xx"),
+        ("dev", placeholder),
+        ("dev", "short"),
+    ]
+    for app_env, password in accepted:
+        monkeypatch.setenv("APP_ENV", app_env)
+        monkeypatch.setenv("POSTGRES_PASSWORD", password)
+
+        settings = Settings(_env_file=None)
+
+        assert settings.database_url.password == password

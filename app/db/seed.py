@@ -7,10 +7,10 @@ import asyncio
 import json
 import logging
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.dialects.postgresql import insert
@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.models import Appointment, AvailableSlot, Medication, Patient
 from app.db.session import create_database_engine, create_session_factory
-from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL
+from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL, clinic_date
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,9 @@ GENERATED_TIMES = {
     DR_LEE: (time(10, 0), time(13, 30)),
 }
 SCHEDULED = "scheduled"
+# The same rules the database enforces, checked first so that a bad record is reported by
+# field name only (hide_input_in_errors) and never reaches an INSERT.
+LAST_FOUR = r"^[0-9]{4}$"
 
 # For example "2026-12-03 10:30 AM with Dr. Patel", in clinic-local time.
 APPOINTMENT_TEXT = re.compile(
@@ -44,7 +47,7 @@ class _Record(BaseModel):
 
 class MedicationRecord(_Record):
     name: str
-    refills_remaining: int
+    refills_remaining: Annotated[int, Field(ge=0)]
     last_filled: date
     pharmacy: str
 
@@ -54,12 +57,12 @@ class PatientRecord(_Record):
     first_name: str
     last_name: str
     dob: date
-    ssn_last4: str | None
+    ssn_last4: Annotated[str, Field(pattern=LAST_FOUR)] | None
     phone: str
     medications: list[MedicationRecord]
     next_appointment: str | None
     lab_results_status: str
-    balance_due: Decimal
+    balance_due: Annotated[Decimal, Field(ge=0)]
 
     @model_validator(mode="before")
     @classmethod
@@ -210,7 +213,7 @@ async def _run(settings: Settings, today: date) -> None:
 def main() -> None:
     settings = Settings()
     logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
-    today = datetime.now(CLINIC_TZ).date()
+    today = clinic_date(datetime.now(UTC))
     # psycopg's async mode needs a selector event loop; Windows defaults to the proactor loop.
     asyncio.run(_run(settings, today), loop_factory=asyncio.SelectorEventLoop)
 

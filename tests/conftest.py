@@ -8,12 +8,12 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
-from app.db.session import create_database_engine, create_session_factory
+from app.db.session import create_database_engine, create_session_factory, create_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,6 +24,35 @@ OFFLINE_DB_ENV = {
     "POSTGRES_USER": "sunrise_offline",
     "POSTGRES_PASSWORD": "offline-test-password",
 }
+
+
+# No test may end skipped, xfailed or xpassed, however the skip was written (marker, call,
+# alias, exception, collection-time skip). Each one is recorded and the run fails at the end.
+NOT_RUN: list[str] = []
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if hasattr(report, "wasxfail"):
+        NOT_RUN.append(f"{report.nodeid}: xfailed or xpassed")
+    elif report.skipped:
+        NOT_RUN.append(f"{report.nodeid}: skipped")
+
+
+def pytest_collectreport(report: pytest.CollectReport) -> None:
+    if report.skipped:
+        NOT_RUN.append(f"{report.nodeid}: skipped at collection")
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    if NOT_RUN:
+        terminalreporter.section("tests that must run but did not", red=True)
+        for line in NOT_RUN:
+            terminalreporter.line(line)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    if NOT_RUN and session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
@@ -57,7 +86,7 @@ def with_database(settings: Settings, name: str) -> Settings:
 
 
 def admin_engine(settings: Settings) -> Engine:
-    return create_engine(settings.database_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    return create_sync_engine(settings, isolation_level="AUTOCOMMIT", poolclass=NullPool)
 
 
 def create_database(settings: Settings, name: str, template: str | None = None) -> None:
@@ -182,7 +211,7 @@ def database(server_settings: Settings, migrated_template: str) -> Iterator[Sett
 
 @pytest.fixture
 def sync_engine(database: Settings) -> Iterator[Engine]:
-    engine = create_engine(database.database_url, poolclass=NullPool)
+    engine = create_sync_engine(database, poolclass=NullPool)
     try:
         yield engine
     finally:

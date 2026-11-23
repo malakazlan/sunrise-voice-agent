@@ -6,11 +6,12 @@ from pathlib import Path
 
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db.models import Base
+from app.db.session import create_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLINIC_TABLES = {"patients", "medications", "appointments", "available_slots"}
@@ -37,7 +38,7 @@ CONSTRAINT_DEFINITIONS = text(
 
 
 def table_names(settings: Settings) -> set[str]:
-    engine = create_engine(settings.database_url, poolclass=NullPool)
+    engine = create_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return set(inspect(connection).get_table_names())
@@ -45,8 +46,27 @@ def table_names(settings: Settings) -> set[str]:
         engine.dispose()
 
 
+# Every column as Postgres reports it, including its default (a serial key's sequence) and
+# whether it is an identity column.
+COLUMN_DEFINITIONS = text(
+    "SELECT table_name, column_name, data_type, character_maximum_length, numeric_precision,"
+    " numeric_scale, is_nullable, column_default, is_identity"
+    " FROM information_schema.columns"
+    " WHERE table_schema = 'public' AND table_name <> 'alembic_version'"
+)
+
+
+def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
+    engine = create_sync_engine(settings, poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            return {tuple(row) for row in connection.execute(COLUMN_DEFINITIONS).all()}
+    finally:
+        engine.dispose()
+
+
 def constraint_definitions(settings: Settings) -> set[tuple[str, str, str]]:
-    engine = create_engine(settings.database_url, poolclass=NullPool)
+    engine = create_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             rows = connection.execute(CONSTRAINT_DEFINITIONS).all()
@@ -62,7 +82,7 @@ def test_migration_matches_models(
     upgrade = run_alembic(migrated, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
 
-    engine = create_engine(migrated.database_url, poolclass=NullPool)
+    engine = create_sync_engine(migrated, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection, opts=COMPARE_OPTIONS)
@@ -77,7 +97,7 @@ def test_migration_matches_models(
     # Alembic compares CHECK constraints by name only. Build the schema straight from the
     # models as well and compare every constraint's definition.
     from_models = new_database()
-    engine = create_engine(from_models.database_url, poolclass=NullPool)
+    engine = create_sync_engine(from_models, poolclass=NullPool)
     try:
         with engine.begin() as connection:
             Base.metadata.create_all(connection)
@@ -87,6 +107,22 @@ def test_migration_matches_models(
     migrated_constraints = constraint_definitions(migrated)
     assert len(migrated_constraints) == 17
     assert migrated_constraints == constraint_definitions(from_models)
+
+    migrated_columns = column_definitions(migrated)
+    assert len(migrated_columns) == 34
+    assert migrated_columns == column_definitions(from_models)
+    assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
+    assert (
+        "available_slots",
+        "id",
+        "integer",
+        None,
+        32,
+        0,
+        "NO",
+        "nextval('available_slots_id_seq'::regclass)",
+        "NO",
+    ) in migrated_columns
 
 
 def test_upgrade_on_migrated_database_is_a_no_op(

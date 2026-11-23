@@ -1,11 +1,11 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db.models import Base
+from app.db.session import create_sync_engine
 
 config = context.config
 
@@ -14,7 +14,7 @@ if config.config_file_name is not None:
 
 
 def run_migrations_online() -> None:
-    engine = create_engine(Settings().database_url, poolclass=NullPool)
+    engine = create_sync_engine(Settings(), poolclass=NullPool)
     with engine.connect() as connection:
         context.configure(
             connection=connection,

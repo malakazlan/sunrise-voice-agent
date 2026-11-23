@@ -1,6 +1,7 @@
 import logging
 import re
 import subprocess
+import traceback
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -9,7 +10,10 @@ from zoneinfo import ZoneInfo
 
 import anyio
 import pytest
+from psycopg import errors
+from pydantic import ValidationError
 from sqlalchemy import Text, column, select, table, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -455,3 +459,105 @@ async def test_unreadable_appointment_text_is_rejected(session: AsyncSession) ->
         await run_seed(session, data)
 
     assert "Tuesday" not in str(excinfo.value)
+
+
+def rendered(error: BaseException) -> str:
+    """Everything a traceback in the logs would show, chained exceptions included."""
+    return "".join(traceback.format_exception(error))
+
+
+SEEDED_VALUES = ("Sarah", "Johnson", "Maria", "Garcia", "Emily", "Nguyen", "3344", "9081", "4406")
+
+
+async def test_database_errors_do_not_carry_row_values(session: AsyncSession) -> None:
+    # 1. The patients insert is refused by the database itself (a test-only trigger), so
+    #    every patient's name and last four digits are in the statement's parameters.
+    await session.execute(
+        text(
+            "CREATE FUNCTION refuse_row() RETURNS trigger LANGUAGE plpgsql"
+            " AS $$ BEGIN RAISE EXCEPTION 'refused by the test trigger'; END $$"
+        )
+    )
+    await session.execute(
+        text(
+            "CREATE TRIGGER refuse_patients BEFORE INSERT ON patients"
+            " FOR EACH ROW EXECUTE FUNCTION refuse_row()"
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(DBAPIError) as refused:
+        await run_seed(session)
+    await session.rollback()
+
+    text_of_error = rendered(refused.value)
+    assert "refused by the test trigger" in text_of_error
+    assert "[parameters:" not in text_of_error
+    for value in SEEDED_VALUES:
+        assert value not in text_of_error, value
+
+    # 2. A duplicate key: Sarah Johnson's appointment time is taken directly first.
+    await session.execute(text("DROP TRIGGER refuse_patients ON patients"))
+    await session.execute(
+        text(
+            "INSERT INTO patients (id, first_name, last_name, dob, phone,"
+            " lab_results_status, balance_due)"
+            " VALUES ('X001', 'Other', 'Person', '1970-01-01', '555-000-0000', 'Pending', 0)"
+        )
+    )
+    await session.execute(
+        text(
+            "INSERT INTO appointments (patient_id, doctor, starts_at, status)"
+            " VALUES ('X001', 'Dr. Patel', :starts_at, 'scheduled')"
+        ),
+        {"starts_at": datetime(2026, 12, 3, 15, 30, tzinfo=UTC)},
+    )
+    await session.commit()
+
+    with pytest.raises(DBAPIError) as duplicate:
+        await run_seed(session)
+
+    assert isinstance(duplicate.value.orig, errors.UniqueViolation)
+    text_of_error = rendered(duplicate.value)
+    assert "uq_appointments_doctor_starts_at" in text_of_error
+    assert "[parameters:" not in text_of_error
+    for value in (*SEEDED_VALUES, "P001", "P003"):
+        assert value not in text_of_error, value
+
+
+async def test_loader_rejects_bad_values_without_echoing_them(session: AsyncSession) -> None:
+    ssn_shaped = "-".join(["9" * 3, "6" * 2, "3" * 4])
+
+    def with_bad(field: str, value: Any) -> dict[str, Any]:
+        data = load_seed_data()
+        if field == "refills_remaining":
+            data["patients"][0]["medications"][0][field] = value
+        else:
+            data["patients"][0][field] = value
+        return data
+
+    cases = [
+        ("ssn_last4", ssn_shaped),
+        ("ssn_last4", "334"),
+        ("ssn_last4", "33a4"),
+        ("ssn_last4", "33445"),
+        ("balance_due", Decimal("-12.34")),
+        ("refills_remaining", -7),
+    ]
+    for field, value in cases:
+        with pytest.raises(ValidationError) as excinfo:
+            await seed(session, with_bad(field, value), TUESDAY)
+
+        message = rendered(excinfo.value)
+        assert [error["loc"][-1] for error in excinfo.value.errors()] == [field], value
+        assert str(value) not in message, value
+        for seeded in SEEDED_VALUES:
+            assert seeded not in message, (value, seeded)
+
+    await session.rollback()
+    assert await counts(session) == {
+        "patients": 0,
+        "medications": 0,
+        "appointments": 0,
+        "available_slots": 0,
+    }
