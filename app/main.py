@@ -9,7 +9,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
 
-    logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger().setLevel(settings.log_level)
 
     docs_enabled = settings.app_env == "dev"
