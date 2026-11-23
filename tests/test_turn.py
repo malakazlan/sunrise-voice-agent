@@ -30,20 +30,43 @@ EXPECTED_DIGEST_HEX = [
 EXPECTED_PASSWORD = base64.b64encode(bytes.fromhex("".join(EXPECTED_DIGEST_HEX))).decode()
 
 
+# The same, for username 1700000360 (max_call_seconds=300):
+#   printf '%s' 1700000360 | openssl dgst -sha1 -hmac fake-turn-shared-secret-for-unit-tests -hex
+SHORT_CALL_DIGEST_HEX = [
+    "ae00",
+    "02bc",
+    "1ff8",
+    "d11c",
+    "5415",
+    "16a6",
+    "4e08",
+    "e739",
+    "9a34",
+    "8c7e",
+]
+SHORT_CALL_PASSWORD = base64.b64encode(bytes.fromhex("".join(SHORT_CALL_DIGEST_HEX))).decode()
+
+
 def test_credential_matches_known_vector() -> None:
     expected = TurnCredential(username="1700000660", password=EXPECTED_PASSWORD)
 
     assert derive_credential(SecretStr(FAKE_SECRET), expires_at=1700000660) == expected
 
 
-def test_credential_expires_after_the_longest_call() -> None:
-    settings = offline_settings(turn_shared_secret=FAKE_SECRET, max_call_seconds=600)
+@pytest.mark.parametrize(
+    ("max_call_seconds", "username", "password"),
+    [(600, "1700000660", EXPECTED_PASSWORD), (300, "1700000360", SHORT_CALL_PASSWORD)],
+)
+def test_credential_expires_after_the_longest_call(
+    max_call_seconds: int, username: str, password: str
+) -> None:
+    settings = offline_settings(turn_shared_secret=FAKE_SECRET, max_call_seconds=max_call_seconds)
 
     credential = issue_credential(settings, now=1700000000.9)
 
     # Expiry = now (whole seconds) + max_call_seconds + 60 second margin.
-    assert credential.username == "1700000660"
-    assert credential.password == EXPECTED_PASSWORD
+    assert credential.username == username
+    assert credential.password == password
 
 
 def test_browser_ice_servers_point_at_turn_host() -> None:

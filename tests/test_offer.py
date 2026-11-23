@@ -1,11 +1,15 @@
 import asyncio
 import hmac
-from collections.abc import Awaitable, Callable
+import json
+import logging
+from collections.abc import Awaitable, Callable, MutableMapping
+from typing import Any
 
 import pytest
 from conftest import VOICE_SECRETS, offline_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.main import create_app
@@ -80,19 +84,96 @@ def active_calls(app: FastAPI) -> int:
     return calls.active
 
 
+# The largest offer body the app reads; written out here, not imported from the app.
+BODY_LIMIT = 32 * 1024
+STREAM_CHUNK = 16 * 1024
+STREAM_GIVES_UP = 64 * 1024 * 1024
+
+
+def offer_scope(headers: dict[str, str], content_length: int | None) -> dict[str, Any]:
+    raw_headers = [(b"content-type", b"application/json")]
+    raw_headers += [(name.lower().encode(), value.encode()) for name, value in headers.items()]
+    if content_length is not None:
+        raw_headers.append((b"content-length", str(content_length).encode()))
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/offer",
+        "raw_path": b"/offer",
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw_headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+
+
+async def post_stream(
+    app: FastAPI, headers: dict[str, str], content_length: int | None = None
+) -> tuple[int | None, int]:
+    """POST /offer with a body that never ends, straight through ASGI.
+
+    Returns the response status (None if the app gave no answer within 10 seconds) and how
+    many body bytes the app pulled. The stream stops sending after 64 MiB and then waits
+    forever, so an app that buffers the whole body never answers.
+    """
+    consumed = 0
+    sent: list[MutableMapping[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal consumed
+        if consumed >= STREAM_GIVES_UP:
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)
+        consumed += STREAM_CHUNK
+        return {"type": "http.request", "body": b"[" * STREAM_CHUNK, "more_body": True}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        sent.append(message)
+
+    task = asyncio.ensure_future(app(offer_scope(headers, content_length), receive, send))
+    done, _pending = await asyncio.wait({task}, timeout=10)
+    if not done:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    starts = [message["status"] for message in sent if message["type"] == "http.response.start"]
+    return (starts[0] if starts else None), consumed
+
+
+# Bodies a caller without the token may send; none of them may be read or parsed.
+TOKENLESS_BODIES = {
+    "offer": json.dumps(OFFER).encode(),
+    "oversized": b"x" * (4 * BODY_LIMIT),
+    "malformed": b'{"sdp": "v=0", "type": ',
+    "nested": b"[" * (BODY_LIMIT // 2 - 8) + b"]" * (BODY_LIMIT // 2 - 8),
+}
+
+
+@pytest.mark.parametrize("body", list(TOKENLESS_BODIES), ids=list(TOKENLESS_BODIES))
 @pytest.mark.parametrize("headers", BAD_AUTH)
-def test_offer_requires_access_token(headers: dict[str, str]) -> None:
+def test_offer_requires_access_token(headers: dict[str, str], body: str) -> None:
     opener = Opener()
     app = create_app(voice_settings(), open_call=opener)
 
     with TestClient(app) as client:
-        response = client.post("/offer", json=OFFER, headers=headers)
+        response = client.post(
+            "/offer",
+            content=TOKENLESS_BODIES[body],
+            headers={**headers, "Content-Type": "application/json"},
+        )
 
         assert response.status_code == 401
         assert response.headers["www-authenticate"] == "Bearer"
         assert "sdp" not in response.json()
         assert opener.attempts == 0
         assert active_calls(app) == 0
+
+    # A body that never ends is not read at all before the token is checked.
+    status, consumed = asyncio.run(post_stream(app, headers))
+    assert (status, consumed) == (401, 0)
 
 
 @pytest.mark.parametrize("headers", BAD_AUTH)
@@ -278,6 +359,7 @@ def test_dev_without_token_is_open() -> None:
         {"sdp": "v=0"},
         {"sdp": "v=0" + "a" * 20_000, "type": "offer"},
         {"sdp": "", "type": "offer"},
+        {"sdp": "v=0", "type": "offer", "extra": "field"},
     ],
 )
 def test_malformed_offer_is_rejected(body: dict[str, str]) -> None:
@@ -299,3 +381,155 @@ def test_call_page_is_served() -> None:
     assert response.headers["content-type"].startswith("text/html")
     for control in ('id="token"', 'id="call"', 'id="hangup"', 'id="state"', 'id="candidate"'):
         assert control in response.text
+
+
+def test_offer_body_is_capped() -> None:
+    opener = Opener()
+    app = create_app(voice_settings(), open_call=opener)
+
+    # A body over the limit is refused, whether it is sent whole or never ends.
+    with TestClient(app) as client:
+        response = client.post(
+            "/offer",
+            content=b"x" * (BODY_LIMIT + 1),
+            headers={**AUTH, "Content-Type": "application/json"},
+        )
+    assert response.status_code == 413
+
+    status, consumed = asyncio.run(post_stream(app, AUTH))
+    assert status == 413
+    # Read up to the limit and at most one chunk more, never the whole stream.
+    assert consumed <= BODY_LIMIT + STREAM_CHUNK
+
+    # A declared length over the limit is refused before any of the body is read.
+    status, consumed = asyncio.run(post_stream(app, AUTH, content_length=BODY_LIMIT + 1))
+    assert (status, consumed) == (413, 0)
+
+    assert opener.attempts == 0
+    assert active_calls(app) == 0
+
+
+def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Configured empty: the app will not start with it.
+    with pytest.raises(ValidationError) as excinfo:
+        offline_settings(demo_access_token="")
+    assert [error["loc"] for error in excinfo.value.errors()] == [("demo_access_token",)]
+
+    # Supplied empty: refused before any comparison is made.
+    compared: list[tuple[bytes, bytes]] = []
+
+    def spy(a: bytes, b: bytes) -> bool:
+        compared.append((a, b))
+        return True
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+    opener = Opener()
+    with TestClient(create_app(voice_settings(), open_call=opener)) as client:
+        for empty in ("Bearer ", "Bearer", "Bearer  "):
+            headers = {"Authorization": empty}
+            assert client.post("/offer", json=OFFER, headers=headers).status_code == 401
+            assert client.get("/ice-servers", headers=headers).status_code == 401
+    assert compared == []
+    assert opener.attempts == 0
+
+    # Both empty: there is no configuration in which an empty token opens a call.
+    with pytest.raises(ValidationError):
+        offline_settings(app_env="dev", demo_access_token="")
+
+
+def test_slot_released_when_stop_hangs(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="app.voice.calls")
+
+    class StuckCall(FakeCall):
+        async def stop(self) -> None:
+            self.stopped = True
+            await asyncio.Event().wait()
+
+    async def main() -> None:
+        registry = CallRegistry(max_calls=1, max_seconds=600, sleep=never, stop_timeout=0.1)
+        call = StuckCall()
+        call_id = registry.reserve()
+        assert call_id is not None
+        task = registry.start(call_id, call)
+        await asyncio.sleep(0)
+        closing = asyncio.ensure_future(registry.close())
+        done, _pending = await asyncio.wait({closing, task}, timeout=5)
+        assert done == {closing, task}
+        assert call.stopped
+        assert registry.active == 0
+        assert f"call_stop_timed_out call_id={call_id}" in caplog.text
+
+    asyncio.run(main())
+
+
+def test_slot_released_when_setup_is_cancelled() -> None:
+    entered = asyncio.Event()
+
+    async def slow_open(call_id: str, sdp: str, sdp_type: str) -> FakeCall:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("never reached")
+
+    app = create_app(voice_settings(max_concurrent_calls=1), open_call=slow_open)
+    body = json.dumps(OFFER).encode()
+
+    async def main() -> None:
+        delivered = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal delivered
+            if delivered:
+                await asyncio.Event().wait()
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message: MutableMapping[str, Any]) -> None:
+            pass
+
+        task = asyncio.ensure_future(app(offer_scope(AUTH, len(body)), receive, send))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert active_calls(app) == 1
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert active_calls(app) == 0
+
+    asyncio.run(main())
+
+
+async def post_offer(app: FastAPI) -> int:
+    """POST /offer with a valid body and the token, straight through ASGI."""
+    body = json.dumps(OFFER).encode()
+    delivered = False
+    starts: list[int] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal delivered
+        if delivered:
+            await asyncio.Event().wait()
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            starts.append(message["status"])
+
+    await app(offer_scope(AUTH, len(body)), receive, send)
+    return starts[0]
+
+
+def test_shutdown_ends_active_calls() -> None:
+    opener = Opener()
+    app = create_app(voice_settings(), open_call=opener)
+
+    # The app's lifespan runs on this loop, which stays up after the shutdown, so only the
+    # shutdown itself can have ended the calls.
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            assert [await post_offer(app), await post_offer(app)] == [200, 200]
+            assert active_calls(app) == 2
+            assert not any(call.stopped for call in opener.calls)
+
+        assert [call.stopped for call in opener.calls] == [True, True]
+        assert active_calls(app) == 0
+
+    asyncio.run(main())

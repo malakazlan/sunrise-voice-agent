@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import Field, PositiveInt, SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
@@ -11,6 +11,8 @@ HostName = Annotated[str, Field(pattern=r"^[A-Za-z0-9.-]+$")]
 # The POSTGRES_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_PASSWORD = "change-me-to-a-long-random-value"  # noqa: S105 (a published placeholder)
 MIN_PASSWORD_LENGTH = 16
+# The access token and the TURN secret, whenever they are set.
+MIN_SECRET_LENGTH = 32
 
 
 def _outside_dev(info: ValidationInfo) -> bool:
@@ -31,13 +33,17 @@ class Settings(BaseSettings):
     postgres_user: str
     postgres_password: SecretStr
 
-    max_concurrent_calls: PositiveInt = 3
-    max_call_seconds: PositiveInt = 600
+    max_concurrent_calls: int = Field(default=3, gt=0, le=20)
+    max_call_seconds: int = Field(default=600, gt=0, le=3600)
     # The voice fields are checked in this order, each against the ones before it, so that
-    # every error is raised on a field whose value is missing and no secret is echoed in it.
-    turn_shared_secret: SecretStr | None = Field(default=None, validate_default=True)
+    # a missing value is reported on its own field and never next to a secret given in another.
+    turn_shared_secret: SecretStr | None = Field(
+        default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
+    )
     turn_host: HostName | None = Field(default=None, validate_default=True)
-    demo_access_token: SecretStr | None = Field(default=None, validate_default=True)
+    demo_access_token: SecretStr | None = Field(
+        default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
+    )
 
     @field_validator("postgres_password")
     @classmethod

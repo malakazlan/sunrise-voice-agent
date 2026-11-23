@@ -8,6 +8,9 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
+# How long ending a call may take before its slot is released regardless.
+STOP_TIMEOUT_SECONDS = 10.0
+
 
 class Call(Protocol):
     def answer(self) -> dict[str, str]: ...
@@ -26,12 +29,16 @@ class CallRegistry:
         max_calls: int,
         max_seconds: float,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        stop_timeout: float = STOP_TIMEOUT_SECONDS,
     ) -> None:
         self._max_calls = max_calls
         self._max_seconds = max_seconds
         self._sleep = sleep
+        self._stop_timeout = stop_timeout
         self._slots: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Calls still being ended; held so that the tasks are not collected mid-run.
+        self._ending: set[asyncio.Task[None]] = set()
 
     @property
     def active(self) -> int:
@@ -49,7 +56,11 @@ class CallRegistry:
         self._slots.discard(call_id)
 
     def start(self, call_id: str, call: Call) -> "asyncio.Task[None]":
-        task = asyncio.create_task(self._supervise(call_id, call))
+        # Started eagerly, so supervision is already inside its try block when start() returns:
+        # a task cancelled before its first step would skip the stop and the release.
+        task = asyncio.Task(
+            self._supervise(call_id, call), loop=asyncio.get_running_loop(), eager_start=True
+        )
         self._tasks[call_id] = task
         return task
 
@@ -72,9 +83,14 @@ class CallRegistry:
                 ended_by = "finished"
         finally:
             limit.cancel()
+            ending = asyncio.ensure_future(self._end(call, running))
+            self._ending.add(ending)
+            ending.add_done_callback(self._ending.discard)
             try:
-                await call.stop()
-                await asyncio.gather(running, return_exceptions=True)
+                done, _pending = await asyncio.wait({ending}, timeout=self._stop_timeout)
+                if not done:
+                    ending.cancel()
+                    logger.warning("call_stop_timed_out call_id=%s", call_id)
             finally:
                 self.release(call_id)
                 self._tasks.pop(call_id, None)
@@ -85,6 +101,11 @@ class CallRegistry:
                     loop.time() - started,
                     self.active,
                 )
+
+    @staticmethod
+    async def _end(call: Call, running: "asyncio.Future[None]") -> None:
+        await call.stop()
+        await asyncio.gather(running, return_exceptions=True)
 
     async def close(self) -> None:
         tasks = list(self._tasks.values())

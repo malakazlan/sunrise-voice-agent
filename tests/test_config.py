@@ -425,3 +425,84 @@ def test_voice_secrets_are_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
         Settings(_env_file=None)
     assert "not-for-logs" not in str(excinfo.value)
     assert "not-for-logs" not in repr(excinfo.value.errors())
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET"])
+@pytest.mark.parametrize("app_env", ["dev", "demo", "prod"])
+def test_short_secrets_are_refused(monkeypatch: pytest.MonkeyPatch, key: str, app_env: str) -> None:
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", app_env)
+    # 31 characters, one short of the minimum; built from pieces like the other fake values.
+    short = "-".join(["short", "not", "for", "logs"]) + "z" * 13
+    assert len(short) == 31
+    monkeypatch.setenv(key, short)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert [(error["type"], error["loc"]) for error in excinfo.value.errors()] == [
+        ("too_short", (key.lower(),))
+    ]
+    assert short not in str(excinfo.value)
+    assert short not in repr(excinfo.value)
+
+    # 32 characters is enough.
+    monkeypatch.setenv(key, short + "z")
+    assert getattr(Settings(_env_file=None), key.lower()).get_secret_value() == short + "z"
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("app_env", ["demo", "prod"])
+@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET", "TURN_HOST"])
+def test_empty_voice_values_count_as_missing_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, app_env: str, key: str
+) -> None:
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.setenv(key, "")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert [(error["loc"], error["msg"]) for error in excinfo.value.errors()] == [
+        ((key.lower(),), f"Value error, {key.lower()} is required unless app_env is dev")
+    ]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_empty_voice_values_in_dev_leave_voice_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    for name in VOICE_SECRETS:
+        monkeypatch.setenv(name, "")
+
+    settings = Settings(_env_file=None)
+
+    assert (settings.demo_access_token, settings.turn_host, settings.turn_shared_secret) == (
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    ("key", "highest"), [("MAX_CONCURRENT_CALLS", 20), ("MAX_CALL_SECONDS", 3600)]
+)
+def test_call_limits_have_upper_bounds(
+    monkeypatch: pytest.MonkeyPatch, key: str, highest: int
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv(key, str(highest))
+    assert getattr(Settings(_env_file=None), key.lower()) == highest
+
+    monkeypatch.setenv(key, str(highest + 1))
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [("less_than_equal", (key.lower(),))]
