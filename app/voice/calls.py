@@ -91,6 +91,9 @@ class CallRegistry:
                 if not done:
                     ending.cancel()
                     logger.warning("call_stop_timed_out call_id=%s", call_id)
+                    if not running.done():
+                        running.cancel()
+                        logger.warning("call_run_cancelled call_id=%s", call_id)
             finally:
                 self.release(call_id)
                 self._tasks.pop(call_id, None)

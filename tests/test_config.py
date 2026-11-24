@@ -1,5 +1,7 @@
+import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import VOICE_SECRETS
@@ -393,10 +395,18 @@ def test_turn_host_must_be_a_bare_host_name(
 
 
 @pytest.mark.usefixtures("db_env")
-@pytest.mark.parametrize("key", ["MAX_CONCURRENT_CALLS", "MAX_CALL_SECONDS"])
-@pytest.mark.parametrize("value", ["0", "-1"])
+@pytest.mark.parametrize(
+    ("key", "value", "error_type"),
+    [
+        ("MAX_CONCURRENT_CALLS", "0", "greater_than"),
+        # A sign is refused before the number is read, as coturn's entrypoint refuses it.
+        ("MAX_CONCURRENT_CALLS", "-1", "value_error"),
+        ("MAX_CALL_SECONDS", "0", "greater_than"),
+        ("MAX_CALL_SECONDS", "-1", "greater_than"),
+    ],
+)
 def test_call_limits_must_be_positive(
-    monkeypatch: pytest.MonkeyPatch, key: str, value: str
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str, error_type: str
 ) -> None:
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv(key, value)
@@ -405,7 +415,7 @@ def test_call_limits_must_be_positive(
         Settings(_env_file=None)
 
     errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
-    assert errors == [("greater_than", (key.lower(),))]
+    assert errors == [(error_type, (key.lower(),))]
 
 
 @pytest.mark.usefixtures("db_env")
@@ -506,3 +516,35 @@ def test_call_limits_have_upper_bounds(
 
     errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
     assert errors == [("less_than_equal", (key.lower(),))]
+
+
+COTURN_CASES = json.loads(
+    (Path(__file__).resolve().parents[1] / "deploy" / "coturn" / "validation-cases.json").read_text(
+        encoding="utf-8"
+    )
+)["cases"]
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    "case", COTURN_CASES, ids=[f"{case['name']}={case['value']!r}" for case in COTURN_CASES]
+)
+def test_app_and_coturn_accept_the_same_values(
+    monkeypatch: pytest.MonkeyPatch, case: dict[str, Any]
+) -> None:
+    # The coturn side of the same table runs in CI (scripts/check_coturn_entrypoint.py).
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv(case["name"], case["value"])
+
+    if case["accepted"]:
+        settings = Settings(_env_file=None)
+        if "calls" in case:
+            assert settings.max_concurrent_calls == case["calls"]
+    else:
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+        assert [error["loc"] for error in excinfo.value.errors()] == [(case["name"].lower(),)]
+        if len(case["value"]) >= 4:
+            assert case["value"] not in str(excinfo.value)

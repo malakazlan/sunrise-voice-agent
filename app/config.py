@@ -1,4 +1,5 @@
-from typing import Annotated, Literal
+import re
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +14,9 @@ EXAMPLE_PASSWORD = "change-me-to-a-long-random-value"  # noqa: S105 (a published
 MIN_PASSWORD_LENGTH = 16
 # The access token and the TURN secret, whenever they are set.
 MIN_SECRET_LENGTH = 32
+# What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
+TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
+PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
 
 
 def _outside_dev(info: ValidationInfo) -> bool:
@@ -58,11 +62,23 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("max_concurrent_calls", mode="before")
+    @classmethod
+    def _plain_call_count(cls, value: Any) -> Any:
+        # Digits only, as coturn's entrypoint reads it: no sign, spaces, underscores or point.
+        if isinstance(value, str) and not PLAIN_WHOLE_NUMBER.fullmatch(value):
+            raise ValueError("max_concurrent_calls must be written with digits only")
+        return value
+
     @field_validator("turn_shared_secret")
     @classmethod
     def _secret_outside_dev(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
         if value is None and _outside_dev(info):
             raise ValueError("turn_shared_secret is required unless app_env is dev")
+        if value is not None and not TURN_SECRET_CHARACTERS.fullmatch(value.get_secret_value()):
+            raise ValueError(
+                "turn_shared_secret may contain only letters, digits and . _ ~ + / = -"
+            )
         return value
 
     @field_validator("turn_host")

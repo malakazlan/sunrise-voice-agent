@@ -409,6 +409,44 @@ def test_offer_body_is_capped() -> None:
     assert active_calls(app) == 0
 
 
+async def post_chunked(app: FastAPI, body: bytes) -> int | None:
+    """POST /offer with the token, streamed in 1 KiB chunks and no declared length."""
+    chunks = [body[start : start + 1024] for start in range(0, len(body), 1024)]
+    starts: list[int] = []
+
+    async def receive() -> dict[str, Any]:
+        if not chunks:
+            await asyncio.Event().wait()
+        chunk = chunks.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            starts.append(message["status"])
+
+    task = asyncio.ensure_future(app(offer_scope(AUTH, None), receive, send))
+    await asyncio.wait({task}, timeout=10)
+    return starts[0] if starts else None
+
+
+def padded_offer(size: int) -> bytes:
+    """A valid offer, padded with JSON whitespace to exactly `size` bytes."""
+    body = json.dumps(OFFER).encode()
+    return body + b" " * (size - len(body))
+
+
+def test_offer_body_cap_boundary() -> None:
+    app = create_app(voice_settings(max_concurrent_calls=1), open_call=Opener())
+
+    async def main() -> tuple[int | None, int | None]:
+        at_cap = await post_chunked(app, padded_offer(BODY_LIMIT))
+        over_cap = await post_chunked(app, padded_offer(BODY_LIMIT + 1))
+        return at_cap, over_cap
+
+    assert len(padded_offer(BODY_LIMIT)) == BODY_LIMIT
+    assert asyncio.run(main()) == (200, 413)
+
+
 def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     # Configured empty: the app will not start with it.
     with pytest.raises(ValidationError) as excinfo:
@@ -441,6 +479,17 @@ def test_slot_released_when_stop_hangs(caplog: pytest.LogCaptureFixture) -> None
     caplog.set_level(logging.INFO, logger="app.voice.calls")
 
     class StuckCall(FakeCall):
+        """Neither its stop nor its run ever finishes on its own."""
+
+        run_cancelled = False
+
+        async def run(self) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.run_cancelled = True
+                raise
+
         async def stop(self) -> None:
             self.stopped = True
             await asyncio.Event().wait()
@@ -457,7 +506,11 @@ def test_slot_released_when_stop_hangs(caplog: pytest.LogCaptureFixture) -> None
         assert done == {closing, task}
         assert call.stopped
         assert registry.active == 0
+        # The call's own run task is cancelled too, not left running behind the released slot.
+        await asyncio.sleep(0)
+        assert call.run_cancelled
         assert f"call_stop_timed_out call_id={call_id}" in caplog.text
+        assert f"call_run_cancelled call_id={call_id}" in caplog.text
 
     asyncio.run(main())
 
