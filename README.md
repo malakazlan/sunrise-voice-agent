@@ -59,47 +59,53 @@ All data used by this project is synthetic. No real customer or personal data is
   - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
     transaction and does not commit, so the event and the action it records commit or roll
     back together. Any failure, a cancelled task included, rolls back the caller's whole
-    transaction, and an INSERT that stores no row counts as a failure. Appends take a
-    transaction-scoped advisory lock and wait for it at most 5 seconds, so callers append
-    last, just before they commit, at the top level of their transaction: an append inside
-    a savepoint, or on a session in autocommit mode, is refused. `now` must carry a time
+    transaction. After its INSERT, `append` reads its row back and compares the stored MAC,
+    so an INSERT that stores nothing, or stores the row somewhere else, counts as a failure.
+    Appends take a transaction-scoped advisory lock and wait for it at most 5 seconds (that
+    timeout stays in force for the rest of the caller's transaction), so callers append
+    last, just before they commit, at the top level of their transaction: an append in a
+    nested transaction, or on a session in autocommit mode, is refused. `now` must carry a time
     zone. Callers use the default isolation level, READ COMMITTED; under REPEATABLE READ or
     SERIALIZABLE an append that meets another writer fails on the primary key (it fails
     closed).
   - Every database connection the app opens is ended by the server after 30 seconds idle
     inside a transaction, so an abandoned transaction cannot hold the lock for long.
   - An event holds only registry codes (action, resource type, outcome, reason) and
-    identifiers of a declared shape: a call id is a uuid4 in hex, a patient id is `P` and 3
-    to 6 digits, an appointment, medication or slot id is its row number (up to 8 digits),
-    and the actor is `agent` or `admin:<user name>`. None of them admits a date with
-    hyphens, a phone number or nine digits. The database's own CHECKs are the outer bound:
-    at most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
+    identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
+    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
+    slot id is its row number (up to 8 digits), and the actor is `agent` or `admin:` and a
+    user name of letters and underscores. The database's own CHECKs are the outer bound: at
+    most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
   - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
     previous MAC and the event's canonical form, which is documented in the module.
     `AuditLog(key).verify(session)` walks the whole chain in batches. Its result's
     `checked` is the number of events it read, good or broken; `breaks` lists every break
     (the first 100, and `truncated` says whether there were more): an edited event, a removed or
     duplicated one, a reordering, a forged event, the wrong key, or a stored value it cannot
-    read. After a break it goes on from that row's stored MAC, so later tampering is still
-    found. It never raises because of what is stored.
+    read. A row's content (its MAC) and its position (its seq) are both checked, so one row
+    can carry two breaks, for example a gap and a MAC mismatch next to a removed row. After a
+    break it goes on from that row's stored MAC, so later tampering is still found, and one
+    edit can show twice: changing only a row's stored MAC breaks that row and the link of the
+    row after it. It never raises because of what is stored.
   - Limits of the chain: removing the newest events is not visible from the chain alone;
     that needs the head kept outside the database. Anyone who can INSERT can add a row at
     the next position without the key; `verify` reports it as one break and checks the
     genuine events after it. The MAC does not bind a chain to one database, so every
     database gets its own `AUDIT_HMAC_KEY`: a chain copied from another database under the
-    same key is not detected. An appointment, medication or slot id is any number of up to 8
-    digits, so it cannot be told apart from a date written without hyphens (`20261124`).
-    Whoever can change the table's definition can add a rule that sends inserts to another
-    table while still answering with the event's seq; `append` then believes the event was
-    stored, and the chain cannot show it (like the removal of the newest events).
+    same key is not detected.
+  - Limits of the identifier shapes: they say what an identifier looks like, not what it
+    means. A patient id, a row id and the digits inside a call id can coincide with other
+    numbers, such as part of a date, a phone number or an SSN, and an admin user name can be
+    a person's name. The control for `call_id` is where it comes from: the server generates
+    it and never takes one from the caller or the model.
   - What the database enforces: triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on
     `audit_events`, and any `INSERT` out of chain position, for ordinary statements from
     every role, superusers included. Whoever owns the table, or a superuser, can still
     disable or drop the triggers or drop the table; the chain still shows any edit made that
-    way. The repo's scans that keep writes to the table in `app/audit/` and the trigger
-    switch in the test fixture are lints against accidents, not controls. The control is the
-    runtime database role in the next change: the app will connect as a role that neither
-    owns the table nor is a superuser.
+    way. The repo's scans that keep writes to the table in `app/audit/`, the trigger switch in
+    the test fixture, and raw `SAVEPOINT` or `ROLLBACK TO` text out of `app/` are lints
+    against accidents, not controls. The control is the runtime database role in the next
+    change: the app will connect as a role that neither owns the table nor is a superuser.
 
 ### Voice echo call
 

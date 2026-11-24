@@ -72,6 +72,12 @@ SWALLOW_BY_TRIGGER = (
     "CREATE FUNCTION swallow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
     "CREATE TRIGGER swallow BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION swallow()",
 )
+# The reviewer's redirect: inserts go to another table, and the rule still returns the row.
+REDIRECT_BY_RULE = (
+    "CREATE TABLE audit_sink (LIKE audit_events)",
+    "CREATE RULE redirect AS ON INSERT TO audit_events DO INSTEAD"
+    " INSERT INTO audit_sink VALUES (NEW.*) RETURNING audit_sink.*",
+)
 
 
 def cid(number: int) -> str:
@@ -145,7 +151,7 @@ async def verified(audit: AuditLog, session: AsyncSession) -> Verification:
     return result
 
 
-def broken(checked: int, *breaks: tuple[int, str], truncated: bool = False) -> Verification:
+def broken(checked: int, *breaks: tuple[int | None, str], truncated: bool = False) -> Verification:
     """A failed verification: `checked` events read, then every break as (seq, kind)."""
     return Verification(
         ok=False,
@@ -385,11 +391,11 @@ ROW_COLUMNS = (
 # --- R1 to R5: tampering is detected -------------------------------------------------------
 
 # One edit per stored column, each made past the table's own protection, and every break
-# verification must then report. The seq edit renumbers the last event, so that the rows keep
-# their order and only the MAC can tell. Editing a MAC breaks its own row and, because the
-# walk goes on from the stored MAC, the link of the row after it.
+# verification must then report. The seq edit renumbers the last event: its MAC fails and so
+# does its position. Editing a MAC breaks its own row and, because the walk goes on from the
+# stored MAC, the link of the row after it.
 EDITS = {
-    "seq": ("UPDATE audit_events SET seq = 4 WHERE seq = 3", [(4, MAC)]),
+    "seq": ("UPDATE audit_events SET seq = 4 WHERE seq = 3", [(4, MAC), (4, GAP)]),
     "ts": ("UPDATE audit_events SET ts = ts + interval '1 microsecond' WHERE seq = 2", [(2, MAC)]),
     "call_id": ("UPDATE audit_events SET call_id = md5('nine') WHERE seq = 2", [(2, MAC)]),
     "call_id_to_null": ("UPDATE audit_events SET call_id = NULL WHERE seq = 2", [(2, MAC)]),
@@ -473,7 +479,7 @@ REORDERINGS = {
     "renumber_all": (
         ["UPDATE audit_events SET seq = seq + 10"],
         4,
-        [(11, MAC), (12, MAC), (13, MAC), (14, MAC)],
+        [(11, MAC), (11, WRONG_START), (12, MAC), (13, MAC), (14, MAC)],
     ),
     "close_a_gap": (
         [
@@ -620,9 +626,12 @@ async def test_verify_reports_unreadable_rows_and_goes_on(
     audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # One batch: an edited row, a timestamp at infinity, one beyond the year 9999 that the
-    # driver can represent, a MAC made null by the owner, then a genuine row whose link to
-    # that null MAC fails. verify raises for none of them.
-    await append_all(audit, session, [*THREE, call_ended(cid(2)), call_started(cid(3))])
+    # driver can represent, a MAC made null by the owner, a genuine row whose link to that
+    # null MAC fails, and a seq made null (sorted last), which has no seq to report and moves
+    # the expected position nowhere. verify raises for none of them.
+    await append_all(
+        audit, session, [*THREE, call_ended(cid(2)), call_started(cid(3)), call_ended(cid(3))]
+    )
     tamper_with_audit_events(
         sync_engine,
         "UPDATE audit_events SET outcome = 'failure' WHERE seq = 1",
@@ -630,11 +639,35 @@ async def test_verify_reports_unreadable_rows_and_goes_on(
         "UPDATE audit_events SET ts = '20000-01-01 00:00:00+00' WHERE seq = 3",
         "ALTER TABLE audit_events ALTER COLUMN mac DROP NOT NULL",
         "UPDATE audit_events SET mac = NULL WHERE seq = 4",
+        "ALTER TABLE audit_events DROP CONSTRAINT pk_audit_events",
+        "ALTER TABLE audit_events ALTER COLUMN seq DROP NOT NULL",
+        "UPDATE audit_events SET seq = NULL WHERE seq = 6",
     )
 
     assert await verified(audit, session) == broken(
-        5, (1, MAC), (2, UNREADABLE), (3, UNREADABLE), (4, UNREADABLE), (5, PREV)
+        6,
+        (1, MAC),
+        (2, UNREADABLE),
+        (3, UNREADABLE),
+        (4, UNREADABLE),
+        (5, PREV),
+        (None, UNREADABLE),
     )
+
+
+async def test_verify_reports_a_gap_next_to_an_edit(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # Event 2 removed and event 3 edited: event 3 fails its MAC and its position. A row can
+    # carry more than one break.
+    await append_all(audit, session, [*THREE, call_ended(cid(2))])
+    tamper_with_audit_events(
+        sync_engine,
+        "DELETE FROM audit_events WHERE seq = 2",
+        "UPDATE audit_events SET outcome = 'failure' WHERE seq = 3",
+    )
+
+    assert await verified(audit, session) == broken(3, (3, MAC), (3, GAP))
 
 
 # --- R6: concurrency ----------------------------------------------------------------------
@@ -759,6 +792,21 @@ async def test_append_refuses_a_session_outside_a_transaction(
 
     with sync_engine.connect() as connection:
         assert connection.execute(COUNT).scalar_one() == 1
+
+
+async def test_action_fails_when_the_insert_is_redirected(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    tamper_with_audit_events(sync_engine, *REDIRECT_BY_RULE)
+
+    await session.execute(INSERT_PATIENT)
+    with pytest.raises(RuntimeError, match="not stored"):
+        await audit.append(session, call_started(), now=T0)
+    await session.commit()
+
+    assert counts(sync_engine) == (0, 0)
+    with sync_engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM audit_sink")).scalar_one() == 0
 
 
 @pytest.mark.parametrize("swallow", ["rule", "trigger"])
@@ -1068,7 +1116,7 @@ def test_fields_reject_free_text() -> None:
         replace(base, actor="admin:" + "x" * 33)
     with pytest.raises(TypeError, match="actor"):
         changed(base, actor=None)
-    for actor in ("agent", "admin:ops", "admin:ops.lead-2", "admin:" + "x" * 32):
+    for actor in ("agent", "admin:ops", "admin:ops_lead", "admin:" + "x" * 32):
         assert replace(base, actor=actor).actor == actor
 
 
@@ -1107,11 +1155,35 @@ def test_identifiers_must_fit_their_declared_pattern(monkeypatch: pytest.MonkeyP
         with pytest.raises(ValueError):
             changed(base, resource_type=log.ResourceType.PATIENT, resource_id=value)
 
-    # An admin is named, not described: no digits first, no underscores, no SSN or phone.
-    assert replace(base, actor="admin:mlee").actor == "admin:mlee"
-    for value in NOT_IDENTIFIERS:
+    # A call id is a version-4 UUID in hex: the version digit and the variant are checked.
+    # Here 3f8e2a1c-9b7d-4e6f-8a1b-2c3d4e5f6a7b, then with version 1, then with variant c.
+    version_4 = "".join(["3f8e2a1c", "9b7d", "4e6f", "8a1b", "2c3d4e5f6a7b"])
+    for call_id in (
+        "".join(["3f8e2a1c", "9b7d", "1e6f", "8a1b", "2c3d4e5f6a7b"]),
+        "".join(["3f8e2a1c", "9b7d", "4e6f", "ca1b", "2c3d4e5f6a7b"]),
+        version_4.upper(),
+        str(uuid.UUID(version_4)),
+    ):
+        with pytest.raises(ValueError, match="call_id"):
+            changed(base, call_id=call_id)
+    assert changed(base, call_id=version_4).call_id == version_4
+
+    # An admin user name is letters and underscores, starting with a letter: no digits, dots
+    # or hyphens. The reviewer's values, the SSN-shaped one built from pieces.
+    for actor in ("admin:mlee", "admin:ops_lead", "admin:Mary_Lee"):
+        assert replace(base, actor=actor).actor == actor
+    for actor in (
+        "admin:x" + "-".join(["123", "45", "6789"]),
+        "admin:x555-867-5309",
+        "admin:dob-1980-01-01",
+        "admin:john.smith",
+        "admin:ops2",
+        "admin:_ops",
+        "admin:" + "x" * 33,
+        *[f"admin:{value}" for value in NOT_IDENTIFIERS if value != "mary_ann_lee"],
+    ):
         with pytest.raises(ValueError, match="actor"):
-            replace(base, actor=f"admin:{value}")
+            replace(base, actor=actor)
 
     # A resource type without a declared pattern cannot be used.
     patterns = dict(log.ID_PATTERNS)
@@ -1225,14 +1297,14 @@ KNOWN_CALL_ID = "".join(["3f8e2a1c", "9b7d4e6f", "8a1b2c3d", "4e5f6a7b"])
 #   C=<KNOWN_CALL_ID>
 #   E1="${V}1:127:2026-11-24T15:30:00.000001Z-5:agent12:call_started4:call-7:success-64:${Z}"
 #   A=$(printf '%s' "$Z$E1" | openssl dgst -sha256 -hmac "$K" | cut -d' ' -f2)
-#   E2="${V}1:227:2026-07-01T13:05:09.500000Z32:${C}14:admin:ops.lead10:call_ended4:call"
+#   E2="${V}1:227:2026-07-01T13:05:09.500000Z32:${C}14:admin:ops_lead10:call_ended4:call"
 #   E2="${E2}32:${C}7:failure14:caller_hung_up64:${A}"
 #   B=$(printf '%s' "$A$E2" | openssl dgst -sha256 -hmac "$K" | cut -d' ' -f2)
 KNOWN_MAC_1 = "".join(
     "98091bc7 666c5dff 1b9b4e9f 073b8b66 621db182 cb347e1e f469dfb2 0c3f2b83".split()
 )
 KNOWN_MAC_2 = "".join(
-    "b56d5b90 2d450025 ac34f8c9 e41b0dd8 e73b5032 6a4be49e f1a31e5e fac4a5bb".split()
+    "49fa89f4 8f05d455 40df6eb0 d52c6bfd af4c777a c33cf4fb 330537a1 ddd0de64".split()
 )
 
 
@@ -1245,7 +1317,7 @@ async def test_mac_matches_known_vector(session: AsyncSession) -> None:
         outcome=Outcome.SUCCESS,
     )
     second = Event(
-        actor="admin:ops.lead",
+        actor="admin:ops_lead",
         action=Action.CALL_ENDED,
         resource_type=ResourceType.CALL,
         outcome=Outcome.FAILURE,

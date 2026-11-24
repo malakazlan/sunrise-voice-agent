@@ -123,9 +123,6 @@ class Appointment(Base):
 # Every text column of an audit event except the MACs: identifiers and registry codes only.
 # Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
 AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"
-# The advisory lock that serialises writes to the chain, taken by append and by the position
-# trigger: a fixed number, the bytes of "audit".
-AUDIT_CHAIN_LOCK = int.from_bytes(b"audit", "big")
 
 
 def _audit_text(column: str) -> CheckConstraint:
@@ -181,19 +178,16 @@ AUDIT_PROTECTION = (
     " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
     *(
         # The database itself keeps the chain in position: a row is accepted only at seq
-        # head + 1 (1 on an empty table) after the head's MAC (64 zeros on an empty table).
-        # The function takes the chain's advisory lock before it reads the head, so two
-        # inserts never both pass: the second waits for the first's transaction to end and,
-        # since in READ COMMITTED each statement of the function reads a fresh snapshot,
-        # then sees the first's row and is refused. Under REPEATABLE READ or SERIALIZABLE the
-        # head it reads can be stale, and the primary key refuses the duplicate seq instead.
-        # Only the fixed integer lock id is formatted into the text.
-        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"  # noqa: S608
+        # head + 1 (1 on an empty table) after the head's MAC (64 zeros on an empty table),
+        # as far as the inserting statement can see the head. Two inserts at the same
+        # position can both pass this check when neither sees the other's uncommitted row;
+        # the primary key on seq then refuses the second once the first commits. append
+        # serialises its own writes with the chain's advisory lock, so they never meet here.
+        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"
         "DECLARE\n"
         "  head_seq bigint;\n"
         "  head_mac char(64);\n"
         "BEGIN\n"
-        f"  PERFORM pg_advisory_xact_lock({AUDIT_CHAIN_LOCK});\n"
         "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
         "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
         "    RAISE EXCEPTION 'audit_events row out of position' USING\n"

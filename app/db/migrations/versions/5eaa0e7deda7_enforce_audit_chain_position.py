@@ -17,14 +17,12 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # 418581342580 is the chain's advisory lock, the one append takes (the bytes of "audit").
     op.execute(
         "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"
         "DECLARE\n"
         "  head_seq bigint;\n"
         "  head_mac char(64);\n"
         "BEGIN\n"
-        "  PERFORM pg_advisory_xact_lock(418581342580);\n"
         "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
         "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
         "    RAISE EXCEPTION 'audit_events row out of position' USING\n"

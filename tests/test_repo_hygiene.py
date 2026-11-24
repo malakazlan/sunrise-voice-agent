@@ -247,6 +247,44 @@ def test_audit_table_is_written_only_by_the_audit_module() -> None:
     assert outside == set()
 
 
+# append refuses to run inside a nested transaction, but a savepoint written as SQL text is
+# invisible to it: `SAVEPOINT s`, append, `ROLLBACK TO SAVEPOINT s`, commit stores the action
+# without its event. So no string under app/ may hold either statement; nested transactions go
+# through SQLAlchemy, where append sees them. A lint against accidents, like the scans around it.
+RAW_SAVEPOINT = re.compile(r"\bsavepoint\b|\brollback\s+to\b", re.IGNORECASE)
+
+
+def raw_savepoint_uses(source: str) -> list[str]:
+    return [
+        repr(node.value)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and RAW_SAVEPOINT.search(node.value)
+    ]
+
+
+def test_no_raw_savepoints_under_app() -> None:
+    for sample in (
+        "await session.execute(text('SAVEPOINT s'))\n",
+        "await session.execute(text('rollback to savepoint s'))\n",
+        "connection.exec_driver_sql('Rollback  To s')\n",
+        "sql = 'RELEASE SAVEPOINT s'\n",
+    ):
+        assert raw_savepoint_uses(sample), sample
+    assert not raw_savepoint_uses("async with session.begin_nested():\n    pass\n")
+    assert not raw_savepoint_uses("await session.rollback()\n")
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in tracked_files()
+        if path.suffix == ".py"
+        and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+        and raw_savepoint_uses(path.read_text(encoding="utf-8"))
+    }
+    assert offenders == set()
+
+
 # Two ways to switch off a table's triggers by name. Only the tamper fixture in tests/conftest.py
 # may use the first; nothing may use the second. A lint against accidents, not a control: the
 # table's owner can still drop the triggers, and a string assembled at runtime is not seen. The

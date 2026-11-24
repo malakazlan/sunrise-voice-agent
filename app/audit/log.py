@@ -29,22 +29,26 @@ Canonical form (version `sunrise-audit-v1`)
     this is a new version, and the version text is part of every MAC.
 
 Identifiers
-    Every identifier has a declared shape, and none of them admits a date, a phone number or
-    nine digits (an SSN's length):
+    Every identifier has a declared shape:
 
-    - `call_id`, and the id of a `call`: 32 lowercase hex digits in uuid4 form, as
-      app/voice/calls.py gives each call (`uuid.uuid4().hex`).
+    - `call_id`, and the id of a `call`: a version-4 UUID as 32 lowercase hex digits, its
+      version digit 4 and its variant 8, 9, a or b checked, as app/voice/calls.py gives each
+      call (`uuid.uuid4().hex`).
     - the id of a `patient`: `P` and 3 to 6 digits, as the seed data has them (`P001`).
     - the id of an `appointment`, `medication` or `slot`: the row's number, 1 to 8 digits, no
       leading zero.
-    - `actor`: `agent`, or `admin:` and a user name of 2 to 32 lowercase letters, digits, `.`
-      and `-`, starting with a letter.
+    - `actor`: `agent`, or `admin:` and a user name of 1 to 32 letters and underscores,
+      starting with a letter.
 
-    A resource type without a declared id shape cannot be used. The database's CHECKs (letters,
-    digits, `_ - : .`, at most 64) stay as the outer bound.
+    The shapes limit what an identifier can look like, not what it can mean: a patient id, a
+    row id and the digits inside a call id can coincide with other numbers, such as part of a
+    date, a phone number or an SSN. The control for `call_id` is where it comes from: the
+    server generates it and never takes one from the caller or the model. A resource type
+    without a declared id shape cannot be used. The database's CHECKs (letters, digits,
+    `_ - : .`, at most 64) stay as the outer bound.
 
 Concurrency and the caller's transaction
-    `append` runs at the top level of the caller's transaction, never inside a savepoint, and
+    `append` runs at the top level of the caller's transaction, never in a nested one, and
     the caller uses the default isolation level, READ COMMITTED. It waits at most
     LOCK_TIMEOUT_MS for the chain's transaction-scoped advisory lock, then reads the head; the
     lock ends with the caller's transaction, committed, rolled back or killed, so callers
@@ -68,7 +72,7 @@ from pydantic import SecretStr
 from sqlalchemy import BigInteger, and_, case, cast, extract, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AUDIT_CHAIN_LOCK, AuditEvent
+from app.db.models import AuditEvent
 from app.db.session import in_database_transaction
 
 logger = logging.getLogger(__name__)
@@ -81,10 +85,12 @@ VERIFY_BATCH_SIZE = 1000
 MAX_REPORTED_BREAKS = 100
 # How long append waits for the chain's lock before it fails, like any other failure.
 LOCK_TIMEOUT_MS = 5000
+# The advisory lock that serialises appends: a fixed number, the bytes of "audit".
+CHAIN_LOCK = int.from_bytes(b"audit", "big")
 
 AGENT = "agent"
 ADMIN_PREFIX = "admin:"
-ADMIN_NAME = re.compile(r"[a-z][a-z0-9.-]{1,31}")
+ADMIN_NAME = re.compile(r"[A-Za-z][A-Za-z_]{0,31}")
 CALL_ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}")
 PATIENT_ID = re.compile(r"P[0-9]{3,6}")
 ROW_ID = re.compile(r"[1-9][0-9]{0,7}")
@@ -209,7 +215,9 @@ class ChainBreak(StrEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Break:
-    seq: int
+    """`seq` is None for a row whose seq cannot be read."""
+
+    seq: int | None
     kind: ChainBreak
 
 
@@ -321,7 +329,9 @@ class AuditLog:
         its seq. Does not commit. Any failure, from a refused argument to cancellation, rolls
         back the caller's whole transaction before the original error is raised, so the
         action it records can never commit without it, however the caller handles the error.
-        A session in autocommit mode or inside a savepoint is refused.
+        A session in autocommit mode or in a nested transaction is refused. The lock timeout
+        it sets stays in force for the rest of the caller's transaction and replaces any the
+        caller set; callers append last.
         """
         try:
             if type(event) is not Event:
@@ -333,13 +343,13 @@ class AuditLog:
                 raise ValueError("now must carry a time zone")
             if session.in_nested_transaction():
                 raise RuntimeError(
-                    "append runs at the top level of the caller's transaction, not nested"
-                    " in a savepoint"
+                    "append runs at the top level of the caller's transaction, not in a nested"
+                    " transaction"
                 )
             await session.execute(
                 select(func.set_config("lock_timeout", f"{LOCK_TIMEOUT_MS}ms", True))
             )
-            await session.execute(select(func.pg_advisory_xact_lock(AUDIT_CHAIN_LOCK)))
+            await session.execute(select(func.pg_advisory_xact_lock(CHAIN_LOCK)))
             if not await in_database_transaction(session):
                 raise RuntimeError(
                     "append needs a database transaction to roll back; the session is in"
@@ -359,6 +369,7 @@ class AuditLog:
                 reason=None if event.reason is None else event.reason.value,
                 prev_mac=prev_mac,
             )
+            mac = self._mac(row)
             written = await session.execute(
                 insert(AuditEvent)
                 .values(
@@ -372,12 +383,16 @@ class AuditLog:
                     outcome=row.outcome,
                     reason=row.reason,
                     prev_mac=row.prev_mac,
-                    mac=self._mac(row),
+                    mac=mac,
                 )
                 .returning(AuditEvent.seq)
             )
             # A rule or trigger can make an INSERT store nothing without an error.
             if written.scalars().all() != [seq]:
+                raise RuntimeError("the audit event was not stored")
+            # A rule can also send the row elsewhere and still return it: read it back.
+            stored = await session.execute(select(AuditEvent.mac).where(AuditEvent.seq == seq))
+            if stored.scalars().all() != [mac]:
                 raise RuntimeError("the audit event was not stored")
         except BaseException:
             try:
@@ -423,18 +438,25 @@ class AuditLog:
         truncated = False
         anchor: str = ZERO_MAC
         expected_seq = 1
+        started = False
         result = await session.stream(statement)
         try:
             async for batch in result.partitions():
                 for stored in batch:
-                    kind = self._break_at(stored, expected_seq, anchor, first=checked == 0)
-                    if kind is not None:
+                    seq = stored.seq if isinstance(stored.seq, int) else None
+                    if seq is None:
+                        # No seq to report and no position to move on from.
+                        kinds = [ChainBreak.UNREADABLE]
+                    else:
+                        kinds = self._breaks_at(stored, expected_seq, anchor, first=not started)
+                        anchor = stored.mac
+                        expected_seq = seq + 1
+                        started = True
+                    for kind in kinds:
                         if len(breaks) < MAX_REPORTED_BREAKS:
-                            breaks.append(Break(seq=stored.seq, kind=kind))
+                            breaks.append(Break(seq=seq, kind=kind))
                         else:
                             truncated = True
-                    anchor = stored.mac
-                    expected_seq = stored.seq + 1
                     checked += 1
         finally:
             await result.close()
@@ -442,38 +464,50 @@ class AuditLog:
             ok=not breaks, checked=checked, breaks=tuple(breaks), truncated=truncated
         )
 
-    def _break_at(
+    def _breaks_at(
         self, stored: Any, expected_seq: int, anchor: str, *, first: bool
-    ) -> ChainBreak | None:
-        """The first rule a stored row breaks, given the seq and the previous MAC that should
-        come next. The MAC comes first: a row that was edited in any way is reported as edited.
+    ) -> list[ChainBreak]:
+        """Every rule a stored row with a readable seq breaks, given the seq and the previous
+        MAC that should come next. Its content (MAC) and its position (seq) are checked
+        whatever the other says, so a row can break both; its link to the previous MAC only
+        when both are good, since an edited or misplaced row has no meaningful link.
         """
+        kinds = []
+        authentic = False
         try:
             if stored.ts_microseconds is None:
-                return ChainBreak.UNREADABLE
-            row = ChainRow(
-                seq=stored.seq,
-                ts=EPOCH + timedelta(microseconds=stored.ts_microseconds),
-                call_id=stored.call_id,
-                actor=stored.actor,
-                action=stored.action,
-                resource_type=stored.resource_type,
-                resource_id=stored.resource_id,
-                outcome=stored.outcome,
-                reason=stored.reason,
-                prev_mac=stored.prev_mac,
-            )
-            authentic = self._is_authentic(row, stored.mac)
+                kinds.append(ChainBreak.UNREADABLE)
+            else:
+                row = ChainRow(
+                    seq=stored.seq,
+                    ts=EPOCH + timedelta(microseconds=stored.ts_microseconds),
+                    call_id=stored.call_id,
+                    actor=stored.actor,
+                    action=stored.action,
+                    resource_type=stored.resource_type,
+                    resource_id=stored.resource_id,
+                    outcome=stored.outcome,
+                    reason=stored.reason,
+                    prev_mac=stored.prev_mac,
+                )
+                authentic = self._is_authentic(row, stored.mac)
+                if not authentic:
+                    kinds.append(ChainBreak.MAC_MISMATCH)
         except Exception:
-            return ChainBreak.UNREADABLE
-        if not authentic:
-            return ChainBreak.MAC_MISMATCH
-        if first and (row.seq != 1 or row.prev_mac != ZERO_MAC):
-            return ChainBreak.WRONG_START
-        if row.seq < expected_seq:
-            return ChainBreak.DUPLICATE
-        if row.seq > expected_seq:
-            return ChainBreak.GAP
-        if row.prev_mac != anchor:
-            return ChainBreak.PREV_MAC_MISMATCH
-        return None
+            kinds.append(ChainBreak.UNREADABLE)
+        in_position = True
+        if first and stored.seq != 1:
+            kinds.append(ChainBreak.WRONG_START)
+            in_position = False
+        elif not first and stored.seq < expected_seq:
+            kinds.append(ChainBreak.DUPLICATE)
+            in_position = False
+        elif not first and stored.seq > expected_seq:
+            kinds.append(ChainBreak.GAP)
+            in_position = False
+        if authentic and in_position:
+            if first and stored.prev_mac != ZERO_MAC:
+                kinds.append(ChainBreak.WRONG_START)
+            elif not first and stored.prev_mac != anchor:
+                kinds.append(ChainBreak.PREV_MAC_MISMATCH)
+        return kinds
