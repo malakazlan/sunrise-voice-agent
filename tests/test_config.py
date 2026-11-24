@@ -1,8 +1,11 @@
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
+from conftest import VOICE_SECRETS
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
@@ -10,11 +13,12 @@ from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db.session import create_sync_engine
+from app.main import create_app
 
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_defaults_apply_without_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
 
@@ -44,7 +48,7 @@ def test_unknown_app_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert errors == [("literal_error", ("app_env",))]
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_unknown_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("LOG_LEVEL", "TRACE")
@@ -56,7 +60,7 @@ def test_unknown_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert errors == [("literal_error", ("log_level",))]
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_unknown_key_in_env_file_is_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -69,7 +73,7 @@ def test_unknown_key_in_env_file_is_rejected(
     assert [error["type"] for error in excinfo.value.errors()] == ["extra_forbidden"]
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_missing_env_file_is_fine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("APP_ENV", "demo")
@@ -80,7 +84,7 @@ def test_missing_env_file_is_fine(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert settings.log_level == "INFO"
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_env_file_value_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("APP_ENV=demo\nLOG_LEVEL=DEBUG\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
@@ -88,7 +92,7 @@ def test_env_file_value_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert Settings().log_level == "DEBUG"
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_environment_variable_beats_env_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -121,7 +125,7 @@ def test_env_example_loads_and_carries_defaults() -> None:
             assert getattr(example, name) == field.default, name
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_rejection_does_not_echo_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".env").write_text(
         "APP_ENV=demo\nAPP_ENVV=not-for-logs-1\nLOG_LEVEL=not-for-logs-2\n", encoding="utf-8"
@@ -138,6 +142,8 @@ def test_rejection_does_not_echo_values(monkeypatch: pytest.MonkeyPatch, tmp_pat
 @pytest.mark.usefixtures("clean_env")
 def test_missing_database_settings_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
+    for key, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(key, value)
 
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
@@ -151,7 +157,7 @@ def test_missing_database_settings_are_rejected(monkeypatch: pytest.MonkeyPatch)
     ]
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_database_url_is_built_from_the_parts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
     monkeypatch.setenv("POSTGRES_HOST", "db.example")
@@ -188,6 +194,9 @@ def test_database_password_is_hidden(
             postgres_db=server_settings.postgres_db,
             postgres_user=server_settings.postgres_user,
             postgres_password=password,
+            demo_access_token=VOICE_SECRETS["DEMO_ACCESS_TOKEN"],
+            turn_host=VOICE_SECRETS["TURN_HOST"],
+            turn_shared_secret=VOICE_SECRETS["TURN_SHARED_SECRET"],
         )
 
     settings = build(server_settings.postgres_port)
@@ -241,7 +250,7 @@ def example_password() -> str:
     raise AssertionError("POSTGRES_PASSWORD missing from .env.example")
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPatch) -> None:
     placeholder = example_password()
     # The placeholder is long enough to pass the length rule, so only its own check stops it.
@@ -278,6 +287,271 @@ def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.usefixtures("db_env")
+def test_voice_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.max_concurrent_calls == 3
+    assert settings.max_call_seconds == 600
+    assert settings.demo_access_token is None
+    assert settings.turn_host is None
+    assert settings.turn_shared_secret is None
+
+
+# The order Settings checks the voice fields in.
+VOICE_FIELD_ORDER = ["TURN_SHARED_SECRET", "TURN_HOST", "DEMO_ACCESS_TOKEN"]
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("app_env", ["demo", "prod"])
+@pytest.mark.parametrize(
+    "missing",
+    [["DEMO_ACCESS_TOKEN"], ["TURN_HOST"], ["TURN_SHARED_SECRET"], VOICE_FIELD_ORDER],
+    ids=["token", "turn_host", "turn_secret", "all"],
+)
+def test_voice_secrets_required_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, app_env: str, missing: list[str]
+) -> None:
+    monkeypatch.setenv("APP_ENV", app_env)
+    for key, value in VOICE_SECRETS.items():
+        if key not in missing:
+            monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"], error["msg"]) for error in excinfo.value.errors()]
+    assert errors == [
+        (
+            "value_error",
+            (key.lower(),),
+            f"Value error, {key.lower()} is required unless app_env is dev",
+        )
+        for key in VOICE_FIELD_ORDER
+        if key in missing
+    ]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_app_will_not_start_without_voice_secrets_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "prod")
+
+    with pytest.raises(ValidationError, match="demo_access_token"):
+        create_app()
+
+
+@pytest.mark.usefixtures("db_env")
+def test_dev_runs_without_voice_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+
+    assert Settings(_env_file=None).app_env == "dev"
+
+
+@pytest.mark.usefixtures("db_env")
+def test_turn_without_access_token_is_rejected_in_dev(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("TURN_HOST", VOICE_SECRETS["TURN_HOST"])
+    monkeypatch.setenv("TURN_SHARED_SECRET", VOICE_SECRETS["TURN_SHARED_SECRET"])
+
+    with pytest.raises(ValidationError, match="demo_access_token") as excinfo:
+        Settings(_env_file=None)
+
+    assert excinfo.value.error_count() == 1
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("present", ["TURN_HOST", "TURN_SHARED_SECRET"])
+def test_turn_host_and_secret_come_together(monkeypatch: pytest.MonkeyPatch, present: str) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("DEMO_ACCESS_TOKEN", VOICE_SECRETS["DEMO_ACCESS_TOKEN"])
+    monkeypatch.setenv(present, VOICE_SECRETS[present])
+
+    with pytest.raises(ValidationError, match="turn_host") as excinfo:
+        Settings(_env_file=None)
+
+    assert excinfo.value.error_count() == 1
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    "turn_host", ["turn.example.test:3478", "turn:turn.example.test", "a b", "x?transport=tcp"]
+)
+def test_turn_host_must_be_a_bare_host_name(
+    monkeypatch: pytest.MonkeyPatch, turn_host: str
+) -> None:
+    for key, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("TURN_HOST", turn_host)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [("string_pattern_mismatch", ("turn_host",))]
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    ("key", "value", "error_type"),
+    [
+        ("MAX_CONCURRENT_CALLS", "0", "greater_than"),
+        # A sign is refused before the number is read, as coturn's entrypoint refuses it.
+        ("MAX_CONCURRENT_CALLS", "-1", "value_error"),
+        ("MAX_CALL_SECONDS", "0", "greater_than"),
+        ("MAX_CALL_SECONDS", "-1", "greater_than"),
+    ],
+)
+def test_call_limits_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str, error_type: str
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [(error_type, (key.lower(),))]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_voice_secrets_are_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("APP_ENV", "prod")
+
+    settings = Settings(_env_file=None)
+
+    for shown in (repr(settings), str(settings), settings.model_dump_json()):
+        assert "not-for-logs" not in shown
+
+    # A rejected configuration must not echo the secrets it was given either.
+    monkeypatch.delenv("TURN_HOST")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "not-for-logs" not in str(excinfo.value)
+    assert "not-for-logs" not in repr(excinfo.value.errors())
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET"])
+@pytest.mark.parametrize("app_env", ["dev", "demo", "prod"])
+def test_short_secrets_are_refused(monkeypatch: pytest.MonkeyPatch, key: str, app_env: str) -> None:
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", app_env)
+    # 31 characters, one short of the minimum; built from pieces like the other fake values.
+    short = "-".join(["short", "not", "for", "logs"]) + "z" * 13
+    assert len(short) == 31
+    monkeypatch.setenv(key, short)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert [(error["type"], error["loc"]) for error in excinfo.value.errors()] == [
+        ("too_short", (key.lower(),))
+    ]
+    assert short not in str(excinfo.value)
+    assert short not in repr(excinfo.value)
+
+    # 32 characters is enough.
+    monkeypatch.setenv(key, short + "z")
+    assert getattr(Settings(_env_file=None), key.lower()).get_secret_value() == short + "z"
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("app_env", ["demo", "prod"])
+@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET", "TURN_HOST"])
+def test_empty_voice_values_count_as_missing_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, app_env: str, key: str
+) -> None:
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.setenv(key, "")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert [(error["loc"], error["msg"]) for error in excinfo.value.errors()] == [
+        ((key.lower(),), f"Value error, {key.lower()} is required unless app_env is dev")
+    ]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_empty_voice_values_in_dev_leave_voice_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    for name in VOICE_SECRETS:
+        monkeypatch.setenv(name, "")
+
+    settings = Settings(_env_file=None)
+
+    assert (settings.demo_access_token, settings.turn_host, settings.turn_shared_secret) == (
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    ("key", "highest"), [("MAX_CONCURRENT_CALLS", 20), ("MAX_CALL_SECONDS", 3600)]
+)
+def test_call_limits_have_upper_bounds(
+    monkeypatch: pytest.MonkeyPatch, key: str, highest: int
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv(key, str(highest))
+    assert getattr(Settings(_env_file=None), key.lower()) == highest
+
+    monkeypatch.setenv(key, str(highest + 1))
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    errors = [(error["type"], error["loc"]) for error in excinfo.value.errors()]
+    assert errors == [("less_than_equal", (key.lower(),))]
+
+
+COTURN_CASES = json.loads(
+    (Path(__file__).resolve().parents[1] / "deploy" / "coturn" / "validation-cases.json").read_text(
+        encoding="utf-8"
+    )
+)["cases"]
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    "case", COTURN_CASES, ids=[f"{case['name']}={case['value']!r}" for case in COTURN_CASES]
+)
+def test_app_and_coturn_accept_the_same_values(
+    monkeypatch: pytest.MonkeyPatch, case: dict[str, Any]
+) -> None:
+    # The coturn side of the same table runs in CI (scripts/check_coturn_entrypoint.py).
+    for name, value in VOICE_SECRETS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv(case["name"], case["value"])
+
+    if case["accepted"]:
+        settings = Settings(_env_file=None)
+        if "calls" in case:
+            assert settings.max_concurrent_calls == case["calls"]
+    else:
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+        assert [error["loc"] for error in excinfo.value.errors()] == [(case["name"].lower(),)]
+        if len(case["value"]) >= 4:
+            assert case["value"] not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_refused_in_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
     for value in ("2026-11-24T10:00:00", "2026-11-24T15:00:00Z", "2026-11-24T10:00:00-05:00"):
@@ -300,7 +574,7 @@ def test_simulated_now_refused_in_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_allowed_in_dev_and_demo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIMULATED_NOW", "2026-11-24T15:00:00Z")
     for app_env in ("dev", "demo"):
@@ -311,7 +585,7 @@ def test_simulated_now_allowed_in_dev_and_demo(monkeypatch: pytest.MonkeyPatch) 
         assert settings.simulated_now == datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_without_zone_is_clinic_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "demo")
     rows = [
@@ -328,7 +602,7 @@ def test_simulated_now_without_zone_is_clinic_time(monkeypatch: pytest.MonkeyPat
         assert simulated == expected
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_inside_a_clock_change_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "demo")
     # 02:30 on 2026-03-08 does not exist in New York; 01:30 on 2026-11-01 happens twice.
@@ -346,7 +620,7 @@ def test_simulated_now_inside_a_clock_change_is_refused(monkeypatch: pytest.Monk
     assert Settings(_env_file=None).simulated_now == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_blank_simulated_now_means_unset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("APP_ENV=prod\nSIMULATED_NOW=\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
@@ -354,7 +628,7 @@ def test_blank_simulated_now_means_unset(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert Settings().simulated_now is None
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_accepts_only_an_iso_date_and_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "demo")
     refused = [

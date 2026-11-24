@@ -109,7 +109,7 @@ def test_naive_datetime_is_rejected() -> None:
             is_open(naive)
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_simulated_now_is_honoured_in_demo() -> None:
     settings = Settings(_env_file=None, app_env="demo", simulated_now="2026-11-28T16:00:00Z")
 
@@ -117,7 +117,7 @@ def test_simulated_now_is_honoured_in_demo() -> None:
     assert is_open(clinic_now(settings)) is False
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_clinic_now_is_clinic_time() -> None:
     settings = Settings(_env_file=None, app_env="demo", simulated_now="2026-11-24T03:00:00Z")
 
@@ -135,7 +135,7 @@ def test_clinic_now_rejects_a_simulated_value_without_a_zone() -> None:
             clinic_now(FixedClock(naive))
 
 
-@pytest.mark.usefixtures("db_env")
+@pytest.mark.usefixtures("offline_env")
 def test_real_clock_when_simulated_now_unset() -> None:
     settings = Settings(_env_file=None, app_env="prod")
     assert settings.simulated_now is None
