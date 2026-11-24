@@ -257,7 +257,8 @@ def fail_attempt(state: CallState) -> CallState:
 
 
 def drop_claim(state: CallState) -> CallState:
-    """End the claim and the step without counting anything: for a submit that did not run."""
+    """End the claim and the step without counting anything: for a claim found locked, and a
+    submit that did not run."""
     return _next(state, **_NO_STEP)
 
 
@@ -294,6 +295,12 @@ class FailedAttempt(BaseModel):
     model_config = _FROZEN
 
 
+class EndClaim(BaseModel):
+    """A handler's request for `drop_claim`."""
+
+    model_config = _FROZEN
+
+
 class SsnStep(BaseModel):
     """The input guard's change to an armed SSN step: the step's fields as they are after the
     turn. Applied by code, never returned by a tool."""
@@ -316,7 +323,7 @@ def _step(state: CallState, change: SsnStep) -> CallState:
     )
 
 
-Transition = Move | Verify | IdentityClaim | FailedAttempt | SsnStep
+Transition = Move | Verify | IdentityClaim | FailedAttempt | EndClaim | SsnStep
 
 
 def apply(state: CallState, transition: Transition) -> CallState:
@@ -329,6 +336,8 @@ def apply(state: CallState, transition: Transition) -> CallState:
         return claim(state, transition)
     if isinstance(transition, FailedAttempt):
         return fail_attempt(state)
+    if isinstance(transition, EndClaim):
+        return drop_claim(state)
     if isinstance(transition, SsnStep):
         return _step(state, transition)
     raise TypeError("not a transition")

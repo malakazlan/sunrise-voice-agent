@@ -955,6 +955,14 @@ def test_registration_rules() -> None:
     with pytest.raises(DeclarationError, match="grant"):
         registry.register(Tool(**{**code_only, "name": "code_only_again"}), grant=grant)
 
+    # A code-only writing tool declares an argument model with no fields at all.
+    with pytest.raises(DeclarationError, match="no arguments"):
+        registry.register(
+            Tool(**{**code_only, "name": "code_writer", "writes": True, "arguments": Topic}),
+            grant=Grant(),
+        )
+    assert "code_writer" not in [item.name for item in registry.tools]
+
     # The confirmation rule is for tools the model can call: a code-only tool writes without
     # arguments; a model-callable one cannot.
     code_writer = {**code_only, "name": "code_writer", "writes": True}
@@ -1549,3 +1557,52 @@ async def test_events_carry_only_declared_actions(deps: Deps, owner_engine: Engi
         ("tool_failed", "tool", "undeclared", "failure", call),
         ("tool_failed", "tool", "reserved", "failure", call),
     ]
+
+
+class NestedDob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dob: str
+
+
+class ClaimWithNestedDob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    born: NestedDob
+
+
+class ClaimWithUpperDob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    DOB: str  # noqa: N815 (the name under test)
+
+
+class ClaimWithAliasedDob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    dob: str = Field(alias="DOB")
+
+
+class ClaimWithValidationAliasDob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    dob: str = Field(validation_alias=AliasChoices("dob", "d_o_b"))
+
+
+def test_the_date_of_birth_exemption_is_narrow() -> None:
+    # Exactly a top-level field named `dob`, of the one claim tool: nothing nested, no other
+    # spelling, no alias that names it otherwise.
+    for arguments in (
+        ClaimWithNestedDob,
+        ClaimWithUpperDob,
+        ClaimWithAliasedDob,
+        ClaimWithValidationAliasDob,
+        arguments_with(full_name=(str, ...), d_o_b=(str, ...)),
+    ):
+        with pytest.raises(DeclarationError, match="names a patient"):
+            Registry().register(Tool(**{**CLAIMER, "arguments": arguments}))
+    Registry().register(Tool(**CLAIMER))

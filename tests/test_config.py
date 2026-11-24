@@ -1188,3 +1188,20 @@ def test_simulated_now_accepts_only_an_iso_date_and_time(monkeypatch: pytest.Mon
         monkeypatch.setenv("SIMULATED_NOW", value)
 
         assert Settings(_env_file=None).simulated_now == expected, value
+
+
+@pytest.mark.usefixtures("offline_env")
+def test_identity_key_differs_from_the_audit_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared = "-".join(["one", "key", "for", "both", "uses", "x" * 12])
+    assert len(shared) >= 32
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        monkeypatch.setenv("AUDIT_HMAC_KEY", shared)
+        monkeypatch.setenv("IDENTITY_HASH_KEY", shared)
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+        assert [error["loc"] for error in excinfo.value.errors()] == [("identity_hash_key",)]
+        assert shared not in str(excinfo.value)
+        assert "audit_hmac_key" in str(excinfo.value)
+        monkeypatch.setenv("IDENTITY_HASH_KEY", shared + "z")
+        assert Settings(_env_file=None).identity_hash_key.get_secret_value() == shared + "z"

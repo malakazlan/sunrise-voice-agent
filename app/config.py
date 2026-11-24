@@ -247,6 +247,14 @@ class Settings(DatabaseSettings):
         _check_strong_secret(name, value, info)
         return value
 
+    @field_validator("identity_hash_key")
+    @classmethod
+    def identity_key_is_not_the_audit_key(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+        audit_key = info.data.get("audit_hmac_key")
+        if audit_key is not None and value.get_secret_value() == audit_key.get_secret_value():
+            raise ValueError("identity_hash_key must differ from audit_hmac_key")
+        return value
+
     @field_validator("max_concurrent_calls", mode="before")
     @classmethod
     def _plain_call_count(cls, value: Any) -> Any:

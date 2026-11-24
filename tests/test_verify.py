@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -220,6 +221,7 @@ async def test_failures_are_indistinguishable(
         "wrong digits": ("Sarah Johnson", "1985-03-14", ("33" + "45",)),
         "unknown person": ("Nobody Here", "1999-09-09", (LAST_FOUR,)),
         "no digits given": ("Sarah Johnson", "1985-03-14", ("um", "what", "hold on")),
+        "two records match": ("Chris Moore", "1980-05-05", ("99" + "00",)),
     }
     seen = []
     for kind, (name, dob, turns) in failures.items():
@@ -694,3 +696,53 @@ async def hanging_up_server() -> AsyncIterator[int]:
     finally:
         server.close()
         await server.wait_closed()
+
+
+# --- Rework: the count across calls under concurrency, and a locked second claim -------------
+
+
+async def test_concurrent_claims_record_at_most_five(deps: Deps, seeded: Engine) -> None:
+    # Ten calls each claim the same identity before any of them submits: each is armed, since
+    # nothing is counted yet. Their wrong digits are then submitted all at once.
+    armed = []
+    for _ in range(10):
+        state, outcome = await claim(intake(), deps, *SARAH)
+        assert outcome == ASK
+        decision = guard_input("00" + "00", state)
+        assert decision.change is not None and decision.submit
+        armed.append(apply(state, decision.change))
+    results = await asyncio.gather(*(submit_claim(state, deps) for state in armed))
+
+    failures = [row for row in attempts(seeded) if row[2] is False]
+    assert len(failures) == 5
+    assert sorted(str(outcome.script) for _state, outcome in results) == sorted(
+        ["verify_fail"] * 5 + ["verify_locked"] * 5
+    )
+    # A call told the identity is locked counted nothing, and holds no claim.
+    for state, outcome in results:
+        if outcome.script is ScriptId.VERIFY_LOCKED:
+            assert (state.verify_attempts, state.pending_claim, state.pending_ssn4) == (
+                0,
+                None,
+                None,
+            )
+    assert [event[0] for event in events(seeded)].count("identity_locked") == 5
+
+
+async def test_a_locked_second_claim_ends_the_first(
+    deps: Deps, seeded: Engine, clock: Clock
+) -> None:
+    # Lock one claimed identity with five failed calls.
+    for _ in range(5):
+        _state, outcome = await attempt(deps, "Nobody Here", "1999-09-09", "00" + "00")
+        assert outcome == FAIL
+    # A call claims Sarah, then the locked identity: the first claim is gone.
+    state, outcome = await claim(intake(), deps, *SARAH)
+    assert outcome == ASK
+    state, outcome = await claim(state, deps, "Nobody Here", "1999-09-09")
+    assert outcome == LOCKED
+    assert (state.pending_claim, state.expecting_ssn4, state.pending_ssn4) == (None, False, None)
+    # Sarah's digits afterwards verify nothing.
+    state, _decision, submitted = await say(state, LAST_FOUR, deps)
+    assert submitted is None
+    assert (state.verified, state.patient_id) == (False, None)

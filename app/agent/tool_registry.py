@@ -47,6 +47,7 @@ from app.agent.claims import ClaimKeys
 from app.agent.scripts import ScriptId
 from app.agent.state import (
     CallState,
+    EndClaim,
     FailedAttempt,
     IdentityClaim,
     Move,
@@ -117,7 +118,7 @@ class ToolResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     data: dict[str, Any] = {}
-    transition: Move | Verify | IdentityClaim | FailedAttempt | None = None
+    transition: Move | Verify | IdentityClaim | FailedAttempt | EndClaim | None = None
     script: ScriptId | None = None
     audit_action: Action | None = None
     resource_id: str | None = None
@@ -337,7 +338,9 @@ def check_declaration(tool: Tool) -> Tool:
         )
 
     # The caller confirms what the model asks to write. Code calls a code-only tool on its own
-    # decision, never on the model's word.
+    # decision, never on the model's word, and gives it nothing to write but the state.
+    if declared.writes and not declared.model_callable and declared.arguments.model_fields:
+        raise DeclarationError("a code-only writing tool takes no arguments")
     if declared.writes and declared.model_callable:
         confirmed = declared.arguments.model_fields.get("confirmed")
         if (
