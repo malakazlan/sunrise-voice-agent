@@ -3,6 +3,7 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,18 @@ class NoSkipsPlugin:
 
 def pytest_configure(config: pytest.Config) -> None:
     config.pluginmanager.register(NoSkipsPlugin(), "no-skips")
+
+
+@pytest.fixture(autouse=True)
+def restore_exception_hooks() -> Iterator[None]:
+    """The application's logging configuration routes uncaught exceptions through logging.
+    pytest reports an exception in a thread through its own threading.excepthook, so after
+    each test the hooks it had are put back."""
+    hooks = (sys.excepthook, threading.excepthook)
+    try:
+        yield
+    finally:
+        sys.excepthook, threading.excepthook = hooks
 
 
 @pytest.fixture

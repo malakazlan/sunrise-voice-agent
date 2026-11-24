@@ -205,6 +205,33 @@ All data used by this project is synthetic. No real customer or personal data is
       create objects there before the next start-up; that start-up then refuses to run until
       those objects are removed by hand.
 
+- Masked log output. `app/guard/logging.py` is the only place log output is configured; the
+  application and each start-up step call it first. Every line goes to stderr as
+  `timestamp LEVEL logger message`, and the message and any traceback pass through
+  `app/guard/mask.py` first, line by line. A record's `extra` fields are not printed.
+  - SSNs (`***-**-****`; after a cue such as `ssn`, `social`, `last four`, `ssn_last4`,
+    `ending in`, the digits or number words that follow become `****`), dates
+    (`****-**-DD`, Python's `datetime.date(...)` included), phone numbers (`***-***-` and
+    the last four digits) and email addresses (`s***@***.com`) are masked. A line longer than
+    10,000 characters is cut, with ` [cut]` at the end, before masking, so the last line of a
+    long traceback stays. Call ids, patient ids, times, amounts, years, version numbers and
+    four-digit numbers without a cue are left alone; a nine-digit or ten-digit number on its
+    own is masked whatever it is.
+  - Python's warnings, exceptions nobody catches (in the main thread or another) and records
+    that find no handler are logged through the same formatter.
+  - The level is `LOG_LEVEL`, for the root logger and uvicorn's loggers. uvicorn's access log
+    is off. Pipecat (through loguru) and its WebRTC stack (`aioice`, `aiortc`) keep only
+    warnings and errors, and loguru does not print the values of local variables.
+  - Masking free text is best effort. The controls that matter are that the app logs event
+    names, ids and counts, and that the input guard swallows SSN digits before anything
+    could log them.
+  - Not handled: digits said before the cue (`3344 is my ssn`), seven-digit local numbers,
+    international numbers, eight-digit compact dates, quoted or internationalized email
+    addresses, an identifier split across two log calls, and names. Pipecat prints a version
+    banner through loguru's own sink when it is imported, before the configuration runs; a
+    handler a library adds after the configuration is not covered. The repo's scans that
+    keep log configuration in one module are lints against accidents.
+
 ### Voice echo call
 
 The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC

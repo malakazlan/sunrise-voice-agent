@@ -127,8 +127,7 @@ async def test_migrations_fail_when_the_runtime_role_holds_a_table_lock(
     # the runtime role's ROW EXCLUSIVE (from its INSERT privilege) conflicts with.
     downgrade = run_alembic(database, "downgrade", "5ec4a5850975")
     assert downgrade.returncode == 0, downgrade.stderr
-    # In this process, so the short limits apply; without the logging configuration of
-    # alembic.ini, which would change this process's loggers.
+    # In this process, so the short limits apply.
     config = Config()
     config.set_main_option("script_location", str(REPO_ROOT / "app" / "db" / "migrations"))
     async with runtime.begin() as hostile:
