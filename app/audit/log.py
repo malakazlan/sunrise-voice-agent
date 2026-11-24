@@ -37,6 +37,9 @@ Identifiers
     - the id of a `patient`: `P` and 3 to 6 digits, as the seed data has them (`P001`).
     - the id of an `appointment`, `medication` or `slot`: the row's number, 1 to 8 digits, no
       leading zero.
+    - the id of a `tool`: its registered name, 2 to 40 lower-case letters and underscores, as
+      app/agent/tool_registry.py declares tools. A name the model gives that is not a
+      registered tool is never recorded.
     - `actor`: `agent`, or `admin:` and a user name of 1 to 32 letters and underscores,
       starting with a letter.
 
@@ -94,6 +97,7 @@ ADMIN_NAME = re.compile(r"[A-Za-z][A-Za-z_]{0,31}")
 CALL_ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}")
 PATIENT_ID = re.compile(r"P[0-9]{3,6}")
 ROW_ID = re.compile(r"[1-9][0-9]{0,7}")
+TOOL_NAME = re.compile(r"[a-z_]{2,40}")
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -101,6 +105,9 @@ EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 class Action(StrEnum):
     CALL_STARTED = "call_started"
     CALL_ENDED = "call_ended"
+    TOOL_CALLED = "tool_called"
+    TOOL_REFUSED = "tool_refused"
+    TOOL_FAILED = "tool_failed"
 
 
 class ResourceType(StrEnum):
@@ -109,6 +116,7 @@ class ResourceType(StrEnum):
     APPOINTMENT = "appointment"
     MEDICATION = "medication"
     SLOT = "slot"
+    TOOL = "tool"
 
 
 # The shape of each resource type's ids.
@@ -118,12 +126,14 @@ ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
     ResourceType.APPOINTMENT: ROW_ID,
     ResourceType.MEDICATION: ROW_ID,
     ResourceType.SLOT: ROW_ID,
+    ResourceType.TOOL: TOOL_NAME,
 }
 
 
 class Outcome(StrEnum):
     SUCCESS = "success"
     FAILURE = "failure"
+    REFUSED = "refused"
 
 
 class Reason(StrEnum):

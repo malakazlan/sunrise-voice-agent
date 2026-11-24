@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
+from app.agent.tools import register_tools
 from app.api.offer import OpenCall, build_router
 from app.config import Settings
 from app.guard.logging import configure_logging
@@ -20,6 +21,7 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         settings = Settings()
 
     configure_logging(settings)
+    register_tools()
 
     if open_call is None:
         open_call = partial(open_echo_call, settings)

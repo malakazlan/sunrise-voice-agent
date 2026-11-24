@@ -148,6 +148,20 @@ STARTUP_LOCK_TIMEOUT_MS = 30_000
 STARTUP_STATEMENT_TIMEOUT_MS = 300_000
 
 
+# Every engine gives up opening a connection to a server that does not answer after this long,
+# instead of psycopg's default of 130 seconds: a tool call waiting on the database holds up the
+# caller's conversation. libpq's `connect_timeout` (whole seconds); psycopg enforces it itself
+# on its synchronous and asynchronous connections alike, per host it tries.
+CONNECT_TIMEOUT_SECONDS = 5
+
+
+# Every statement of the application's sessions (the runtime role) ends after this long, so a
+# connected but stalled server cannot hold a tool call. A statement waiting for a lock is
+# running too: the audit log's own lock wait (LOCK_TIMEOUT_MS in app/audit/log.py) is just as
+# long, so whichever ends that wait first, the append fails the same way.
+RUNTIME_STATEMENT_TIMEOUT_MS = 5_000
+
+
 def _connect_args(startup: bool = False) -> dict[str, Any]:
     # libpq's `options` sets the server setting for the whole session, at connect time.
     options = f"-c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"
@@ -156,7 +170,9 @@ def _connect_args(startup: bool = False) -> dict[str, Any]:
             f" -c lock_timeout={STARTUP_LOCK_TIMEOUT_MS}"
             f" -c statement_timeout={STARTUP_STATEMENT_TIMEOUT_MS}"
         )
-    return {"options": options}
+    else:
+        options += f" -c statement_timeout={RUNTIME_STATEMENT_TIMEOUT_MS}"
+    return {"options": options, "connect_timeout": CONNECT_TIMEOUT_SECONDS}
 
 
 def startup_wait_failure(

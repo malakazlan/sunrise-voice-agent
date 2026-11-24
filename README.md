@@ -55,7 +55,7 @@ All data used by this project is synthetic. No real customer or personal data is
     Zero or two matches is no match. Filler words (`my albuterol`) are not removed.
 
 - An audit log, `app/audit/log.py`, the only code that writes or verifies the
-  `audit_events` table (nothing calls it yet; later slices add their events):
+  `audit_events` table (tool dispatch, below, is its first caller):
   - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
     transaction and does not commit, so the event and the action it records commit or roll
     back together. Any failure, a cancelled task included, rolls back the caller's whole
@@ -70,11 +70,14 @@ All data used by this project is synthetic. No real customer or personal data is
     SERIALIZABLE an append that meets another writer fails on the primary key (it fails
     closed).
   - Every database connection the app opens is ended by the server after 30 seconds idle
-    inside a transaction, so an abandoned transaction cannot hold the lock for long.
+    inside a transaction, so an abandoned transaction cannot hold the lock for long. Opening
+    a connection gives up after 5 seconds (`connect_timeout`) when the server does not answer,
+    for the app and the start-up steps alike.
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
     variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
-    slot id is its row number (up to 8 digits), and the actor is `agent` or `admin:` and a
+    slot id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
+    lower-case letters and underscores), and the actor is `agent` or `admin:` and a
     user name of letters and underscores. The database's own CHECKs are the outer bound: at
     most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
   - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
@@ -269,6 +272,81 @@ Friday, strictly after today in clinic time, no holiday calendar) have slots for
 9:30 AM, 11:00 AM and 3:00 PM and for Dr. Lee at 10:00 AM and 1:30 PM, America/New_York time.
 These rows have `source = 'generated'`; the slots from the task data have `source = 'task'`.
 A generated slot never replaces an existing slot at the same doctor and time.
+
+### Call state and the tool gate
+
+No real tool is registered yet; later slices add the tools and wire them to the model.
+
+- `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
+  `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
+  with `new_call` (greeting, unverified, nothing counted, a call id from the call registry);
+  nothing else in `app/` constructs a state. A state changes only through transition
+  functions, which refuse illegal moves (`IllegalTransitionError`): greeting to intake;
+  intake to booking (a new patient); serving to booking, and booking to serving for a
+  verified caller only (a new patient's booking never reaches serving); intake, serving or
+  booking to closing, or to handoff while the office is open; any phase but ended to
+  emergency; any phase but ended to ended (the caller can hang up at any time). Ended is
+  final. `verify` is the only move from intake to serving and the only code that sets
+  `verified` and the patient id, and it refuses while the office is closed. Every state is
+  validated for consistency: verified goes with a patient id and a first name, an open office
+  and a phase a verified caller can be in; counters are never negative. These rules hold
+  against the model and the caller; code that deliberately bypasses validation
+  (`model_construct`, `object.__setattr__`) can still forge a state.
+- `app/agent/tool_registry.py`: a tool is declared once (name, argument model, handler,
+  whether it touches patient data, its phases, whether it needs the office open, whether it
+  writes, whether it may verify the caller, its audit action and resource type). Registration
+  refuses a declaration that breaks a rule: every field given and of the right kind, the
+  audit action from the audit registry and not one dispatch or the call writes itself
+  (`tool_refused`, `tool_failed`, `call_started`, `call_ended`); no argument naming a patient
+  or a record owner (`patient`, `patient_id`, `ssn`, `dob` and the like), by field name,
+  alias or any validation alias (each choice, each step of a path), in nested models too;
+  every argument model, nested ones included, forbids unknown fields; no argument takes free
+  keys (a mapping), `Any` or `object`; a patient-data tool only in `serving` and `booking`; a
+  writing tool's arguments have `confirmed: bool = False`; a tool that may verify is not a
+  patient-data tool, is in `intake` only, and there is at most one; the name is 2 to 40
+  lower-case letters and underscores.
+- `app/agent/tools.py`: `register_tools()` is the one entry point that registers every tool
+  on the application's registry and seals it; after that, registering refuses. The app calls
+  it at start. The structural tests call it after importing every module under `app/`, so a
+  tool registered anywhere is checked against the gate's rules; the registry is constructed
+  once in `app/`.
+- The gate (`tools_for`): no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
+  `ended`; a tool only in its declared phases; an office-hours tool only while the office is
+  open; a patient-data tool only for a verified caller with a patient id, while the office is
+  open. Since such a tool can only be declared for `serving` and `booking`, it is never
+  offered anywhere else.
+- `dispatch` is the only caller of a handler. It refuses a tool name that is not a registered
+  one (or not text), a tool the gate does not allow, arguments larger than 16 KiB as JSON (or
+  not JSON at all) and arguments that do not validate, without running the handler.
+  Otherwise, in one transaction and within 10 seconds, the handler runs (it gets the patient
+  id from the state, never from the arguments), the transition it asks for is applied (a
+  `Verify` only from the tool declared to verify), the transaction is checked to be the one
+  the handler was given, the audit event is appended, and it commits. The check reads the
+  transaction's id (`pg_current_xact_id`, unique for the life of the server) before the
+  handler and again after, so a handler that commits or rolls back, with SQLAlchemy or with
+  SQL text, fails the call; a commit through SQLAlchemy is refused before it reaches the
+  database. On any failure the connection is closed rather than reused, so the server rolls
+  back whatever it holds.
+- Every dispatch leaves exactly one audit event. A tool call's event names the tool when its
+  resource type is `tool`, the caller's patient id (from the state, never from the handler)
+  when it is `patient`, and otherwise the record the handler names. `tool_refused` (outcome
+  `refused`) and `tool_failed` (outcome `failure`) events have resource type `tool` and the
+  tool's name as id (none for a name that is not a registered tool) and are written in their
+  own transaction. When the call is cancelled mid-tool (the caller hangs up), the work is
+  rolled back and no event is written for that tool call; the call's own end event records
+  the hang-up.
+- The model gets fixed text for a refusal or a failure, never an exception or an argument
+  value. Failures and refusals are counted separately: from two failures, or five refusals,
+  every outcome asks for a hand-off. Tool calls of one call run one at a time.
+- The application's database sessions end any statement after 5 seconds, so a connected but
+  stalled server cannot hold a tool call; the start-up steps keep their own limits.
+- The repo's scans that keep handler calls inside `dispatch` (any `.handler` reference, the
+  text `"handler"` as `getattr` takes it, a registered handler called by name) and raw
+  transaction statements out of `app/` are lints against accidents, not controls: they read
+  the source as written.
+- Limit: a handler that runs a raw `COMMIT` statement has committed its work before dispatch
+  regains control, and dispatch cannot undo it. The call fails and no success event is
+  written, but the committed rows stay; the scan keeps such SQL text out of `app/`.
 
 ## Configuration
 

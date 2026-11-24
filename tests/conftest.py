@@ -1,6 +1,8 @@
 import asyncio
+import importlib
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -134,6 +136,33 @@ def offline_env(db_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """The required database settings plus the voice settings a demo or prod app needs."""
     for key, value in VOICE_SECRETS.items():
         monkeypatch.setenv(key, value)
+
+
+def import_application_modules() -> list[str]:
+    """Import every module of the application, so that whatever any of them registers is
+    registered; returns their names. The Alembic scripts under app/db/migrations are run by
+    Alembic, not imported."""
+    names = []
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        relative = path.relative_to(REPO_ROOT).with_suffix("")
+        if relative.parts[:3] == ("app", "db", "migrations"):
+            continue
+        parts = relative.parts[:-1] if relative.name == "__init__" else relative.parts
+        name = ".".join(parts)
+        importlib.import_module(name)
+        names.append(name)
+    return names
+
+
+@pytest.fixture
+def silent_server() -> Iterator[int]:
+    """The port of a server that takes TCP connections and never answers, like a database
+    server that has stopped responding: the listening socket's backlog completes each
+    connection and nothing ever reads from it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        yield int(listener.getsockname()[1])
 
 
 @pytest.fixture(scope="session")

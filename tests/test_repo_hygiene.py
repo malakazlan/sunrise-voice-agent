@@ -4,6 +4,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from conftest import import_application_modules
+
+from app.agent.tool_registry import REGISTRY
+from app.agent.tools import register_tools
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Three digits, two digits, four digits, not part of a longer run of digits. Matched on raw
@@ -253,18 +258,49 @@ def test_audit_table_is_written_only_by_the_audit_module() -> None:
 
 # append refuses to run inside a nested transaction, but a savepoint written as SQL text is
 # invisible to it: `SAVEPOINT s`, append, `ROLLBACK TO SAVEPOINT s`, commit stores the action
-# without its event. So no string under app/ may hold either statement; nested transactions go
-# through SQLAlchemy, where append sees them. A lint against accidents, like the scans around it.
+# without its event. And a tool handler that ends its transaction with SQL text (`COMMIT`,
+# `ROLLBACK`, `END`) splits its work from the audit event. So no string under app/ may hold
+# such a statement; transactions go through SQLAlchemy. The Alembic scripts are left out of the
+# transaction-statement part: they run as the owner, never in the application, and their
+# PL/pgSQL function bodies end with `END`. The name of a SQLAlchemy event (`"commit"`) is not
+# SQL. A lint against accidents, like the scans around it: text assembled at runtime is not
+# seen.
 RAW_SAVEPOINT = re.compile(r"\bsavepoint\b|\brollback\s+to\b", re.IGNORECASE)
+# A transaction statement where a statement starts (the text's start, or after `;`, past any
+# comments), followed by its end or by a word that can follow it in Postgres.
+RAW_TRANSACTION_STATEMENT = re.compile(
+    r"(?:^|;)\s*(?:(?:/\*.*?\*/|--[^\n]*\n)\s*)*"
+    r"(?:(?:start|prepare)\s+transaction\b|(?:commit|rollback)\s+prepared\b"
+    r"|(?:begin|commit|end|rollback|abort)"
+    r"(?:\s*(?:;|$)|\s+(?:work|transaction|and|isolation|read|deferrable|not)\b))",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-def raw_savepoint_uses(source: str) -> list[str]:
+MIGRATIONS = "app/db/migrations/"
+EVENT_REGISTRATION = {"listen", "listens_for", "contains", "remove"}
+
+
+def raw_savepoint_uses(source: str, *, statements: bool = True) -> list[str]:
+    tree = ast.parse(source)
+    event_names = {
+        id(node.args[1])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
+        in EVENT_REGISTRATION
+        and len(node.args) > 1
+    }
     return [
         repr(node.value)
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(tree)
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and RAW_SAVEPOINT.search(node.value)
+        and id(node) not in event_names
+        and (
+            RAW_SAVEPOINT.search(node.value)
+            or (statements and RAW_TRANSACTION_STATEMENT.search(node.value))
+        )
     ]
 
 
@@ -274,17 +310,44 @@ def test_no_raw_savepoints_under_app() -> None:
         "await session.execute(text('rollback to savepoint s'))\n",
         "connection.exec_driver_sql('Rollback  To s')\n",
         "sql = 'RELEASE SAVEPOINT s'\n",
+        "await session.execute(text('COMMIT'))\n",
+        "await session.execute(text('  commit work'))\n",
+        "await session.execute(text('/* done */ COMMIT;'))\n",
+        "await session.execute(text('-- done\\nEND'))\n",
+        "await session.execute(text('END TRANSACTION'))\n",
+        "await session.execute(text('ROLLBACK'))\n",
+        "await session.execute(text('rollback and chain'))\n",
+        "await session.execute(text('ABORT'))\n",
+        "await session.execute(text('BEGIN'))\n",
+        "await session.execute(text('begin isolation level serializable'))\n",
+        "await session.execute(text('START TRANSACTION READ WRITE'))\n",
+        "await session.execute(text('SELECT 1; COMMIT'))\n",
+        "await session.execute(text(\"COMMIT PREPARED 'x'\"))\n",
+        "await session.execute(text(\"PREPARE TRANSACTION 'x'\"))\n",
     ):
         assert raw_savepoint_uses(sample), sample
     assert not raw_savepoint_uses("async with session.begin_nested():\n    pass\n")
     assert not raw_savepoint_uses("await session.rollback()\n")
+    for prose in (
+        '"""End the call and release its connection."""\n',
+        '"""Begin with the greeting."""\n',
+        "message = 'commits together, or rolls back'\n",
+        "action = 'call_ended'\n",
+        "event.listen(connection, 'commit', refuse)\n",
+    ):
+        assert not raw_savepoint_uses(prose), prose
+    assert not raw_savepoint_uses("BODY = 'BEGIN\\n  RETURN NEW;\\nEND\\n'\n", statements=False)
+    assert raw_savepoint_uses("BODY = 'SAVEPOINT s'\n", statements=False)
 
     offenders = {
         path.relative_to(REPO_ROOT).as_posix()
         for path in tracked_files()
         if path.suffix == ".py"
         and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
-        and raw_savepoint_uses(path.read_text(encoding="utf-8"))
+        and raw_savepoint_uses(
+            path.read_text(encoding="utf-8"),
+            statements=not path.relative_to(REPO_ROOT).as_posix().startswith(MIGRATIONS),
+        )
     }
     assert offenders == set()
 
@@ -374,6 +437,127 @@ def test_owner_engine_only_in_startup_modules() -> None:
     # Every start-up step reaches the owner through these names, so the scan sees them.
     assert users >= STARTUP_MODULES
     assert users <= OWNER_ALLOWED, users - OWNER_ALLOWED
+
+
+# A tool's handler runs only inside Registry.dispatch, after the gate and the argument check,
+# inside the transaction its audit event commits with. So no `.handler(...)` call may appear
+# anywhere else, and no handler of the application registry may be called by its name. Like
+# the scans above, a lint against accidents: a handler reached under another name is not seen.
+DISPATCH_MODULE = "app/agent/tool_registry.py"
+
+
+def handler_calls(source: str, handler_names: set[str], *, in_dispatch_module: bool) -> list[str]:
+    """Every way the source reaches a tool's handler outside Registry.dispatch: any `.handler`
+    attribute (a call, `.handler.__call__`, a local name bound to it), the text "handler" (as
+    getattr takes it), and a call of a registered handler by its name."""
+    tree = ast.parse(source)
+    allowed: set[int] = set()
+    if in_dispatch_module:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "Registry":
+                for item in node.body:
+                    if isinstance(item, ast.AsyncFunctionDef) and item.name == "dispatch":
+                        allowed |= {id(inner) for inner in ast.walk(item)}
+    uses = []
+    for node in ast.walk(tree):
+        if id(node) in allowed:
+            continue
+        if isinstance(node, ast.Attribute) and node.attr == "handler":
+            uses.append(".handler")
+        elif isinstance(node, ast.Constant) and node.value == "handler":
+            uses.append("'handler'")
+        elif isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in handler_names:
+                uses.append(f"{name}()")
+    return uses
+
+
+def test_handlers_are_called_only_by_dispatch() -> None:
+    in_dispatch = (
+        "class Registry:\n"
+        "    async def dispatch(self, state, name, raw_args, deps):\n"
+        "        return await tool.handler(session, state, arguments)\n"
+    )
+    elsewhere = in_dispatch.replace("dispatch", "run_directly")
+    for sample in (
+        "await tool.handler(session, state, arguments)\n",
+        "registry.tools[0].handler(session, state, arguments)\n",
+        "await tool.handler.__call__(session, state, arguments)\n",
+        "run = tool.handler\nawait run(session, state, arguments)\n",
+        "await getattr(tool, 'handler')(session, state, arguments)\n",
+        "await get_balance(session, state, arguments)\n",
+        "await tools.get_balance(session, state, arguments)\n",
+        in_dispatch,
+    ):
+        assert handler_calls(sample, {"get_balance"}, in_dispatch_module=False), sample
+    assert handler_calls(elsewhere, set(), in_dispatch_module=True)
+    assert not handler_calls(in_dispatch, set(), in_dispatch_module=True)
+    assert not handler_calls(
+        "registry.register(Tool(name='get_balance', handler=get_balance))\n"
+        "await registry.dispatch(state, 'get_balance', {}, deps)\n",
+        {"get_balance"},
+        in_dispatch_module=False,
+    )
+
+    # Every tool the application has, wherever it is registered.
+    import_application_modules()
+    register_tools()
+    names = {getattr(item.handler, "__name__", "") for item in REGISTRY.tools}
+    sources = {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in tracked_files()
+        if path.suffix == ".py" and not path.relative_to(REPO_ROOT).as_posix().startswith("tests/")
+    }
+    # dispatch is where the one call is, and the scan sees it.
+    dispatch_source = sources[DISPATCH_MODULE]
+    assert handler_calls(dispatch_source, set(), in_dispatch_module=False) == [".handler"]
+
+    offenders = {
+        name: found
+        for name, source in sources.items()
+        if (found := handler_calls(source, names, in_dispatch_module=name == DISPATCH_MODULE))
+    }
+    assert offenders == {}
+
+
+def constructor_calls(source: str, class_name: str) -> int:
+    return sum(
+        1
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) == class_name
+    )
+
+
+def app_sources() -> dict[str, str]:
+    return {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in tracked_files()
+        if path.suffix == ".py" and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+    }
+
+
+def test_the_tool_registry_is_built_once() -> None:
+    # The application has one registry: the one its single entry point fills and seals.
+    assert constructor_calls("REGISTRY = Registry()\n", "Registry") == 1
+    assert constructor_calls("other = tool_registry.Registry()\n", "Registry") == 1
+    counts = {
+        name: found
+        for name, source in app_sources().items()
+        if (found := constructor_calls(source, "Registry"))
+    }
+    assert counts == {DISPATCH_MODULE: 1}
+
+
+def test_call_states_are_built_only_in_the_state_module() -> None:
+    # Code elsewhere starts a call with new_call and changes it only through transitions.
+    assert constructor_calls("state = CallState(call_id=c)\n", "CallState") == 1
+    assert constructor_calls("state = state_module.CallState(call_id=c)\n", "CallState") == 1
+    builders = {
+        name for name, source in app_sources().items() if constructor_calls(source, "CallState")
+    }
+    assert builders == {"app/agent/state.py"}
 
 
 # app/domain/ decides office hours and identity from its arguments alone: no database, no
