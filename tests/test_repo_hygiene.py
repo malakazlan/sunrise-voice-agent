@@ -633,34 +633,147 @@ def test_logging_is_configured_in_one_module() -> None:
         "pipecat_logger.warning('x')\n"
     )
 
+    for sample in (
+        "logger.handlers = []\n",
+        "logging.getLogger('app').handlers[:] = [handler]\n",
+        "logger.propagate = False\n",
+        "logger.handlers.append(handler)\n",
+        "logging.getLogger().handlers.insert(0, handler)\n",
+        "del logger.handlers[0]\n",
+    ):
+        assert logger_state_uses(sample), sample
+    assert not logger_state_uses(
+        "handlers = []\nhandlers.append(x)\nif logger.propagate:\n    pass\n"
+    )
+
     users = {
         path.relative_to(REPO_ROOT).as_posix()
         for path in tracked_files()
         if path.suffix == ".py" and logging_setup_uses(path.read_text(encoding="utf-8"))
     }
-
-    assert users == {LOGGING_MODULE}
-
-
-def print_uses(source: str) -> list[int]:
-    return [
-        node.lineno
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print"
-    ]
-
-
-def test_no_print_in_app() -> None:
-    assert print_uses("print('call started')\n")
-    assert print_uses("def f() -> None:\n    print()\n")
-    assert not print_uses("logger.info('x')\nprinter.print('x')\n")
-
-    offenders = {
-        path.relative_to(REPO_ROOT).as_posix(): found
+    # Changing a logger's handlers or whether it passes records up, under app/.
+    state_users = {
+        path.relative_to(REPO_ROOT).as_posix()
         for path in tracked_files()
         if path.suffix == ".py"
         and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
-        and (found := print_uses(path.read_text(encoding="utf-8")))
+        and logger_state_uses(path.read_text(encoding="utf-8"))
     }
 
-    assert offenders == {}
+    assert users == {LOGGING_MODULE}
+    assert state_users == {LOGGING_MODULE}
+
+
+LOGGER_STATE = {"handlers", "propagate"}
+HANDLER_LIST_CALLS = {"append", "extend", "insert"}
+
+
+def logger_state_uses(source: str) -> list[str]:
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        changed = isinstance(getattr(node, "ctx", None), ast.Store | ast.Del)
+        if changed and isinstance(node, ast.Attribute) and node.attr in LOGGER_STATE:
+            uses.append(f".{node.attr} =")
+        elif (
+            changed
+            and isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "handlers"
+        ):
+            uses.append(".handlers[...] =")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in HANDLER_LIST_CALLS
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "handlers"
+        ):
+            uses.append(f".handlers.{node.func.attr}")
+    return uses
+
+
+# Ways to write to the console without logging, so without masking. app/config.py's main
+# reports settings errors (field names and fixed messages, never values) before any logging
+# configuration exists; that one use is named here.
+TRACEBACK_PRINTERS = {"print_exc", "print_exception", "print_stack"}
+CONSOLE_STREAMS = {"stdout", "stderr"}
+DIRECT_OUTPUT_ALLOWED = {("app/config.py", "sys.stderr.write", "main")}
+
+
+def direct_output(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Import | ast.ImportFrom):
+        modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else []
+        if "pprint" in modules or getattr(node, "module", None) == "pprint":
+            return "pprint"
+        return None
+    if not isinstance(node, ast.Call):
+        return None
+    name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+    if isinstance(node.func, ast.Name) and name == "print":
+        return "print"
+    if name in TRACEBACK_PRINTERS:
+        return f"traceback.{name}"
+    stream = node.func.value if isinstance(node.func, ast.Attribute) else None
+    if (
+        name == "write"
+        and isinstance(stream, ast.Attribute)
+        and stream.attr in CONSOLE_STREAMS
+        and getattr(stream.value, "id", None) == "sys"
+    ):
+        return f"sys.{stream.attr}.write"
+    return None
+
+
+def direct_output_uses(source: str) -> list[tuple[str, str]]:
+    """Each direct write to the console, with the name of the function it is in."""
+    uses = []
+
+    def visit(node: ast.AST, function: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = (
+                child.name
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                else function
+            )
+            found = direct_output(child)
+            if found is not None:
+                uses.append((found, inner))
+            visit(child, inner)
+
+    visit(ast.parse(source), "")
+    return uses
+
+
+def test_no_print_in_app() -> None:
+    for sample in (
+        "print('call started')\n",
+        "def f() -> None:\n    print()\n",
+        "import traceback\ntraceback.print_exc()\n",
+        "from traceback import print_exception\nprint_exception(error)\n",
+        "traceback.print_stack()\n",
+        "import pprint\n",
+        "from pprint import pp\n",
+        "sys.stdout.write('x')\n",
+        "sys.stderr.write('x')\n",
+    ):
+        assert direct_output_uses(sample), sample
+    assert not direct_output_uses(
+        "logger.info('x')\nprinter.print('x')\nfile.write('x')\nbuffer.stdout.write('x')\n"
+    )
+    assert direct_output_uses("def main() -> None:\n    sys.stderr.write('x')\n") == [
+        ("sys.stderr.write", "main")
+    ]
+
+    found = {
+        path.relative_to(REPO_ROOT).as_posix(): direct_output_uses(path.read_text(encoding="utf-8"))
+        for path in tracked_files()
+        if path.suffix == ".py" and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+    }
+    offenders = {
+        name: [use for use in uses if (name, *use) not in DIRECT_OUTPUT_ALLOWED]
+        for name, uses in found.items()
+    }
+
+    assert {name: uses for name, uses in offenders.items() if uses} == {}
+    # The named exception is still there; if it goes, so should its entry.
+    assert ("sys.stderr.write", "main") in found["app/config.py"]
