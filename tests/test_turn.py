@@ -70,13 +70,15 @@ APPOINTMENT_REPLY = f"Your next appointment is {SARAH_APPOINTMENT}."
 FIRST_PAIR, SECOND_PAIR = "33", "44"
 DIGITS_IN_WORDS = "three three four four"
 
-INTAKE_TOOLS = ["verify_identity"]
+INTAKE_TOOLS = ["verify_identity", "start_new_patient"]
 SERVING_TOOLS = [
     "get_next_appointment",
     "request_refill",
     "get_lab_status",
     "get_balance",
     "send_message_to_doctor",
+    "find_slots",
+    "book_appointment",
 ]
 
 EVENTS = text("SELECT action, resource_type, resource_id, outcome FROM audit_events ORDER BY seq")

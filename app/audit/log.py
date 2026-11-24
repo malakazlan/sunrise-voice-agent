@@ -124,6 +124,14 @@ class Action(StrEnum):
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
+    NEW_PATIENT_STARTED = "new_patient_started"
+    NEW_PATIENT_DETAILS_COLLECTED = "new_patient_details_collected"
+    SLOTS_OFFERED = "slots_offered"
+    APPOINTMENT_BOOKED = "appointment_booked"
+    NEW_PATIENT_BOOKED = "new_patient_booked"
+    BOOKING_PREVIEWED = "booking_previewed"
+    SLOT_TAKEN = "slot_taken"
+    BOOKING_REPEATED = "booking_repeated"
 
 
 class ResourceType(StrEnum):

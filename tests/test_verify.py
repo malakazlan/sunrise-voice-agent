@@ -632,6 +632,8 @@ async def test_bad_claims_are_refused_by_argument_validation(deps: Deps, seeded:
         {"full_name": "Sarah Johnson", "dob": "1985-02-30"},
         {"full_name": "Sarah Johnson", "dob": 19850314},
         {"full_name": "Sarah Johnson", "dob": "1985-03-14T00:00:00"},
+        {"full_name": "Sarah Johnson", "dob": "1899-12-31"},
+        {"full_name": "Sarah Johnson", "dob": "0001-01-01"},
         {"full_name": "Sarah Johnson"},
         {"full_name": "李雷", "dob": "1985-03-14"},
         {"full_name": "Dr.", "dob": "1985-03-14"},
@@ -642,8 +644,10 @@ async def test_bad_claims_are_refused_by_argument_validation(deps: Deps, seeded:
         after, outcome = await REGISTRY.dispatch(state, "verify_identity", arguments, deps)
         assert (after, outcome) == (state.model_copy(update={"tool_refusals": 1}), REFUSED)
     assert attempts(seeded) == []
-    # Born today is a date of birth.
+    # Born today is a date of birth, and so is the first day of 1900.
     after, outcome = await claim(state, deps, "Sarah Johnson", "2026-11-24")
+    assert outcome == ASK
+    after, outcome = await claim(state, deps, "Sarah Johnson", "1900-01-01")
     assert outcome == ASK
 
 
