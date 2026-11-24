@@ -1,0 +1,22 @@
+# Test only (CI's forced-relay probe): coturn keeps its committed configuration file; only
+# its networking changes. app and coturn join a network whose addresses lie outside every
+# range coturn denies, so no peer has to be allowed and every deny rule is exercised.
+#   TURN_HOST=203.0.113.10 docker compose --env-file .env -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.relay-test.yml up -d
+services:
+  app:
+    networks:
+      default: {}
+      relay-test: {}
+  coturn:
+    network_mode: !reset null
+    networks:
+      relay-test:
+        ipv4_address: 203.0.113.10
+
+networks:
+  relay-test:
+    ipam:
+      config:
+        # TEST-NET-3 (RFC 5737): never routed, and not in coturn's denied ranges.
+        - subnet: 203.0.113.0/24

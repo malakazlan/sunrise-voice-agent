@@ -74,6 +74,38 @@ All data used by this project is synthetic. No real customer or personal data is
     the owner included. A superuser can still switch the table's triggers off; the chain
     still shows any edit made that way.
 
+### Voice echo call
+
+The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC
+transport). There is no speech recognition, model or speech synthesis yet.
+
+- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch,
+  the connection state, the ICE candidate types in use and a count of audio packets received.
+- `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
+  shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
+- `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.
+- Both need `Authorization: Bearer <DEMO_ACCESS_TOKEN>`. The token is checked before any of
+  the body is read. When no token is configured (only allowed in dev without TURN) the two
+  endpoints are open.
+- At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). A call ends when the caller
+  leaves, when it has not connected within 30 seconds, or after `MAX_CALL_SECONDS`.
+- coturn runs as a Compose service built from `deploy/coturn`: one configuration file with
+  allocation and bandwidth quotas, no relaying to private, loopback, link-local or unspecified
+  IPv4 addresses, and its own logging switched off because it records caller addresses.
+  Every TURN credential has its own username (`<expiry>:<random id>`), so coturn's per-user
+  quota (4 allocations, one call's worth) limits each credential; the total quota is 9 per
+  allowed call, and an allocation nobody refreshes ends within 120 seconds. The unspecified
+  IPv6 address is not denied: coturn 4.19.2 matches that rule against IPv4 peers as well and
+  then refuses every relayed call.
+
+What has been run: the test suite on Windows 10, and `scripts/echo_probe.py` (an aiortc
+client that sends a tone and checks it comes back) against the app in Docker Desktop on
+Windows, both directly and forced through coturn. The forced-relay runs used the committed
+coturn configuration with only its networking changed (`deploy/docker-compose.relay-test.yml`:
+app and coturn on 203.0.113.0/24, which coturn does not deny), no peer allowed, coturn on that
+network rather than on host networking. CI runs the same forced-relay probe. No browser, phone
+or server deployment has been tried yet.
+
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
 9:30 AM, 11:00 AM and 3:00 PM and for Dr. Lee at 10:00 AM and 1:30 PM, America/New_York time.
@@ -93,10 +125,16 @@ A generated slot never replaces an existing slot at the same doctor and time.
 | `POSTGRES_USER`     | user name                           | none, required |
 | `POSTGRES_PASSWORD` | password, never logged (see below)  | none, required |
 | `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
+| `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
+| `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
+| `TURN_HOST`         | host name, no scheme or port        | required unless dev |
+| `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
+| `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
 
-Settings come from the environment or `.env`. An invalid or missing value stops startup.
-Environment variables take precedence over `.env`. The same `POSTGRES_*` values configure
-the database container in Compose, so there is one set of database credentials.
+Settings come from the environment or `.env`. An invalid or missing value stops startup, and
+an empty value counts as unset. Environment variables take precedence over `.env`. The same
+`POSTGRES_*` values configure the database container in Compose, so there is one set of
+database credentials.
 
 Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
 placeholder from `.env.example`; startup stops otherwise.
@@ -105,6 +143,10 @@ placeholder from `.env.example`; startup stops otherwise.
 be at least 32 characters and must not be the placeholder from `.env.example`. Keep it outside
 the database: whoever holds it can write events that verify. Changing it makes the existing
 log fail verification.
+
+`TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
+`DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
+token. Generate the two secrets with `openssl rand -hex 32`.
 
 `SIMULATED_NOW` fixes the clinic clock for dev and demo, for example to show the office
 closed on a weekday afternoon. Empty means the real clock. Otherwise it must be an ISO 8601
@@ -126,9 +168,15 @@ curl http://127.0.0.1:8000/health
 The app container runs `alembic upgrade head`, then the seed, then the server. A failure in
 any step stops the container. The database is not published to the host.
 
-`--env-file .env` is required: Compose takes `POSTGRES_DB`, `POSTGRES_USER` and
-`POSTGRES_PASSWORD` from it and refuses to start, naming the variable, if one is missing. The
-database container receives only those three variables; the app receives all of `.env`.
+`--env-file .env` is required: Compose takes every value from it and refuses to start, naming
+the variable, if `APP_ENV` or a database credential is missing. Each container receives only
+its own variables: the database its three credentials, the app its settings, coturn
+`TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn checks those three by the
+same rules as the app and stops at start-up, naming the variable, if `TURN_HOST` or
+`TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty
+`MAX_CONCURRENT_CALLS` means 3, as in the app. So the whole stack needs the TURN values set. coturn uses host networking, which needs a
+Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49359. The app is
+published on `127.0.0.1:8000` only.
 
 ## Run locally with uv
 
@@ -141,7 +189,7 @@ uv sync
 docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up -d db
 uv run alembic upgrade head
 uv run python -m app.db.seed
-uv run uvicorn app.main:create_app --factory --port 8000
+uv run uvicorn app.main:create_app --factory --port 8000 --no-access-log
 curl http://127.0.0.1:8000/health
 ```
 
@@ -150,8 +198,15 @@ Checks:
 ```sh
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy --strict app tests
+uv run mypy --strict app tests scripts
 uv run pytest
+```
+
+Echo probe, against a running app (`--relay` restricts it to TURN relay candidates; the token,
+if one is set, comes from the `PROBE_TOKEN` environment variable):
+
+```sh
+uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2
 ```
 
 The tests need a running database server and read its address from the `POSTGRES_*`

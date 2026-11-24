@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice echo test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
+    label, button { display: block; margin: 0.75rem 0; }
+    input[type="password"] { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+    button { padding: 0.6rem 1.2rem; font-size: 1rem; }
+    dt { font-weight: bold; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Voice echo test</h1>
+  <p>Test page. The server sends your own audio back to you.</p>
+
+  <label>Access token
+    <input id="token" type="password" autocomplete="off">
+  </label>
+  <label><input id="relay" type="checkbox"> Relay only (force the call through TURN)</label>
+  <button id="call" type="button">Call</button>
+  <button id="hangup" type="button" disabled>Hang up</button>
+
+  <dl>
+    <dt>Connection state</dt><dd id="state">idle</dd>
+    <dt>Candidate type in use</dt><dd id="candidate">none</dd>
+    <dt>Audio received from server</dt><dd id="received">none</dd>
+  </dl>
+  <audio id="remote" autoplay></audio>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+    let pc = null;
+    let mic = null;
+    let statsTimer = null;
+
+    const show = (id, text) => { el(id).textContent = text; };
+
+    const authHeaders = () => {
+      const token = el("token").value.trim();
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    };
+
+    const refusal = (response, what) => {
+      if (response.status === 401) return `${what} refused: wrong or missing access token`;
+      if (response.status === 503) return `${what} refused: too many calls, try again later`;
+      return `${what} failed (HTTP ${response.status})`;
+    };
+
+    // The offer is sent once candidate gathering is complete (no trickle ICE).
+    const gatheringComplete = (connection, limitMs) => new Promise((resolve) => {
+      if (connection.iceGatheringState === "complete") return resolve();
+      const timer = setTimeout(resolve, limitMs);
+      connection.addEventListener("icegatheringstatechange", () => {
+        if (connection.iceGatheringState === "complete") { clearTimeout(timer); resolve(); }
+      });
+    });
+
+    const updateStats = async () => {
+      if (!pc) return;
+      const stats = await pc.getStats();
+      let pair = null;
+      let packets = 0;
+      stats.forEach((report) => {
+        if (report.type === "transport" && report.selectedCandidatePairId) {
+          pair = stats.get(report.selectedCandidatePairId);
+        }
+        if (report.type === "inbound-rtp" && report.kind === "audio") {
+          packets = report.packetsReceived;
+        }
+      });
+      if (!pair) {
+        // Firefox marks the pair in use instead of reporting it on the transport.
+        stats.forEach((report) => {
+          if (report.type === "candidate-pair" && report.selected) pair = report;
+        });
+      }
+      if (pair) {
+        const local = stats.get(pair.localCandidateId);
+        const remote = stats.get(pair.remoteCandidateId);
+        show("candidate", `this device: ${local?.candidateType ?? "?"}, server: ${remote?.candidateType ?? "?"}`);
+      }
+      show("received", `${packets} audio packets`);
+    };
+
+    const hangUp = () => {
+      clearInterval(statsTimer);
+      statsTimer = null;
+      if (pc) pc.close();
+      pc = null;
+      if (mic) mic.getTracks().forEach((track) => track.stop());
+      mic = null;
+      el("remote").srcObject = null;
+      el("call").disabled = false;
+      el("hangup").disabled = true;
+    };
+
+    const call = async () => {
+      el("call").disabled = true;
+      el("hangup").disabled = false;
+      show("candidate", "none");
+      show("received", "none");
+      try {
+        show("state", "fetching ICE servers");
+        const ice = await fetch("/ice-servers", { headers: authHeaders() });
+        if (!ice.ok) throw new Error(refusal(ice, "ICE servers"));
+        const { iceServers } = await ice.json();
+
+        show("state", "asking for the microphone");
+        mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        pc = new RTCPeerConnection({
+          iceServers,
+          iceTransportPolicy: el("relay").checked ? "relay" : "all",
+        });
+        pc.addTransceiver(mic.getAudioTracks()[0], { direction: "sendrecv" });
+        pc.ontrack = (event) => {
+          el("remote").srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        };
+        pc.onconnectionstatechange = () => {
+          if (!pc) return;
+          show("state", pc.connectionState);
+          if (pc.connectionState === "connected" && !statsTimer) {
+            updateStats();
+            statsTimer = setInterval(updateStats, 1000);
+          }
+          if (pc.connectionState === "failed" || pc.connectionState === "closed") hangUp();
+        };
+
+        await pc.setLocalDescription(await pc.createOffer());
+        show("state", "gathering candidates");
+        await gatheringComplete(pc, 5000);
+
+        show("state", "sending offer");
+        const response = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+        });
+        if (!response.ok) throw new Error(refusal(response, "Call"));
+        const answer = await response.json();
+        await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+      } catch (error) {
+        hangUp();
+        show("state", `error: ${error.message}`);
+      }
+    };
+
+    el("call").addEventListener("click", call);
+    el("hangup").addEventListener("click", () => { hangUp(); show("state", "hung up"); });
+  </script>
+</body>
+</html>
