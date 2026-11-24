@@ -8,11 +8,17 @@ them. Every state, however it is made, is validated for consistency: verified go
 patient id and a first name, an open office and a phase a verified caller can be in. Errors
 name fields and phases, never values.
 
+The identity claim and the SSN step live in intake with the office open: `claim` stores what
+the caller said and arms the step, the input guard's `SsnStep` collects the digits, and the
+claim ends with `verify` or a failed attempt, or with any phase change. The SSN digits
+(`pending_ssn4`, `verified_ssn4`) are excluded from every dump and from the text form, by their
+declaration; validation errors never show input.
+
 These rules protect against the model and the caller. Code that deliberately bypasses
 validation (`model_construct`, `object.__setattr__`) can still forge a state.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Self
 
@@ -45,6 +51,28 @@ class IllegalTransitionError(ValueError):
 
 _FROZEN = ConfigDict(frozen=True, strict=True, extra="forbid", hide_input_in_errors=True)
 
+# At this many failed attempts the call is locked: no more claims, no verification.
+MAX_VERIFY_ATTEMPTS = 3
+
+# The digits the SSN step has collected, and the four a verified caller gave.
+_PENDING_DIGITS = r"^[0-9]{1,4}$"
+_VERIFIED_DIGITS = r"^[0-9]{4}$"
+
+
+def _hidden_digits(pattern: str) -> Any:
+    """A field for SSN digits: never in a dump, never in the text form."""
+    return Field(default=None, exclude=True, repr=False, pattern=pattern)
+
+
+class IdentityClaim(BaseModel):
+    """Who the caller says they are, as verify_identity took it. Also the transition that
+    stores it and arms the SSN step."""
+
+    model_config = _FROZEN
+
+    full_name: str = Field(repr=False)
+    dob: date = Field(repr=False)
+
 
 class CallState(BaseModel):
     """`call_id` comes from the call registry (app/voice/calls.py), never from the caller or
@@ -64,6 +92,12 @@ class CallState(BaseModel):
     is_new_patient: bool = False
     tool_errors: int = Field(default=0, ge=0)
     tool_refusals: int = Field(default=0, ge=0)
+    pending_claim: IdentityClaim | None = None
+    expecting_ssn4: bool = False
+    # Armed turns so far that have not completed the four digits.
+    ssn_turns: int = Field(default=0, ge=0)
+    pending_ssn4: str | None = _hidden_digits(_PENDING_DIGITS)
+    verified_ssn4: str | None = _hidden_digits(_VERIFIED_DIGITS)
 
     @field_validator("call_id")
     @classmethod
@@ -84,7 +118,24 @@ class CallState(BaseModel):
                 raise ValueError(f"a verified caller is not in {self.phase.value}")
             if self.patient_id is None or not PATIENT_ID.fullmatch(self.patient_id):
                 raise ValueError("patient_id does not have the declared shape of a patient id")
+        if self.verified_ssn4 is not None and not self.verified:
+            raise ValueError("verified_ssn4 is set only for a verified caller")
+        self._consistent_step()
         return self
+
+    def _consistent_step(self) -> None:
+        claimed = self.pending_claim is not None
+        stepped = (claimed, self.expecting_ssn4, self.ssn_turns != 0, self.pending_ssn4 is not None)
+        if any(stepped) and not (self.phase is Phase.INTAKE and self.office_open):
+            raise ValueError("the claim and the SSN step exist only in intake, office open")
+        if (self.expecting_ssn4 or self.pending_ssn4 is not None) and not claimed:
+            raise ValueError("expecting_ssn4 and pending_ssn4 need a pending_claim")
+        if self.ssn_turns and not self.expecting_ssn4:
+            raise ValueError("ssn_turns are counted only while expecting_ssn4")
+        if self.verify_locked != (self.verify_attempts >= MAX_VERIFY_ATTEMPTS):
+            raise ValueError("verify_locked is set exactly when verify_attempts reaches the limit")
+        if self.verify_locked and claimed:
+            raise ValueError("a locked call holds no pending_claim")
 
 
 def new_call(*, call_id: str, started_at: datetime, office_open: bool) -> CallState:
@@ -93,8 +144,18 @@ def new_call(*, call_id: str, started_at: datetime, office_open: bool) -> CallSt
 
 
 def _next(state: CallState, **changes: Any) -> CallState:
-    """The state with `changes`, validated like any other."""
-    return CallState.model_validate({**state.model_dump(), **changes})
+    """The state with `changes`, validated like any other. Every field is carried, the hidden
+    ones included."""
+    return CallState.model_validate({**dict(state), **changes})
+
+
+# What ends the identity claim and the SSN step.
+_NO_STEP: dict[str, Any] = {
+    "pending_claim": None,
+    "expecting_ssn4": False,
+    "ssn_turns": 0,
+    "pending_ssn4": None,
+}
 
 
 # The moves `move` makes, from each phase. intake -> serving is not here: it is `verify`. The
@@ -123,7 +184,8 @@ def _refuse(state: CallState, to: Phase, why: str = "not a legal move") -> Illeg
 
 def move(state: CallState, to: Phase) -> CallState:
     """Every legal move except intake -> serving. Hand-off needs the office open; intake ->
-    booking is a new patient's booking, and booking -> serving needs a verified caller."""
+    booking is a new patient's booking, and booking -> serving needs a verified caller. Every
+    move ends the identity claim and the SSN step."""
     if to not in _MOVES[state.phase]:
         raise _refuse(state, to)
     if to is Phase.HANDOFF and not state.office_open:
@@ -131,17 +193,20 @@ def move(state: CallState, to: Phase) -> CallState:
     if to is Phase.SERVING and not state.verified:
         raise _refuse(state, to, "refused for a caller who is not verified")
     if state.phase is Phase.INTAKE and to is Phase.BOOKING:
-        return _next(state, phase=to, is_new_patient=True)
-    return _next(state, phase=to)
+        return _next(state, phase=to, is_new_patient=True, **_NO_STEP)
+    return _next(state, phase=to, **_NO_STEP)
 
 
 def verify(state: CallState, *, patient_id: str, first_name: str) -> CallState:
     """intake -> serving for the patient code identified: the only transition that sets
-    `verified`, `patient_id` and `patient_first_name`."""
+    `verified`, `patient_id` and `patient_first_name`. The digits the step collected are kept
+    as `verified_ssn4`; the claim and the step end."""
     if state.phase is not Phase.INTAKE:
         raise _refuse(state, Phase.SERVING)
     if not state.office_open:
         raise _refuse(state, Phase.SERVING, "refused while the office is closed")
+    if state.verify_locked:
+        raise _refuse(state, Phase.SERVING, "refused for a locked call")
     if not isinstance(patient_id, str) or not PATIENT_ID.fullmatch(patient_id):
         raise ValueError("patient_id does not have the declared shape of a patient id")
     if not isinstance(first_name, str) or not first_name.strip():
@@ -152,7 +217,48 @@ def verify(state: CallState, *, patient_id: str, first_name: str) -> CallState:
         verified=True,
         patient_id=patient_id,
         patient_first_name=first_name,
+        verified_ssn4=state.pending_ssn4,
+        **_NO_STEP,
     )
+
+
+def _refuse_step(state: CallState, what: str, why: str) -> IllegalTransitionError:
+    return IllegalTransitionError(f"{what} in {state.phase.value} is {why}")
+
+
+def claim(state: CallState, identity: IdentityClaim) -> CallState:
+    """Store who the caller says they are and arm the SSN step: intake only, office open, a
+    call that is not locked. A second claim replaces the first and clears the digits."""
+    if state.phase is not Phase.INTAKE:
+        raise _refuse_step(state, "a claim", "not a legal move")
+    if not state.office_open:
+        raise _refuse_step(state, "a claim", "refused while the office is closed")
+    if state.verify_locked:
+        raise _refuse_step(state, "a claim", "refused for a locked call")
+    return _next(state, pending_claim=identity, expecting_ssn4=True, ssn_turns=0, pending_ssn4=None)
+
+
+def locks_the_call(state: CallState) -> bool:
+    """Whether one more failed attempt locks the call."""
+    return state.verify_attempts + 1 >= MAX_VERIFY_ATTEMPTS
+
+
+def fail_attempt(state: CallState) -> CallState:
+    """One failed attempt, in intake: counted, the call locked at MAX_VERIFY_ATTEMPTS, and the
+    claim and the step ended."""
+    if state.phase is not Phase.INTAKE:
+        raise _refuse_step(state, "a failed attempt", "not a legal move")
+    return _next(
+        state,
+        verify_attempts=state.verify_attempts + 1,
+        verify_locked=locks_the_call(state),
+        **_NO_STEP,
+    )
+
+
+def drop_claim(state: CallState) -> CallState:
+    """End the claim and the step without counting anything: for a submit that did not run."""
+    return _next(state, **_NO_STEP)
 
 
 # The counters change nothing the consistency rules look at, so counting never fails: dispatch
@@ -166,7 +272,7 @@ def count_refusal(state: CallState) -> CallState:
 
 
 class Move(BaseModel):
-    """A handler's request for `move`."""
+    """A request for `move`."""
 
     model_config = _FROZEN
 
@@ -182,10 +288,47 @@ class Verify(BaseModel):
     first_name: str = Field(repr=False)
 
 
-def apply(state: CallState, transition: Move | Verify) -> CallState:
-    """The transition a handler asked for, through the same function as any other caller."""
+class FailedAttempt(BaseModel):
+    """A handler's request for `fail_attempt`."""
+
+    model_config = _FROZEN
+
+
+class SsnStep(BaseModel):
+    """The input guard's change to an armed SSN step: the step's fields as they are after the
+    turn. Applied by code, never returned by a tool."""
+
+    model_config = _FROZEN
+
+    expecting_ssn4: bool
+    ssn_turns: int = Field(ge=0)
+    pending_ssn4: str | None = _hidden_digits(_PENDING_DIGITS)
+
+
+def _step(state: CallState, change: SsnStep) -> CallState:
+    if not state.expecting_ssn4:
+        raise _refuse_step(state, "an SSN step change", "refused while the step is not armed")
+    return _next(
+        state,
+        expecting_ssn4=change.expecting_ssn4,
+        ssn_turns=change.ssn_turns,
+        pending_ssn4=change.pending_ssn4,
+    )
+
+
+Transition = Move | Verify | IdentityClaim | FailedAttempt | SsnStep
+
+
+def apply(state: CallState, transition: Transition) -> CallState:
+    """A transition given as a value, through the same function as any other caller."""
     if isinstance(transition, Move):
         return move(state, transition.to)
     if isinstance(transition, Verify):
         return verify(state, patient_id=transition.patient_id, first_name=transition.first_name)
-    raise TypeError("a transition is a Move or a Verify")
+    if isinstance(transition, IdentityClaim):
+        return claim(state, transition)
+    if isinstance(transition, FailedAttempt):
+        return fail_attempt(state)
+    if isinstance(transition, SsnStep):
+        return _step(state, transition)
+    raise TypeError("not a transition")

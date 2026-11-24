@@ -9,6 +9,7 @@ from sqlalchemy import (
     Connection,
     DateTime,
     ForeignKey,
+    Index,
     MetaData,
     Numeric,
     Table,
@@ -158,6 +159,26 @@ class AuditEvent(Base):
     reason: Mapped[str | None]
     prev_mac: Mapped[str] = mapped_column(CHAR(64))
     mac: Mapped[str] = mapped_column(CHAR(64))
+
+
+class VerificationAttempt(Base):
+    """One submitted identity check: the claim's keyed hash (app/agent/claims.py), the call, and
+    whether it matched. Never a name, a date of birth or a digit of the SSN."""
+
+    __tablename__ = "verification_attempts"
+    __table_args__ = (
+        CheckConstraint("claim_key ~ '^[0-9a-f]{64}$'", name="claim_key"),
+        # The declared shape of a call id (CALL_ID in app/audit/log.py).
+        CheckConstraint("call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'", name="call_id"),
+        Index("ix_verification_attempts_claim_key_created_at", "claim_key", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    claim_key: Mapped[str]
+    call_id: Mapped[str]
+    success: Mapped[bool]
+    # The call's clock, as the audit log's: never the database's.
+    created_at: Mapped[datetime]
 
 
 # audit_events is append-only for every role, the owner and superusers included: a statement

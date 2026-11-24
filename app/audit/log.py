@@ -108,6 +108,10 @@ class Action(StrEnum):
     TOOL_CALLED = "tool_called"
     TOOL_REFUSED = "tool_refused"
     TOOL_FAILED = "tool_failed"
+    IDENTITY_CLAIMED = "identity_claimed"
+    IDENTITY_VERIFIED = "identity_verified"
+    IDENTITY_REFUSED = "identity_refused"
+    IDENTITY_LOCKED = "identity_locked"
 
 
 class ResourceType(StrEnum):

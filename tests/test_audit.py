@@ -1367,6 +1367,10 @@ def test_only_registry_members_are_accepted() -> None:
         "tool_called",
         "tool_refused",
         "tool_failed",
+        "identity_claimed",
+        "identity_verified",
+        "identity_refused",
+        "identity_locked",
     }
     assert {member.value for member in ResourceType} == {
         "call",

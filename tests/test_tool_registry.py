@@ -1,12 +1,12 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import anyio
 import pytest
-from conftest import TEST_AUDIT_KEY, import_application_modules
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, import_application_modules
 from pydantic import (
     AliasChoices,
     AliasPath,
@@ -22,12 +22,15 @@ from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.agent import tool_registry
-from app.agent.state import CallState, Move, Phase, Verify, move, new_call, verify
+from app.agent.claims import ClaimKeys
+from app.agent.state import CallState, IdentityClaim, Move, Phase, Verify, move, new_call, verify
 from app.agent.tool_registry import (
     REGISTRY,
     DeclarationError,
     Deps,
+    Grant,
     Handler,
+    HandlerContext,
     Registry,
     Status,
     Tool,
@@ -35,6 +38,7 @@ from app.agent.tool_registry import (
     ToolOutcome,
     ToolResult,
     check_declaration,
+    is_available,
 )
 from app.agent.tools import register_tools
 from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
@@ -45,6 +49,7 @@ from app.voice.calls import CallRegistry
 pytestmark = pytest.mark.anyio
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
+CLAIM_KEYS = ClaimKeys(SecretStr(TEST_IDENTITY_KEY))
 
 GREETING = Phase.GREETING
 INTAKE = Phase.INTAKE
@@ -109,7 +114,9 @@ def recording(
 ) -> Handler:
     """A handler that records each call, then raises `fail` or returns `result`."""
 
-    async def handler(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+    async def handler(
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+    ) -> ToolResult:
         calls.append((state, arguments))
         if fail is not None:
             raise fail
@@ -119,17 +126,21 @@ def recording(
 
 
 def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
-    """A valid declaration: no patient data, every phase, no write, audited as tool_called."""
+    """A valid declaration: callable by the model, no patient data, every phase, no write,
+    audited as tool_called."""
     values: dict[str, Any] = {
         "name": name,
         "arguments": NoArguments,
         "handler": handler,
+        "model_callable": True,
         "phi": False,
         "phases": frozenset(Phase),
         "office_open_only": False,
         "writes": False,
         "may_verify": False,
+        "takes_identity_claim": False,
         "audit_action": Action.TOOL_CALLED,
+        "outcome_actions": {},
         "resource_type": ResourceType.TOOL,
     }
     values.update(overrides)
@@ -143,9 +154,10 @@ def phi_tool(name: str, handler: Handler) -> Tool:
 
 
 def registry_of(*tools: Tool) -> Registry:
+    """A registry of the tools; a code-only tool gets a grant of its own, unused here."""
     registry = Registry()
     for item in tools:
-        registry.register(item)
+        registry.register(item, grant=None if item.model_callable else Grant())
     return registry
 
 
@@ -222,6 +234,7 @@ async def deps(runtime: AsyncEngine) -> AsyncIterator[Deps]:
         sessions=create_session_factory(runtime),
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
+        claim_keys=CLAIM_KEYS,
     )
 
 
@@ -450,7 +463,9 @@ def inserting(
 ) -> Handler:
     """A writing handler: it inserts a patient row, then does `then`."""
 
-    async def handler(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+    async def handler(
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+    ) -> ToolResult:
         await session.execute(INSERT_PATIENT, {"id": patient_id})
         if locks_seen is not None:
             locks_seen.append((await session.execute(OWN_ADVISORY_LOCKS)).scalar_one())
@@ -499,6 +514,7 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
                 sessions=deps.sessions,
                 audit=AuditThatFailsAfterWriting(SecretStr(TEST_AUDIT_KEY)),
                 now=deps.now,
+                claim_keys=CLAIM_KEYS,
             ),
         ),
         # A handler may not commit on its own.
@@ -520,7 +536,9 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
 
 
 async def test_every_dispatch_is_audited(deps: Deps, owner_engine: Engine) -> None:
-    async def not_a_result(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+    async def not_a_result(
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+    ) -> ToolResult:
         return {"data": {}}  # type: ignore[return-value]
 
     unused: Calls = []
@@ -613,7 +631,9 @@ async def test_two_failures_hand_off(deps: Deps, owner_engine: Engine) -> None:
 # --- R13, R14: declarations ------------------------------------------------------------------
 
 
-async def noop(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+async def noop(
+    session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+) -> ToolResult:
     return ToolResult()
 
 
@@ -622,16 +642,38 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "name": "read_chart",
         "arguments": NoArguments,
         "handler": noop,
+        "model_callable": True,
         "phi": True,
         "phases": frozenset(PHI_PHASES),
         "office_open_only": True,
         "writes": False,
         "may_verify": False,
+        "takes_identity_claim": False,
         "audit_action": Action.TOOL_CALLED,
+        "outcome_actions": {},
         "resource_type": ResourceType.PATIENT,
     }
     values.update(overrides)
     return values
+
+
+class ClaimArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    dob: str
+
+
+# A tool that may verify, as the model would call it; and the one that takes a claim.
+VERIFIER = valid(name="check_identity", may_verify=True, phi=False, phases=frozenset({INTAKE}))
+CLAIMER = valid(
+    name="claim_identity",
+    arguments=ClaimArguments,
+    phi=False,
+    phases=frozenset({INTAKE}),
+    takes_identity_claim=True,
+    resource_type=ResourceType.TOOL,
+)
 
 
 def without(field: str) -> dict[str, Any]:
@@ -726,8 +768,14 @@ def test_registration_rules() -> None:
                 "arguments",
                 "handler",
                 "name",
+                "model_callable",
+                "takes_identity_claim",
+                "outcome_actions",
             )
         ],
+        ("declare", Tool.model_construct(**valid(model_callable="no"))),
+        ("declare", Tool.model_construct(**valid(outcome_actions={"tool_called": "success"}))),
+        ("declare", Tool.model_construct(**valid(outcome_actions={Action.TOOL_CALLED: "ok"}))),
         ("declare", Tool.model_construct(**valid(phases=frozenset()))),
         ("declare", Tool.model_construct(**valid(phases={SERVING}))),
         ("declare", Tool.model_construct(**valid(phases=frozenset({"serving"})))),
@@ -806,12 +854,54 @@ def test_registration_rules() -> None:
                 Action.CALL_ENDED,
             )
         ],
-        # A tool that may verify the caller: not a patient-data tool, and in intake only.
-        ("verif", Tool(**valid(may_verify=True))),
+        # A tool that may verify the caller: not a patient-data tool, in intake only, and never
+        # callable by the model.
+        ("verif", Tool(**valid(may_verify=True, model_callable=False))),
         *[
-            ("verif", Tool(**valid(may_verify=True, phi=False, phases=frozenset(phases))))
+            (
+                "verif",
+                Tool(
+                    **valid(
+                        may_verify=True,
+                        model_callable=False,
+                        phi=False,
+                        phases=frozenset(phases),
+                    )
+                ),
+            )
             for phases in ({INTAKE, SERVING}, {SERVING}, {INTAKE, GREETING}, set(Phase))
         ],
+        ("verif", Tool(**VERIFIER)),
+        # The tool that takes an identity claim: not a patient-data tool, intake only, office
+        # open only, callable by the model, and it may not verify.
+        *[
+            ("claim", Tool(**{**CLAIMER, **change}))
+            for change in (
+                {"phi": True},
+                {"phases": frozenset({INTAKE, SERVING})},
+                {"phases": frozenset({SERVING})},
+                {"office_open_only": False},
+                {"model_callable": False},
+                {"may_verify": True},
+            )
+        ],
+        # Only that tool may take a date of birth, and nothing else that names a patient.
+        ("names a patient", Tool(**{**CLAIMER, "takes_identity_claim": False})),
+        *[
+            ("names a patient", Tool(**{**CLAIMER, "arguments": arguments}))
+            for arguments in (
+                arguments_with(full_name=(str, ...), date_of_birth=(str, ...)),
+                arguments_with(full_name=(str, ...), dob=(str, ...), ssn=(str, ...)),
+                arguments_with(dob=(str, ...), patient_id=(str, ...)),
+            )
+        ],
+        # The other actions a tool's events may carry: never a reserved one, never its own
+        # default action again.
+        *[
+            ("reserved", Tool(**valid(outcome_actions={action: Outcome.REFUSED})))
+            for action in (Action.TOOL_REFUSED, Action.TOOL_FAILED, Action.CALL_ENDED)
+        ],
+        ("default action", Tool(**valid(outcome_actions={Action.TOOL_CALLED: Outcome.SUCCESS}))),
         # The name is the tool's audit id: lower-case letters and underscores, 2 to 40.
         *[
             ("name", Tool.model_construct(**valid(name=name)))
@@ -840,11 +930,45 @@ def test_registration_rules() -> None:
     assert [item.name for item in registry.tools] == ["read_chart", "office_info"]
 
     # One tool at most may verify the caller.
-    verifier = valid(may_verify=True, phi=False, phases=frozenset({INTAKE}))
-    registry.register(Tool(**{**verifier, "name": "check_identity"}))
+    verifier = {**VERIFIER, "model_callable": False}
+    registry.register(Tool(**{**verifier, "name": "check_identity"}), grant=Grant())
     with pytest.raises(DeclarationError, match="verif"):
-        registry.register(Tool(**{**verifier, "name": "check_identity_again"}))
+        registry.register(Tool(**{**verifier, "name": "check_identity_again"}), grant=Grant())
     assert [item.name for item in registry.tools if item.may_verify] == ["check_identity"]
+
+    # One tool at most takes an identity claim; it may take a date of birth.
+    registry.register(Tool(**CLAIMER))
+    with pytest.raises(DeclarationError, match="claim"):
+        registry.register(Tool(**{**CLAIMER, "name": "claim_identity_again"}))
+    assert [item.name for item in registry.tools if item.takes_identity_claim] == ["claim_identity"]
+
+    # A code-only tool is registered with a grant of its own; a model-callable tool without.
+    code_only = valid(name="code_only", phi=False, phases=frozenset({INTAKE}), model_callable=False)
+    grant = Grant()
+    for tool, given, rule in (
+        (Tool(**code_only), None, "grant"),
+        (Tool(**{**code_only, "model_callable": True}), Grant(), "grant"),
+    ):
+        with pytest.raises(DeclarationError, match=rule):
+            registry.register(tool, grant=given)
+    registry.register(Tool(**code_only), grant=grant)
+    with pytest.raises(DeclarationError, match="grant"):
+        registry.register(Tool(**{**code_only, "name": "code_only_again"}), grant=grant)
+
+    # The confirmation rule is for tools the model can call: a code-only tool writes without
+    # arguments; a model-callable one cannot.
+    code_writer = {**code_only, "name": "code_writer", "writes": True}
+    registry.register(Tool(**code_writer), grant=Grant())
+    with pytest.raises(DeclarationError, match="confirmed"):
+        registry.register(Tool(**{**code_writer, "name": "model_writer", "model_callable": True}))
+    assert [item.name for item in registry.tools] == [
+        "read_chart",
+        "office_info",
+        "check_identity",
+        "claim_identity",
+        "code_only",
+        "code_writer",
+    ]
 
 
 def gate_violations(registry: Registry) -> list[str]:
@@ -861,11 +985,18 @@ def gate_violations(registry: Registry) -> list[str]:
     # The verified flag without a patient id, for each phase and office state.
     states += [state.model_copy(update={"patient_id": None}) for state in states if state.verified]
     for state in states:
-        for description in registry.tools_for(state):
-            item = by_name[description.name]
+        offered = {description.name for description in registry.tools_for(state)}
+        # What dispatch would run, for the model or for code with the tool's grant.
+        runnable = {item.name for item in registry.tools if is_available(item, state)}
+        for name in sorted(offered | runnable):
+            item = by_name[name]
             where = (
                 f"{item.name} in {state.phase} verified={state.verified} open={state.office_open}"
             )
+            if name in offered and not item.model_callable:
+                problems.append(f"code only: {where}")
+            if item.takes_identity_claim and state.phase is not INTAKE:
+                problems.append(f"claim: {where}")
             if state.phase in NO_TOOL_PHASES:
                 problems.append(f"no tools: {where}")
             if state.phase not in item.phases:
@@ -892,6 +1023,8 @@ def test_application_registry_obeys_the_gate() -> None:
     assert REGISTRY.sealed
     assert gate_violations(REGISTRY) == []
     assert len([item for item in REGISTRY.tools if item.may_verify]) <= 1
+    assert len([item for item in REGISTRY.tools if item.takes_identity_claim]) <= 1
+    assert not [item for item in REGISTRY.tools if item.may_verify and item.model_callable]
 
     # The gate offers a tool only in its declared phases, and a patient-data tool cannot be
     # declared for any phase but serving and booking: so no registry, whatever it holds, can
@@ -914,7 +1047,14 @@ def test_application_registry_obeys_the_gate() -> None:
         phi_tool("read_chart", noop),
         declared("office_info", noop),
         declared("transfer_desk", noop, phases=frozenset({INTAKE}), office_open_only=True),
-        declared("check_identity", noop, phases=frozenset({INTAKE}), may_verify=True),
+        declared(
+            "check_identity",
+            noop,
+            phases=frozenset({INTAKE}),
+            may_verify=True,
+            model_callable=False,
+        ),
+        Tool(**CLAIMER),
     ]
     assert gate_violations(registry_of(*tools)) == []
 
@@ -924,9 +1064,17 @@ def test_application_registry_obeys_the_gate() -> None:
 
     ungated = Ungated()
     for item in tools:
-        ungated.register(item)
+        ungated.register(item, grant=None if item.model_callable else Grant())
     kinds = {problem.split(":")[0] for problem in gate_violations(ungated)}
-    assert kinds == {"no tools", "undeclared phase", "phi", "office closed", "verifier"}
+    assert kinds == {
+        "no tools",
+        "undeclared phase",
+        "phi",
+        "office closed",
+        "verifier",
+        "code only",
+        "claim",
+    }
 
 
 # --- Neighbours -----------------------------------------------------------------------------
@@ -1019,6 +1167,7 @@ async def test_unanswering_database_fails_within_a_bound(
             sessions=create_session_factory(engine),
             audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
             now=lambda: T0,
+            claim_keys=CLAIM_KEYS,
         )
         calls: Calls = []
         registry = registry_of(declared("look_up", recording(calls), arguments=Topic))
@@ -1057,6 +1206,7 @@ async def test_database_down_fails_generically(
             sessions=create_session_factory(engine),
             audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
             now=lambda: T0,
+            claim_keys=CLAIM_KEYS,
         )
         calls: Calls = []
         registry = registry_of(declared("look_up", recording(calls), arguments=Topic))
@@ -1082,21 +1232,33 @@ class Member(BaseModel):
 
 async def test_only_the_verifying_tool_can_verify(deps: Deps, owner_engine: Engine) -> None:
     async def claims_identity(
-        session: AsyncSession, state: CallState, arguments: Any
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
     ) -> ToolResult:
         return ToolResult(transition=Verify(patient_id=arguments.member_number, first_name="Ann"))
 
-    registry = registry_of(
-        declared("look_up_member", claims_identity, arguments=Member, phases=frozenset({INTAKE})),
+    async def arms(
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+    ) -> ToolResult:
+        return ToolResult(transition=IdentityClaim(full_name="Ann Lee", dob=date(1990, 1, 1)))
+
+    grant = Grant()
+    registry = Registry()
+    registry.register(
+        declared("look_up_member", claims_identity, arguments=Member, phases=frozenset({INTAKE}))
+    )
+    registry.register(
         declared(
             "check_identity",
             claims_identity,
             arguments=Member,
             phases=frozenset({INTAKE}),
             may_verify=True,
+            model_callable=False,
         ),
-        phi_tool("read_chart", noop),
+        grant=grant,
     )
+    registry.register(phi_tool("read_chart", noop))
+    registry.register(declared("look_up_claim", arms, phases=frozenset({INTAKE})))
     state = intake()
 
     # Any other tool asking to verify fails, and the caller stays unverified.
@@ -1112,15 +1274,21 @@ async def test_only_the_verifying_tool_can_verify(deps: Deps, owner_engine: Engi
     )
     assert "read_chart" not in names(registry, after)
 
-    # The one tool declared to verify does.
+    # So does any tool but the one that takes a claim asking to arm the SSN step.
+    after, outcome = await registry.dispatch(state, "look_up_claim", {}, deps)
+    assert outcome == FAILED
+    assert (after.expecting_ssn4, after.pending_claim) == (False, None)
+
+    # The one tool declared to verify does, called by code with its grant.
     after, outcome = await registry.dispatch(
-        state, "check_identity", {"member_number": "P002"}, deps
+        state, "check_identity", {"member_number": "P002"}, deps, grant=grant
     )
     assert outcome.status is Status.DONE
     assert (after.verified, after.patient_id, after.phase) == (True, "P002", SERVING)
     assert "read_chart" in names(registry, after)
     assert events(owner_engine) == [
         failed_event(state, "look_up_member"),
+        failed_event(state, "look_up_claim"),
         called_event(state, "check_identity"),
     ]
 
@@ -1228,7 +1396,9 @@ async def test_tool_calls_are_audited_with_their_ids(deps: Deps, owner_engine: E
     ]
 
 
-async def never_returns(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+async def never_returns(
+    session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+) -> ToolResult:
     await anyio.sleep_forever()
     raise AssertionError("unreachable")
 
@@ -1289,3 +1459,93 @@ async def test_five_refusals_hand_off(deps: Deps) -> None:
     # Every outcome after that says so too, a success included.
     state, outcome = await registry.dispatch(state, "look_up", {"topic": "hours"}, deps)
     assert (outcome.status, outcome.hand_off) == (Status.DONE, True)
+
+
+# --- Slice 08: who may call a tool, and the events it may write ------------------------------
+
+
+async def test_code_only_tools_are_refused_to_the_model(deps: Deps, owner_engine: Engine) -> None:
+    code: Calls = []
+    info: Calls = []
+    grant = Grant()
+    registry = Registry()
+    registry.register(
+        declared("settle_claim", recording(code), phases=frozenset({INTAKE}), model_callable=False),
+        grant=grant,
+    )
+    registry.register(declared("office_info", recording(info)))
+    state = intake()
+
+    # Never offered to the model, in any state.
+    for each in every_combination():
+        assert "settle_claim" not in names(registry, each)
+    assert names(registry, state) == ["office_info"]
+
+    refusals: list[tuple[str, Grant | None]] = [
+        # The model: no grant.
+        ("settle_claim", None),
+        # Code with a grant that is not this tool's.
+        ("settle_claim", Grant()),
+        # Code with this tool's grant, calling a tool it was not given the right to call.
+        ("office_info", grant),
+    ]
+    for name, given in refusals:
+        after, outcome = await registry.dispatch(state, name, {}, deps, grant=given)
+        assert (after, outcome) == (after_refusal(state), REFUSED), (name, given)
+    assert (code, info) == ([], [])
+    assert events(owner_engine) == [refused_event(state, name) for name, _ in refusals]
+
+    # Every gate rule applies to code too: outside its phase, even with its grant.
+    for outside in (
+        start(),
+        verified_serving(),
+        intake(office_open=True).model_copy(update={"phase": EMERGENCY}),
+    ):
+        after, outcome = await registry.dispatch(outside, "settle_claim", {}, deps, grant=grant)
+        assert outcome == REFUSED
+    assert code == []
+
+    # With its own grant, in its phase, it runs.
+    after, outcome = await registry.dispatch(state, "settle_claim", {}, deps, grant=grant)
+    assert outcome.status is Status.DONE
+    assert len(code) == 1
+
+    # The application: the model cannot call submit_identity, and it is the only tool that
+    # may verify, so code cannot verify through any other.
+    import_application_modules()
+    register_tools()
+    by_name = {item.name: item for item in REGISTRY.tools}
+    assert by_name["submit_identity"].model_callable is False
+    assert [item.name for item in REGISTRY.tools if item.may_verify] == ["submit_identity"]
+    assert "submit_identity" not in names(REGISTRY, intake())
+    assert "verify_identity" in names(REGISTRY, intake())
+    after, outcome = await REGISTRY.dispatch(intake(), "submit_identity", {}, deps)
+    assert outcome == REFUSED
+    assert after.verified is False
+
+
+async def test_events_carry_only_declared_actions(deps: Deps, owner_engine: Engine) -> None:
+    def picking(action: Action | None) -> Handler:
+        return recording([], ToolResult(audit_action=action))
+
+    outcomes = {Action.IDENTITY_REFUSED: Outcome.REFUSED, Action.IDENTITY_LOCKED: Outcome.REFUSED}
+    registry = registry_of(
+        declared("default", picking(None), outcome_actions=outcomes),
+        declared("own", picking(Action.TOOL_CALLED), outcome_actions=outcomes),
+        declared("refused", picking(Action.IDENTITY_REFUSED), outcome_actions=outcomes),
+        declared("locked", picking(Action.IDENTITY_LOCKED), outcome_actions=outcomes),
+        declared("undeclared", picking(Action.IDENTITY_VERIFIED), outcome_actions=outcomes),
+        declared("reserved", picking(Action.TOOL_FAILED), outcome_actions=outcomes),
+    )
+    state = intake()
+    for name in ("default", "own", "refused", "locked", "undeclared", "reserved"):
+        await registry.dispatch(state, name, {}, deps)
+    call = state.call_id
+    assert events(owner_engine) == [
+        ("tool_called", "tool", "default", "success", call),
+        ("tool_called", "tool", "own", "success", call),
+        ("identity_refused", "tool", "refused", "refused", call),
+        ("identity_locked", "tool", "locked", "refused", call),
+        ("tool_failed", "tool", "undeclared", "failure", call),
+        ("tool_failed", "tool", "reserved", "failure", call),
+    ]

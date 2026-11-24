@@ -1,12 +1,17 @@
-"""The tools the model may use, and the one way they run.
+"""The tools the agent has, and the one way they run.
 
 A tool is declared once (`Tool`) and registered on a `Registry`, which refuses a declaration
 that breaks a rule (`check_declaration`). The application's registry is filled and sealed by
-one entry point (app/agent/tools.py). `tools_for` is the gate: the tools a call's state allows
-right now. `dispatch` is the only caller of a handler: it re-checks the gate, bounds and
-validates the arguments, then runs the handler, applies the transition the handler asks for and
-appends the audit event in one database transaction, and commits, all within a deadline. A
-refusal or a failure gives the model fixed text and is audited in a transaction of its own.
+one entry point (app/agent/tools.py). `tools_for` is the gate as the model sees it: the tools
+it may call in a call's state right now. `dispatch` is the only caller of a handler: it checks
+who is calling, re-checks the gate, bounds and validates the arguments, then runs the handler,
+applies the transition the handler asks for and appends the audit event in one database
+transaction, and commits, all within a deadline. A refusal or a failure gives fixed text and is
+audited in a transaction of its own.
+
+A tool is callable by the model, or by code only. A dispatch without a grant is the model's.
+Code calls a code-only tool with the `Grant` registered with that tool: an object the code
+holds, which nothing the model sends can be. Every gate rule applies to both.
 
 The handler's transaction is checked before its event is appended: its id is read before the
 handler runs and again after (`pg_current_xact_id`, unique for the life of the database
@@ -38,8 +43,12 @@ from pydantic.fields import FieldInfo
 from sqlalchemy import Connection, Text, cast, event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent.claims import ClaimKeys
+from app.agent.scripts import ScriptId
 from app.agent.state import (
     CallState,
+    FailedAttempt,
+    IdentityClaim,
     Move,
     Phase,
     Verify,
@@ -48,6 +57,7 @@ from app.agent.state import (
     count_tool_error,
 )
 from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, ResourceType
+from app.domain.clinic import CLINIC_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +85,9 @@ OWNER_FIELDS = frozenset(
         "record_owner",
     }
 )
+# The one of them the tool that takes an identity claim may have, as its own top-level field:
+# the date of birth the caller claims. Code matches the claim; no record is looked up by it.
+CLAIM_FIELDS = frozenset({"dob"})
 
 # The actions dispatch and the call itself write; no tool may declare one as its own.
 RESERVED_ACTIONS = frozenset(
@@ -97,19 +110,32 @@ FAILED_MESSAGE = "That could not be done right now."
 
 
 class ToolResult(BaseModel):
-    """What a handler returns: data for the model, the transition it asks for, and, for a tool
+    """What a handler returns: data for its caller, the transition it asks for, a line for code
+    to speak, the action of its event when the tool declares more than one, and, for a tool
     whose resource type is neither `tool` nor `patient`, the id of the record it acted on."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     data: dict[str, Any] = {}
-    transition: Move | Verify | None = None
+    transition: Move | Verify | IdentityClaim | FailedAttempt | None = None
+    script: ScriptId | None = None
+    audit_action: Action | None = None
     resource_id: str | None = None
 
 
-# A handler takes the session of dispatch's transaction, the call's state and the validated
-# arguments. It must not end the transaction; the patient it acts for is `state.patient_id`.
-Handler = Callable[[AsyncSession, CallState, Any], Awaitable[ToolResult]]
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HandlerContext:
+    """What a handler has besides its session: the instant of this tool call on the call's
+    clock, and the hasher of identity claims."""
+
+    now: datetime
+    claim_keys: ClaimKeys
+
+
+# A handler takes the session of dispatch's transaction, the call's state, the validated
+# arguments and its context. It must not end the transaction; the patient it acts for is
+# `state.patient_id`.
+Handler = Callable[[AsyncSession, CallState, Any, HandlerContext], Awaitable[ToolResult]]
 
 
 class Tool(BaseModel):
@@ -122,13 +148,20 @@ class Tool(BaseModel):
     name: str
     arguments: type[BaseModel]
     handler: Handler
+    # False for a tool only code calls, with the grant registered with it.
+    model_callable: bool
     phi: bool
     phases: frozenset[Phase] = Field(min_length=1)
     office_open_only: bool
     writes: bool
     # The one tool that may ask to verify the caller (a Verify transition).
     may_verify: bool
+    # The one tool that takes an identity claim (an IdentityClaim transition).
+    takes_identity_claim: bool
+    # The action of the tool's events, with the outcome success, unless the handler names one
+    # of outcome_actions, each with its fixed outcome.
     audit_action: Action
+    outcome_actions: dict[Action, Outcome]
     resource_type: ResourceType
 
 
@@ -148,7 +181,8 @@ class Status(StrEnum):
 
 
 class ToolOutcome(BaseModel):
-    """What the model is told. A refusal or a failure is fixed text and no data."""
+    """What the caller of dispatch is told. A refusal or a failure is fixed text and no data.
+    A script is a line for code to speak."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -156,6 +190,14 @@ class ToolOutcome(BaseModel):
     message: str | None
     data: dict[str, Any]
     hand_off: bool
+    script: ScriptId | None = None
+
+
+class Grant:
+    """Code's right to call one code-only tool: registered with the tool, held by the code
+    that calls it and passed to dispatch."""
+
+    __slots__ = ()
 
 
 class DeclarationError(ValueError):
@@ -164,12 +206,13 @@ class DeclarationError(ValueError):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Deps:
-    """What dispatch needs to run a tool: sessions as the runtime role, the audit log and the
-    clock (aware datetimes)."""
+    """What dispatch needs to run a tool: sessions as the runtime role, the audit log, the
+    clock (aware datetimes) and the hasher of identity claims."""
 
     sessions: async_sessionmaker[AsyncSession]
     audit: AuditLog
     now: Callable[[], datetime]
+    claim_keys: ClaimKeys
 
 
 def _key(name: str) -> str:
@@ -228,14 +271,21 @@ def _takes_anything(annotation: object) -> bool:
     return False
 
 
-def _check_arguments(arguments: type[BaseModel]) -> None:
+def _check_arguments(arguments: type[BaseModel], *, claim: bool) -> None:
+    """The argument rules. For the tool that takes an identity claim, its own top-level fields
+    may be named as in CLAIM_FIELDS."""
     for model in _models_in(arguments):
         if model.model_config.get("extra") != "forbid":
             raise DeclarationError(
                 "every argument model, nested ones too, must forbid extra fields"
             )
+        allowed = CLAIM_FIELDS if claim and model is arguments else frozenset()
         for name, field in model.model_fields.items():
-            owners = sorted(key for key in _names_of(name, field) if _key(key) in _OWNER_KEYS)
+            owners = sorted(
+                key
+                for key in _names_of(name, field)
+                if _key(key) in _OWNER_KEYS and key not in allowed
+            )
             if owners:
                 raise DeclarationError(f"argument {owners[0]} names a patient or a record owner")
             if _takes_anything(field.annotation):
@@ -251,18 +301,38 @@ def check_declaration(tool: Tool) -> Tool:
         raise DeclarationError(f"a tool must declare valid {', '.join(fields)}") from None
     if not TOOL_NAME.fullmatch(declared.name):
         raise DeclarationError("the tool name must be 2 to 40 lower-case letters and underscores")
-    if declared.audit_action in RESERVED_ACTIONS:
+    if {declared.audit_action, *declared.outcome_actions} & RESERVED_ACTIONS:
         raise DeclarationError("the audit action is reserved for dispatch and the call")
+    if declared.audit_action in declared.outcome_actions:
+        raise DeclarationError("the default action is not listed again in outcome_actions")
 
-    _check_arguments(declared.arguments)
+    if declared.takes_identity_claim and (
+        declared.phi
+        or declared.phases != {Phase.INTAKE}
+        or not declared.office_open_only
+        or not declared.model_callable
+        or declared.may_verify
+    ):
+        raise DeclarationError(
+            "a tool that takes an identity claim is not a phi tool, is in intake only with the"
+            " office open, is callable by the model and may not verify"
+        )
+
+    _check_arguments(declared.arguments, claim=declared.takes_identity_claim)
 
     if declared.phi and not declared.phases <= PHI_PHASES:
         raise DeclarationError("a phi tool may list only the serving and booking phases")
 
-    if declared.may_verify and (declared.phi or declared.phases != {Phase.INTAKE}):
-        raise DeclarationError("a tool that may verify is not a phi tool and is in intake only")
+    if declared.may_verify and (
+        declared.phi or declared.phases != {Phase.INTAKE} or declared.model_callable
+    ):
+        raise DeclarationError(
+            "a tool that may verify is not a phi tool, is in intake only and is code-only"
+        )
 
-    if declared.writes:
+    # The caller confirms what the model asks to write. Code calls a code-only tool on its own
+    # decision, never on the model's word.
+    if declared.writes and declared.model_callable:
         confirmed = declared.arguments.model_fields.get("confirmed")
         if (
             confirmed is None
@@ -277,8 +347,8 @@ def check_declaration(tool: Tool) -> Tool:
     return declared
 
 
-def _available(tool: Tool, state: CallState) -> bool:
-    """The gate."""
+def is_available(tool: Tool, state: CallState) -> bool:
+    """The gate, for the model's calls and code's alike."""
     if state.phase in NO_TOOL_PHASES or state.phase not in tool.phases:
         return False
     if tool.office_open_only and not state.office_open:
@@ -308,7 +378,21 @@ def _resource_id(tool: Tool, state: CallState, result: ToolResult) -> str | None
     return result.resource_id
 
 
-def _outcome(status: Status, state: CallState, data: dict[str, Any] | None = None) -> ToolOutcome:
+def _event(tool: Tool, result: ToolResult) -> tuple[Action, Outcome]:
+    """The action and outcome of a tool call's event: only ones the tool declares."""
+    if result.audit_action is None or result.audit_action is tool.audit_action:
+        return tool.audit_action, Outcome.SUCCESS
+    if result.audit_action in tool.outcome_actions:
+        return result.audit_action, tool.outcome_actions[result.audit_action]
+    raise PermissionError("a handler names only an action its tool declares")
+
+
+def _outcome(
+    status: Status,
+    state: CallState,
+    data: dict[str, Any] | None = None,
+    script: ScriptId | None = None,
+) -> ToolOutcome:
     message = {
         Status.DONE: None,
         Status.REFUSED: REFUSED_MESSAGE,
@@ -319,6 +403,7 @@ def _outcome(status: Status, state: CallState, data: dict[str, Any] | None = Non
         message=message,
         data={} if data is None else data,
         hand_off=(state.tool_errors >= MAX_TOOL_ERRORS or state.tool_refusals >= MAX_TOOL_REFUSALS),
+        script=script,
     )
 
 
@@ -332,6 +417,7 @@ class Registry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self._schemas: dict[str, dict[str, Any]] = {}
+        self._grants: dict[str, Grant] = {}
         self._sealed = False
 
     @property
@@ -347,38 +433,69 @@ class Registry:
         """No tool can be registered after this."""
         self._sealed = True
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: Tool, *, grant: Grant | None = None) -> None:
+        """Register a tool: a code-only tool with a grant of its own, a model-callable tool
+        without one."""
         if self._sealed:
             raise DeclarationError("the registry is sealed")
         declared = check_declaration(tool)
+        if declared.model_callable != (grant is None) or (
+            grant is not None and not isinstance(grant, Grant)
+        ):
+            raise DeclarationError(
+                "a code-only tool is registered with a grant, a model-callable tool without one"
+            )
+        if grant is not None and any(given is grant for given in self._grants.values()):
+            raise DeclarationError("a grant is registered with one tool only")
         if declared.name in self._tools:
             raise DeclarationError("a tool of that name is already registered")
         if declared.may_verify and any(item.may_verify for item in self._tools.values()):
             raise DeclarationError("only one tool may verify the caller")
+        if declared.takes_identity_claim and any(
+            item.takes_identity_claim for item in self._tools.values()
+        ):
+            raise DeclarationError("only one tool may take an identity claim")
         self._schemas[declared.name] = declared.arguments.model_json_schema()
         self._tools[declared.name] = declared
+        if grant is not None:
+            self._grants[declared.name] = grant
 
     def tools_for(self, state: CallState) -> list[ToolDescription]:
-        """The tools the state allows right now, in registration order."""
+        """The tools the model may call in the state right now, in registration order."""
         return [
             ToolDescription(name=name, parameters=copy.deepcopy(self._schemas[name]))
             for name, tool in self._tools.items()
-            if _available(tool, state)
+            if tool.model_callable and is_available(tool, state)
         ]
 
     async def dispatch(
-        self, state: CallState, name: object, raw_args: object, deps: Deps
+        self,
+        state: CallState,
+        name: object,
+        raw_args: object,
+        deps: Deps,
+        *,
+        grant: Grant | None = None,
     ) -> tuple[CallState, ToolOutcome]:
-        """Run one tool call for the model and return the next state and what to tell it."""
+        """Run one tool call and return the next state and what to tell the caller: the model
+        when no grant is given, otherwise the code that holds the tool's grant."""
         tool = self._tools.get(name) if isinstance(name, str) else None
         if tool is None:
             return await self._refuse(state, None, "unknown_tool", deps)
-        if tool.name not in {description.name for description in self.tools_for(state)}:
+        if grant is None and not tool.model_callable:
+            return await self._refuse(state, tool.name, "code_only", deps)
+        if grant is not None and self._grants.get(tool.name) is not grant:
+            return await self._refuse(state, tool.name, "not_granted", deps)
+        if not is_available(tool, state):
             return await self._refuse(state, tool.name, "not_available", deps)
         if not _small_enough(raw_args):
             return await self._refuse(state, tool.name, "too_large", deps)
+        now = deps.now()
         try:
-            arguments = tool.arguments.model_validate(raw_args)
+            # Argument models may check dates against the clinic's date, from the call's clock.
+            arguments = tool.arguments.model_validate(
+                raw_args, context={"today": now.astimezone(CLINIC_TZ).date()}
+            )
         except Exception as error:
             count = error.error_count() if isinstance(error, ValidationError) else 0
             logger.warning("tool_arguments_refused tool=%s errors=%d", tool.name, count)
@@ -396,11 +513,18 @@ class Registry:
 
                     event.listen(connection.sync_connection, "commit", only_dispatch_commits)
                     opened = await session.scalar(_TRANSACTION_ID)
-                    result = await tool.handler(session, state, arguments)
+                    context = HandlerContext(now=now, claim_keys=deps.claim_keys)
+                    result = await tool.handler(session, state, arguments, context)
                     if not isinstance(result, ToolResult):
                         raise TypeError("a handler returns a ToolResult")
                     if isinstance(result.transition, Verify) and not tool.may_verify:
                         raise PermissionError("only the tool declared to verify may verify")
+                    if (
+                        isinstance(result.transition, IdentityClaim)
+                        and not tool.takes_identity_claim
+                    ):
+                        raise PermissionError("only the tool declared to take a claim may")
+                    action, outcome = _event(tool, result)
                     after = state if result.transition is None else apply(state, result.transition)
                     resource_id = _resource_id(tool, after, result)
                     if await session.scalar(_TRANSACTION_ID) != opened:
@@ -409,9 +533,9 @@ class Registry:
                         session,
                         Event(
                             actor=AGENT,
-                            action=tool.audit_action,
+                            action=action,
                             resource_type=tool.resource_type,
-                            outcome=Outcome.SUCCESS,
+                            outcome=outcome,
                             call_id=state.call_id,
                             resource_id=resource_id,
                         ),
@@ -437,7 +561,7 @@ class Registry:
             await self._record(failed, Action.TOOL_FAILED, Outcome.FAILURE, tool.name, deps)
             return failed, _outcome(Status.FAILED, failed)
         logger.info("tool_called tool=%s call_id=%s", tool.name, state.call_id)
-        return after, _outcome(Status.DONE, after, result.data)
+        return after, _outcome(Status.DONE, after, result.data, result.script)
 
     async def _refuse(
         self, state: CallState, name: str | None, reason: str, deps: Deps

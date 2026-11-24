@@ -49,12 +49,14 @@ EXPECTED_TABLES = {
     "appointments": {"SELECT", "INSERT", "UPDATE"},
     "available_slots": {"SELECT", "UPDATE"},
     "audit_events": {"SELECT", "INSERT"},
+    "verification_attempts": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
-# Only the appointments insert takes a number from a sequence; patients have text ids and
-# audit_events numbers its own rows.
+# Only the appointments and verification attempts inserts take a number from a sequence;
+# patients have text ids and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
     "appointments_id_seq": {"USAGE"},
+    "verification_attempts_id_seq": {"USAGE"},
     "available_slots_id_seq": set(),
     "medications_id_seq": set(),
 }
@@ -418,6 +420,7 @@ FIRST_COLUMN = {
     "appointments": "reason_short",
     "available_slots": "source",
     "audit_events": "reason",
+    "verification_attempts": "success",
     "alembic_version": "version_num",
 }
 

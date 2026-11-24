@@ -1,14 +1,17 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.agent.state import (
     CallState,
+    FailedAttempt,
+    IdentityClaim,
     IllegalTransitionError,
     Move,
     Phase,
+    SsnStep,
     Verify,
     apply,
     count_refusal,
@@ -323,6 +326,8 @@ def test_a_new_call_starts_at_the_beginning() -> None:
     )
     assert (state.verify_attempts, state.verify_locked, state.tool_errors) == (0, False, 0)
     assert (state.tool_refusals, state.is_new_patient, state.started_at) == (0, False, T0)
+    assert (state.pending_claim, state.expecting_ssn4, state.ssn_turns) == (None, False, 0)
+    assert (state.pending_ssn4, state.verified_ssn4) == (None, None)
     assert new_call(call_id=new_call_id(), started_at=T0, office_open=False).office_open is False
 
 
@@ -365,3 +370,150 @@ def test_a_call_state_checks_what_it_is_given() -> None:
         CallState(call_id=call_id, started_at=T0, office_open=True, tool_errors=-1)
     with pytest.raises(ValidationError):
         CallState(call_id=call_id, started_at=T0, office_open=True, ssn_last4="1234")
+
+
+# --- Slice 08: the identity claim and the SSN step ------------------------------------------
+
+SARAH_CLAIM = IdentityClaim(full_name="Sarah Johnson", dob=date(1985, 3, 14))
+OTHER_CLAIM = IdentityClaim(full_name="Ann Lee", dob=date(1990, 1, 1))
+DIGITS = "33" + "44"
+
+
+def armed(office_open: bool = True) -> CallState:
+    return apply(move(start(office_open), INTAKE), SARAH_CLAIM)
+
+
+def test_the_ssn_step_lives_in_intake() -> None:
+    state = armed()
+    assert (state.pending_claim, state.expecting_ssn4, state.ssn_turns, state.pending_ssn4) == (
+        SARAH_CLAIM,
+        True,
+        0,
+        None,
+    )
+    assert state.pending_claim is not None
+    assert "Sarah" not in repr(state.pending_claim)
+
+    # A claim only in intake, with the office open, on a call that is not locked.
+    for office_open in (True, False):
+        for phase, each in reached(office_open):
+            if phase is INTAKE and office_open:
+                continue
+            with pytest.raises(IllegalTransitionError):
+                apply(each, SARAH_CLAIM)
+    locked = move(start(), INTAKE)
+    for _ in range(3):
+        locked = apply(apply(locked, SARAH_CLAIM), FailedAttempt())
+    with pytest.raises(IllegalTransitionError, match="locked"):
+        apply(locked, SARAH_CLAIM)
+
+    # The guard's change only to an armed step.
+    with pytest.raises(IllegalTransitionError):
+        apply(move(start(), INTAKE), SsnStep(expecting_ssn4=True, ssn_turns=1, pending_ssn4="3"))
+    stepped = apply(state, SsnStep(expecting_ssn4=True, ssn_turns=2, pending_ssn4="334"))
+    assert (stepped.ssn_turns, stepped.pending_ssn4, stepped.pending_claim) == (
+        2,
+        "334",
+        SARAH_CLAIM,
+    )
+
+    # A second claim replaces the first and clears the buffer.
+    again = apply(stepped, OTHER_CLAIM)
+    assert (again.pending_claim, again.ssn_turns, again.pending_ssn4, again.expecting_ssn4) == (
+        OTHER_CLAIM,
+        0,
+        None,
+        True,
+    )
+
+    # Every phase change ends the step: emergency, a new patient's booking, hand-off, the rest.
+    for target in (BOOKING, HANDOFF, EMERGENCY, CLOSING, ENDED):
+        after = move(stepped, target)
+        assert (
+            after.pending_claim,
+            after.expecting_ssn4,
+            after.ssn_turns,
+            after.pending_ssn4,
+        ) == (None, False, 0, None), target
+
+    # Verification keeps the digits as verified_ssn4 and ends the step.
+    full = apply(state, SsnStep(expecting_ssn4=False, ssn_turns=0, pending_ssn4=DIGITS))
+    verified = apply(full, Verify(patient_id="P001", first_name="Sarah"))
+    assert (verified.verified_ssn4, verified.pending_ssn4, verified.pending_claim) == (
+        DIGITS,
+        None,
+        None,
+    )
+    assert (verified.expecting_ssn4, verified.phase) == (False, SERVING)
+
+
+def test_failed_attempts_count_and_lock() -> None:
+    state = move(start(), INTAKE)
+    for attempt in (1, 2, 3):
+        state = apply(apply(state, SARAH_CLAIM), FailedAttempt())
+        assert (state.verify_attempts, state.verify_locked) == (attempt, attempt == 3)
+        assert (state.pending_claim, state.expecting_ssn4, state.pending_ssn4) == (
+            None,
+            False,
+            None,
+        )
+    # A locked call cannot be verified.
+    with pytest.raises(IllegalTransitionError, match="locked"):
+        verify(state, patient_id="P001", first_name="Sarah")
+    # A failure is counted only in intake.
+    with pytest.raises(IllegalTransitionError):
+        apply(verified_serving(), FailedAttempt())
+
+
+def test_the_step_is_consistent() -> None:
+    base: dict[str, object] = {
+        "call_id": new_call_id(),
+        "started_at": T0,
+        "office_open": True,
+        "phase": INTAKE,
+    }
+    claimed: dict[str, object] = {"pending_claim": SARAH_CLAIM}
+    refused: list[dict[str, object]] = [
+        # The claim and the step exist only in intake with the office open.
+        {
+            **claimed,
+            "phase": SERVING,
+            "verified": True,
+            "patient_id": "P001",
+            "patient_first_name": "Sarah",
+        },
+        {**claimed, "phase": BOOKING},
+        {**claimed, "office_open": False},
+        {**claimed, "expecting_ssn4": True, "office_open": False},
+        # Armed needs a claim; digits need a claim; counted turns need the step armed.
+        {"expecting_ssn4": True},
+        {"pending_ssn4": "33"},
+        {**claimed, "ssn_turns": 1},
+        {**claimed, "expecting_ssn4": True, "ssn_turns": -1},
+        # Digits only, at most four; the verified ones exactly four, and only when verified.
+        {**claimed, "pending_ssn4": DIGITS + "5"},
+        {**claimed, "pending_ssn4": "33a"},
+        {**claimed, "pending_ssn4": ""},
+        {"verified_ssn4": DIGITS},
+        # Locked exactly at three attempts; a locked call holds no claim.
+        {"verify_locked": True},
+        {"verify_attempts": 3},
+        {**claimed, "verify_attempts": 3, "verify_locked": True},
+    ]
+    for given in refused:
+        with pytest.raises(ValidationError) as invalid:
+            CallState.model_validate({**base, **given})
+        assert DIGITS not in str(invalid.value)
+        assert "Sarah" not in str(invalid.value)
+    accepted: list[dict[str, object]] = [
+        {**claimed},
+        {**claimed, "expecting_ssn4": True, "ssn_turns": 2, "pending_ssn4": "334"},
+        {"verify_attempts": 3, "verify_locked": True},
+        {"verify_attempts": 2},
+    ]
+    for given in accepted:
+        CallState.model_validate({**base, **given})
+    serving = {"phase": SERVING, "verified": True, "patient_id": "P001", "patient_first_name": "S"}
+    assert CallState.model_validate({**base, **serving, "verified_ssn4": DIGITS}).verified_ssn4 == (
+        DIGITS
+    )

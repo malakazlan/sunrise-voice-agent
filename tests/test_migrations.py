@@ -14,7 +14,14 @@ from app.db.models import Base
 from app.db.session import create_owner_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TABLES = {"patients", "medications", "appointments", "available_slots", "audit_events"}
+TABLES = {
+    "patients",
+    "medications",
+    "appointments",
+    "available_slots",
+    "audit_events",
+    "verification_attempts",
+}
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -125,16 +132,22 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 25
+    assert len(migrated_constraints) == 28
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
         "ck_audit_events_actor",
         "CHECK ((actor ~ '^[A-Za-z0-9_:.-]{1,64}$'::text))",
     ) in migrated_constraints
+    # The attempts table holds a keyed hash and a call id of the declared shape, nothing else.
+    assert (
+        "verification_attempts",
+        "ck_verification_attempts_claim_key",
+        "CHECK ((claim_key ~ '^[0-9a-f]{64}$'::text))",
+    ) in migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 45
+    assert len(migrated_columns) == 50
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
     # seq has no default: the app assigns it under the lock, never a sequence.

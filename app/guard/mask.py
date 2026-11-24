@@ -50,7 +50,8 @@ def _day(name: str) -> str:
 
 # An SSN cue, and the short words that may stand between a cue and the digits ("security
 # number is"). A cue may follow "_" (ssn_last4).
-_CUE = r"(?:ssn|social|last[_ \t-]?(?:four|4)|ending[ \t]+in|ends[ \t]+in)(?![a-z])"
+_LAST_FOUR = r"last[_ \t-]?(?:four|4)"
+_CUE = rf"(?:ssn|social|{_LAST_FOUR}|ending[ \t]+in|ends[ \t]+in)(?![a-z])"
 _GAP = r"[\s:;,.#=\"'()\[\]-]{0,8}+"
 # A word between is never a number, and never the start of another cue: the scan starts again
 # at that cue, so the "four" of "last four" is never taken for the digits.
@@ -149,3 +150,91 @@ def mask(text: str) -> str:
     """The text with every identifier masked, line by line. A line longer than MAX_LENGTH is
     cut to that length, the marker included, before matching. mask(mask(text)) == mask(text)."""
     return "\n".join(_mask_line(line) for line in text.split("\n"))
+
+
+_SSN_KINDS = frozenset({"ssn", "cue"})
+
+
+def _replace_ssn(match: re.Match[str]) -> str:
+    return _replace(match) if match.lastgroup in _SSN_KINDS else match[0]
+
+
+def mask_ssns(text: str) -> str:
+    """The text with SSNs masked as `mask` masks them (a grouped or nine-digit number, digits
+    after a cue), line by line; every other identifier is kept as it is. For text that is
+    stored for people to read, such as a caller's message. Not cut."""
+    return "\n".join(_IDENTIFIER.sub(_replace_ssn, line) for line in text.split("\n"))
+
+
+# Spoken and written digits, read in runs: a run of numerals, a digit word, or a word that
+# repeats the digit after it. Tokens join into one run across spaces and hyphens, and across a
+# comma only between two single digits ("three, three, four"). "oh" is a zero only in a run
+# that holds another digit. The "four" of the cue "last four" is never a digit.
+_DIGIT_TOKEN = re.compile(
+    rf"\d+|(?<![^\W\d_])(?:{'|'.join(_UNIT_DIGITS)}|double|triple)(?![^\W\d_])", re.IGNORECASE
+)
+_REPEATS = {"double": 2, "triple": 3}
+_JOINS = re.compile(r"[ \t-]{0,3}")
+_JOINS_SINGLE_DIGITS = re.compile(r"[ \t-]{0,2},[ \t-]{0,2}")
+_LAST_FOUR_CUE = re.compile(rf"(?<![^\W\d_]){_LAST_FOUR}(?![^\W\d_])", re.IGNORECASE)
+# A group of four digits that reads as a year in this range is taken for one.
+_YEARS = range(1900, 2100)
+
+
+def _single(token: str) -> bool:
+    return len(token) == 1 or not token[0].isdigit()
+
+
+def _run_digits(tokens: list[re.Match[str]]) -> str:
+    words = [token[0].lower() for token in tokens]
+    zero_counts = any(word[0].isdigit() or word in _UNIT_DIGITS for word in words if word != "oh")
+    digits = ""
+    repeat = 1
+    for word in words:
+        if word in _REPEATS:
+            repeat = _REPEATS[word]
+            continue
+        if word[0].isdigit():
+            read = "".join(str(int(char)) for char in word)
+        elif word != "oh" or zero_counts:
+            read = _UNIT_DIGITS[word]
+        else:
+            repeat = 1
+            continue
+        digits += read[0] * repeat + read[1:]
+        repeat = 1
+    return digits
+
+
+def _digit_runs(text: str) -> list[tuple[int, int, str]]:
+    """Each run of digit tokens: where it starts, where it ends, and the digits it says."""
+    text = _LAST_FOUR_CUE.sub(lambda cue: " " * len(cue[0]), text)
+    runs: list[list[re.Match[str]]] = []
+    for token in _DIGIT_TOKEN.finditer(text):
+        if runs:
+            previous = runs[-1][-1]
+            gap = text[previous.end() : token.start()]
+            if _JOINS.fullmatch(gap) or (
+                _JOINS_SINGLE_DIGITS.fullmatch(gap) and _single(previous[0]) and _single(token[0])
+            ):
+                runs[-1].append(token)
+                continue
+        runs.append([token])
+    return [(run[0].start(), run[-1].end(), _run_digits(run)) for run in runs]
+
+
+def spoken_digits(text: str) -> str:
+    """Every digit the text says, in order, written or spoken."""
+    return "".join(digits for _start, _end, digits in _digit_runs(text))
+
+
+def mask_last_four(text: str) -> str:
+    """The text with each run of exactly four digits masked, unless it reads as a year from
+    1900 to 2099. A run joined to other digits is longer than four and is left as it is."""
+    masked = []
+    kept_until = 0
+    for start, end, digits in _digit_runs(text):
+        if len(digits) == 4 and int(digits) not in _YEARS:
+            masked.append(text[kept_until:start] + "****")
+            kept_until = end
+    return "".join(masked) + text[kept_until:]

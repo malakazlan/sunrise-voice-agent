@@ -961,3 +961,99 @@ def test_no_print_in_app() -> None:
     assert {name: uses for name, uses in offenders.items() if uses} == {}
     # The named exception is still there; if it goes, so should its entry.
     assert ("sys.stderr.write", "main") in found["app/config.py"]
+
+
+# app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last
+# four and the spoken digit words. The input guard takes them from there; no other file under
+# app/ may hold a pattern that matches what they match, or a list of the digit words. A pattern
+# counts when it matches a sample whole but not the same shape written in letters, so a pattern
+# for any text of that shape is not taken for one. Like the scans above, a lint against
+# accidents: a pattern assembled at runtime is not seen.
+SSN_OWNER = "app/guard/mask.py"
+INPUT_GUARD = "app/guard/input.py"
+DIGIT_WORDS = {"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+
+
+def ssn_samples() -> list[tuple[str, str]]:
+    """Text an SSN pattern matches whole, each with a decoy of the same shape in letters. Built
+    from pieces so that this file holds no SSN-shaped literal."""
+    last_four = "33" + "44"
+    return [
+        ("-".join(["123", "45", "6789"]), "abc-de-fghi"),
+        (" ".join(["123", "45", "6789"]), "abc de fghi"),
+        (f"ssn {last_four}", "ssn abcd"),
+        (f"my social is {last_four}", "my social is abcd"),
+        (f"last four {last_four}", "last four abcd"),
+        (f"ending in {last_four}", "ending in abcd"),
+        ("three three four four", "trees there fork fours"),
+    ]
+
+
+def ssn_pattern_uses(source: str) -> list[str]:
+    samples = ssn_samples()
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if len(set(re.findall(r"[a-z]+", node.value.lower())) & DIGIT_WORDS) >= 5:
+                uses.append(f"digit words in {node.value[:30]!r}")
+                continue
+            try:
+                pattern = re.compile(node.value, re.IGNORECASE)
+            except re.error:
+                continue
+            if any(
+                pattern.fullmatch(sample) and not pattern.fullmatch(decoy)
+                for sample, decoy in samples
+            ):
+                uses.append(f"pattern {node.value[:30]!r}")
+        elif isinstance(node, ast.Dict | ast.Set | ast.List | ast.Tuple):
+            items = node.keys if isinstance(node, ast.Dict) else node.elts
+            words = {
+                item.value
+                for item in items
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            }
+            if len(words & DIGIT_WORDS) >= 5:
+                uses.append("digit words")
+    return uses
+
+
+def imports_from(source: str, module: str) -> set[str]:
+    return {
+        alias.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module == module
+        for alias in node.names
+    }
+
+
+def test_ssn_patterns_have_one_owner() -> None:
+    for sample in (
+        "SSN = re.compile(r'(?<![0-9])[0-9]{3}-[0-9]{2}-[0-9]{4}(?![0-9])')\n",
+        "SSN = r'\\d{3}[- ]\\d{2}[- ]\\d{4}'\n",
+        "CUE = re.compile(r'(?:ssn|social|last four|ending in)\\D{0,20}\\d{4}')\n",
+        "WORDS = r'(?:zero|one|two|three|four|five|six|seven|eight|nine)'\n",
+        "DIGITS = {'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5}\n",
+        "WORDS = 'zero one two three four five six seven eight nine'.split()\n",
+        "SPOKEN = r'(?:(?:one|two|three|four)\\s+){3}(?:one|two|three|four)'\n",
+    ):
+        assert ssn_pattern_uses(sample), sample
+    assert not ssn_pattern_uses(
+        "WHOLE = re.compile(r'[0-9]+')\n"
+        "AUDIT = '[A-Za-z0-9_:.-]{1,64}'\n"
+        "SHAPE = \"ssn_last4 IS NULL OR ssn_last4 ~ '^[0-9]{4}$'\"\n"
+        "FIELDS = {'ssn', 'ssn_last4', 'social_security_number'}\n"
+        "PHRASES = ('one moment', 'two things')\n"
+    )
+
+    sources = app_sources()
+    owners = {name for name, source in sources.items() if ssn_pattern_uses(source)}
+    # The owner is seen by the scan, and it is the only file that is.
+    assert owners == {SSN_OWNER}
+
+    # The guard uses the owner's redaction and digit reading, not a copy.
+    assert imports_from(sources[INPUT_GUARD], "app.guard.mask") >= {
+        "mask_ssns",
+        "mask_last_four",
+        "spoken_digits",
+    }

@@ -275,7 +275,8 @@ A generated slot never replaces an existing slot at the same doctor and time.
 
 ### Call state and the tool gate
 
-No real tool is registered yet; later slices add the tools and wire them to the model.
+The registered tools are the two of identity verification (below); later slices add the rest
+and wire them to the model.
 
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
@@ -294,7 +295,9 @@ No real tool is registered yet; later slices add the tools and wire them to the 
   (`model_construct`, `object.__setattr__`) can still forge a state.
 - `app/agent/tool_registry.py`: a tool is declared once (name, argument model, handler,
   whether it touches patient data, its phases, whether it needs the office open, whether it
-  writes, whether it may verify the caller, its audit action and resource type). Registration
+  writes, whether the model may call it, whether it may verify the caller, whether it takes
+  an identity claim, its audit action, any other actions its events may carry with each one's
+  fixed outcome, and its resource type). Registration
   refuses a declaration that breaks a rule: every field given and of the right kind, the
   audit action from the audit registry and not one dispatch or the call writes itself
   (`tool_refused`, `tool_failed`, `call_started`, `call_ended`); no argument naming a patient
@@ -302,15 +305,23 @@ No real tool is registered yet; later slices add the tools and wire them to the 
   alias or any validation alias (each choice, each step of a path), in nested models too;
   every argument model, nested ones included, forbids unknown fields; no argument takes free
   keys (a mapping), `Any` or `object`; a patient-data tool only in `serving` and `booking`; a
-  writing tool's arguments have `confirmed: bool = False`; a tool that may verify is not a
-  patient-data tool, is in `intake` only, and there is at most one; the name is 2 to 40
-  lower-case letters and underscores.
+  writing tool the model can call has `confirmed: bool = False` among its arguments (a
+  code-only tool is never called on the model's word); a tool that may verify is not a
+  patient-data tool, is in `intake` only, is code-only, and there is at most one; a tool that
+  takes an identity claim is not a patient-data tool, is in `intake` only with the office
+  open, is callable by the model, may not verify, and there is at most one: it alone may have
+  a `dob` argument; a code-only tool is registered with a grant of its own (`Grant`), a
+  model-callable one without; the name is 2 to 40 lower-case letters and underscores.
 - `app/agent/tools.py`: `register_tools()` is the one entry point that registers every tool
   on the application's registry and seals it; after that, registering refuses. The app calls
   it at start. The structural tests call it after importing every module under `app/`, so a
   tool registered anywhere is checked against the gate's rules; the registry is constructed
   once in `app/`.
-- The gate (`tools_for`): no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
+- Who calls: `tools_for` offers the model only model-callable tools. `dispatch` without a
+  grant is a model call and refuses a code-only tool; with a grant it is a code call and
+  refuses any tool that grant was not registered with. The grant is an object held by the code
+  that calls the tool, never anything the model sends. The gate below applies to both.
+- The gate: no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
   `ended`; a tool only in its declared phases; an office-hours tool only while the office is
   open; a patient-data tool only for a verified caller with a patient id, while the office is
   open. Since such a tool can only be declared for `serving` and `booking`, it is never
@@ -348,6 +359,76 @@ No real tool is registered yet; later slices add the tools and wire them to the 
   regains control, and dispatch cannot undo it. The call fails and no success event is
   written, but the committed rows stay; the scan keeps such SQL text out of `app/`.
 
+### Identity verification
+
+Before any patient information, the caller gives a full name, a date of birth and the last
+four digits of their SSN; all three must match one record, and the digits never reach the
+model. Code decides; the model only relays the name and the date.
+
+- `app/guard/input.py`: `guard_input(text, state)` decides each caller turn, purely (no
+  database, network or clock), in this order. **Emergency**: a phrase of the emergency list
+  (chest pain, can't breathe, suicid..., overdose, stroke, heart attack, passed out, severe
+  bleeding and the others), negated or not, wins in every phase: the model sees nothing of
+  the turn, code speaks the `emergency` line and the call moves to `emergency`. **The SSN
+  step**, while armed: a turn with any digit (numerals in any script, or zero, one ... nine,
+  with double and triple) is swallowed whole and its digits are collected; a turn without
+  one passes. Four digits in all submit them; more than four clear the buffer and ask again
+  (`ssn_too_long`); the third armed turn without four submits what there is. **Redaction**,
+  always: digits after an SSN cue and SSN-shaped numbers, and while the caller is unverified,
+  a group of exactly four digits that is not a year from 1900 to 2099. **Flags**: an attempt
+  to override the instructions, and a request about someone else; the text still passes. The
+  decision carries the state change as a transition; its caller applies it with `apply`.
+- `app/guard/mask.py` stays the one owner of the SSN patterns: the guard uses its cue and SSN
+  alternatives (`mask_ssns`, the same ones `mask()` uses), its bare-four rule
+  (`mask_last_four`) and its digit reading (`spoken_digits`). A repo scan refuses SSN
+  patterns or lists of digit words anywhere else under `app/`; it is a lint, like the others.
+- `verify_identity(full_name, dob)`: the model calls it in `intake` with the office open.
+  The date must be an ISO date (`YYYY-MM-DD`) not after the clinic's date, and the name must
+  be a name; otherwise the arguments are refused and nothing is counted. It stores the claim,
+  arms the SSN step and returns `ssn_ask`. If the call is locked, or the claimed identity has
+  five failures within the last hour across calls, it returns `verify_locked` and arms
+  nothing. It never reads a patient record.
+- `submit_identity()`: code-only; `submit_claim` in `app/agent/tools.py` calls it when the
+  guard says submit. It reads the claim and the digits from the state, selects the records
+  with exactly that date of birth and those four digits, and `pick_patient` must find exactly
+  one by name. A match verifies the caller (`verified`, with their first name) and keeps the
+  digits as `verified_ssn4`. Anything else is one failed attempt, identical whatever did not
+  match: the same `verify_fail` line, the same `identity_refused` event, the same state
+  change; the third locks the call (`verify_locked`, `identity_locked`). Every submit is
+  recorded in `verification_attempts`, in one transaction with the state change and the
+  audit event. A submit that does not run to an outcome (the database is down) counts
+  nothing and verifies nothing, and `submit_claim` drops the claim and the digits.
+- `verification_attempts` holds the claim's keyed hash (HMAC-SHA256 under
+  `IDENTITY_HASH_KEY` over the name's letters and the ISO date), the call id, whether it
+  matched and when; never a name, a date or a digit. The runtime role may only read and
+  insert. A success does not clear earlier failures; failures of claims that match nobody
+  count the same, so a lock says nothing about who exists.
+- The claim and the SSN step live in `intake` with the office open; any phase change ends
+  them, and a second claim replaces the first. `pending_ssn4` and `verified_ssn4` are excluded
+  from every dump and from the state's text form by their declaration; validation errors do
+  not show input. Events carry `identity_claimed`, `identity_verified` (the patient id),
+  `identity_refused` and `identity_locked`, with no factor, name or digit. The scripted lines
+  are in `app/agent/scripts.py`.
+
+Limits, stated plainly:
+
+- A last four said before the step is armed, without a cue, reaches the model when it reads
+  as a year (1900 to 2099), or when it is joined to other digits (a phone number). Outside
+  the step, digits are redacted only after a cue, in SSN shape, or as a lone group of four.
+- Spoken number words count as digits while the step is armed: "one moment" adds a 1 and
+  the turn is swallowed. "oh" is a zero only next to another digit. The "four" of "last four"
+  is not a digit.
+- On the third armed turn without digits the decision both submits and passes the text: the
+  caller of the guard runs the submit first, then gives the model the text. A third turn with
+  more than four digits submits an empty buffer.
+- An emergency while armed: the model sees nothing of the turn; the move to `emergency` ends
+  the step.
+- The count across calls is not atomic: two calls at the same moment can briefly pass five.
+- `pydantic`'s `errors()` returns a rejected value when asked for its input; the error's text
+  form does not. No application code reads `errors()` of a state.
+- `IDENTITY_HASH_KEY` and `AUDIT_HMAC_KEY` are checked as settings; building the hasher and the
+  audit log from them comes with the wiring of the call pipeline.
+
 ## Configuration
 
 | Variable            | Allowed values                      | Default        |
@@ -363,6 +444,7 @@ No real tool is registered yet; later slices add the tools and wire them to the 
 | `APP_DB_USER`       | runtime role: `a-z 0-9 _`, up to 63, not `pg_...`, not `POSTGRES_USER` | none, required |
 | `APP_DB_PASSWORD`   | runtime role's password, never logged, not `POSTGRES_PASSWORD` | none, required |
 | `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
+| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
@@ -382,7 +464,8 @@ its settings before it touches the database (`python -m app.config`); the app ch
 when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
-`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`) must also not start or end with whitespace and must
+`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`) must also not start or end with
+whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -391,6 +474,10 @@ of environment, so it applies the rule in dev as well.
 be at least 32 characters and must not be the placeholder from `.env.example`. Keep it outside
 the database: whoever holds it can write events that verify. Changing it makes the existing
 log fail verification.
+
+`IDENTITY_HASH_KEY` follows the same rules as `AUDIT_HMAC_KEY` (its own placeholder). It keys
+the hashes under which failed identity checks are counted across calls; choose one different
+from the audit key. Changing it starts every count again.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -436,7 +523,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the
