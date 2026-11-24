@@ -36,6 +36,11 @@ NAMING_CONVENTION = {
 }
 
 SLOT_SOURCES = ("task", "generated")
+SCHEDULED = "scheduled"
+REQUEST_TYPES = ("refill", "doctor_message")
+MESSAGE_KINDS = ("doctor_message",)
+MAX_REQUEST_SUMMARY = 200
+MAX_MESSAGE_BODY = 120
 
 
 class Base(DeclarativeBase):
@@ -117,6 +122,50 @@ class Appointment(Base):
     starts_at: Mapped[datetime]
     reason_short: Mapped[str | None]
     status: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+def _length_between(column: str, longest: int, name: str) -> CheckConstraint:
+    return CheckConstraint(f"char_length({column}) BETWEEN 1 AND {longest}", name=name)
+
+
+class Request(Base):
+    """Something a caller asked the clinic's staff to do. A call asks for the same thing once:
+    the same type and summary again in one call is the same request."""
+
+    __tablename__ = "requests"
+    __table_args__ = (
+        UniqueConstraint("call_id", "type", "summary"),
+        CheckConstraint(literal_column("type").in_(REQUEST_TYPES), name="type"),
+        _length_between("summary", MAX_REQUEST_SUMMARY, "summary_length"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    call_id: Mapped[str]
+    patient_id: Mapped[str | None] = mapped_column(ForeignKey("patients.id"))
+    type: Mapped[str]
+    summary: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Message(Base):
+    """A message a caller left for the clinic. The body is the caller's text. A call leaves
+    the same message once."""
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        UniqueConstraint("call_id", "kind", "body"),
+        CheckConstraint(literal_column("kind").in_(MESSAGE_KINDS), name="kind"),
+        _length_between("body", MAX_MESSAGE_BODY, "body_length"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    call_id: Mapped[str]
+    patient_id: Mapped[str | None] = mapped_column(ForeignKey("patients.id"))
+    name: Mapped[str | None]
+    callback_number: Mapped[str | None]
+    body: Mapped[str]
+    kind: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

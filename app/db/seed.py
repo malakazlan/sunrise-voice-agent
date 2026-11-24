@@ -19,7 +19,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import StartupSettings
-from app.db.models import Appointment, AvailableSlot, Medication, Patient
+from app.db.models import SCHEDULED, Appointment, AvailableSlot, Medication, Patient
 from app.db.session import create_owner_engine, create_session_factory, startup_wait_failure
 from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL, clinic_date
 from app.guard.logging import configure_logging
@@ -33,7 +33,6 @@ GENERATED_TIMES = {
     DR_PATEL: (time(9, 30), time(11, 0), time(15, 0)),
     DR_LEE: (time(10, 0), time(13, 30)),
 }
-SCHEDULED = "scheduled"
 # The same rules the database enforces, checked first so that a bad record is reported by
 # field name only (hide_input_in_errors) and never reaches an INSERT.
 LAST_FOUR = r"^[0-9]{4}$"

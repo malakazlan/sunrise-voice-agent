@@ -49,14 +49,18 @@ EXPECTED_TABLES = {
     "appointments": {"SELECT", "INSERT", "UPDATE"},
     "available_slots": {"SELECT", "UPDATE"},
     "audit_events": {"SELECT", "INSERT"},
+    "requests": {"SELECT", "INSERT"},
+    "messages": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
-# Only the appointments insert takes a number from a sequence; patients have text ids and
-# audit_events numbers its own rows.
+# Only the appointments, requests and messages inserts take a number from a sequence; patients
+# have text ids and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
     "appointments_id_seq": {"USAGE"},
     "available_slots_id_seq": set(),
     "medications_id_seq": set(),
+    "requests_id_seq": {"USAGE"},
+    "messages_id_seq": {"USAGE"},
 }
 # The trigger functions of audit_events run as triggers whoever may call them; nobody needs
 # EXECUTE, which Postgres gives everyone by default. Nor the catalog's large-object creators:
@@ -418,6 +422,8 @@ FIRST_COLUMN = {
     "appointments": "reason_short",
     "available_slots": "source",
     "audit_events": "reason",
+    "requests": "patient_id",
+    "messages": "name",
     "alembic_version": "version_num",
 }
 
