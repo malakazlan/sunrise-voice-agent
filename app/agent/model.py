@@ -12,14 +12,25 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from anthropic import AsyncAnthropic
-from anthropic.types import ContentBlock, Message, MessageParam, OutputConfigParam, ToolParam
+from anthropic.types import (
+    ContentBlock,
+    Message,
+    MessageParam,
+    OutputConfigParam,
+    ThinkingConfigParam,
+    ToolParam,
+)
 from httpx2 import AsyncClient
 
 from app.config import Settings
 
-# A spoken reply is one or two sentences; thinking, when the model does any, counts too.
+# A spoken reply is one or two sentences.
 MAX_TOKENS = 300
-# The lowest effort level: the least thinking before the first word, for a phone call.
+# A phone turn does not think: thinking would delay the first word and count against
+# MAX_TOKENS. Claude Haiku 5.5 accepts thinking off at effort low, medium or high; models that
+# refuse it (Opus 5.5 and Sonnet 5.5 among them) answer such a request with an error.
+THINKING: ThinkingConfigParam = {"type": "disabled"}
+# The lowest effort level, for the least time to the first word.
 OUTPUT_CONFIG: OutputConfigParam = {"effort": "low"}
 
 
@@ -101,6 +112,7 @@ class AnthropicModel:
             system=request.system,
             messages=cast("list[MessageParam]", request.messages),
             tools=cast("list[ToolParam]", request.tools),
+            thinking=THINKING,
             output_config=OUTPUT_CONFIG,
         ) as stream:
             async for event in stream:

@@ -811,6 +811,9 @@ async def test_model_request_shape(model_id: str | None) -> None:
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": "What do I owe?"}],
         "tools": [{"name": "get_balance", "description": "d", "input_schema": {"type": "object"}}],
+        # A phone turn does not think: no thinking before the first word, none counted
+        # against max_tokens. Haiku 5.5 accepts thinking off at effort low.
+        "thinking": {"type": "disabled"},
         "output_config": {"effort": "low"},
         "stream": True,
     }

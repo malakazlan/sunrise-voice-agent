@@ -283,7 +283,10 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
   first token within 8 seconds, a reply not finished 20 seconds after that, a reply that is
   neither an answer nor a tool request (cut off at `max_tokens`, say), or a fifth tool round:
   the fixed fallback line, and the call goes on. Two in one call, or a dispatch outcome that
-  asks for one, raise the hand-off signal.
+  asks for one, raise the hand-off signal. Thinking is off in every request (`thinking:
+  disabled`, which Claude Haiku 5.5 accepts at effort `low`): on a phone call it would delay
+  the first word and use up the 300 tokens; a `LLM_MODEL` that refuses thinking off (Claude
+  Opus 5.5 and Sonnet 5.5 do) gets the fallback line on every turn.
 - `Deps` (sessions as the runtime role, the audit log, the clinic clock with `SIMULATED_NOW`,
   the claim hasher) is built once at start-up from the settings (`build_deps` in
   `app/main.py`, kept on `app.state.deps`).
