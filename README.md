@@ -237,13 +237,17 @@ All data used by this project is synthetic. No real customer or personal data is
     handler a library adds after the configuration is not covered. The repo's scans that
     keep log configuration in one module are lints against accidents.
 
-### Voice echo call
+### Voice call: speech in, the model and its tools, text out
 
-The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC
-transport). There is no speech recognition, model or speech synthesis yet.
+A call takes the caller's audio over WebRTC (Pipecat's SmallWebRTC transport) through voice
+activity detection (Silero) and Deepgram's streaming speech-to-text to the agent, and sends
+each turn's result to the call page over the data channel. Nothing is spoken back yet.
 
-- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch,
-  the connection state, the ICE candidate types in use and a count of audio packets received.
+- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch, the
+  connection state, the ICE candidate types in use, and one entry per turn: what the model was
+  given (the guard's text, or "(not shown to the assistant)" for a swallowed or emergency
+  turn), the lines said, the timings and whether a hand-off was asked for. The server's text
+  is written as text, never as markup.
 - `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
   shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
 - `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.
@@ -251,7 +255,46 @@ transport). There is no speech recognition, model or speech synthesis yet.
   the body is read. When no token is configured (only allowed in dev without TURN) the two
   endpoints are open.
 - At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). A call ends when the caller
-  leaves, when it has not connected within 30 seconds, or after `MAX_CALL_SECONDS`.
+  leaves, when it has not connected within 30 seconds, after `MAX_CALL_SECONDS`, when
+  speech-to-text cannot connect, or when a turn fails in a way the agent does not handle.
+  Without both vendor keys (allowed in dev only) a call is refused at set-up.
+- Speech-to-text (`app/voice/pipeline.py`): Deepgram `nova-3-general`, `en-US`, punctuation
+  and smart formatting on, numerals off (smart formatting already writes numbers as numerals),
+  opted out of Deepgram's model improvement programme. Smart formatting writes "three three
+  four four" as `3344` and a date as `March 14, 1985`; a spelled name stays letters (`J O H N
+  S O N`); the input guard reads digits and number words either way. The caller is taken to
+  have stopped after 0.8 seconds of silence; Deepgram is then asked to finalize, and only a
+  finalized transcript makes a turn.
+- The turn (`app/agent/turn.py`, no Pipecat in it): the input guard decides first. Emergency:
+  the emergency line, the call moves to `emergency`, no model request. Swallowed (the SSN
+  step): the model sees nothing of the turn; when the guard says submit, code runs
+  `submit_claim` and its line is the reply. Pass: a submit the guard asks for runs first, then
+  one model turn with the guard's text. Turns run one at a time.
+- A model turn sends the system prompt (`app/agent/prompts.py`: fixed text, no patient data,
+  written for speech), the conversation so far and the tools `tools_for` allows right now,
+  each with its argument model's JSON schema and a fixed description. Every tool call goes
+  through `dispatch`, and its outcome goes back to the model, unless it carries a scripted
+  line: that line is the reply, word for word, the model is told it was said, and tools asked
+  for after it in the same reply do not run. Scripted lines join the conversation as the
+  model's own; swallowed turns never join it. At most four tool rounds per turn.
+- The model (`app/agent/model.py`): Claude through the official Anthropic SDK, async and
+  streamed, `LLM_MODEL` (default `claude-haiku-5-5`), `max_tokens` 300, effort `low`, no
+  `temperature` or other sampling parameter, no SDK retries. A refusal, a failed request, no
+  first token within 8 seconds, a reply not finished 20 seconds after that, a reply that is
+  neither an answer nor a tool request (cut off at `max_tokens`, say), or a fifth tool round:
+  the fixed fallback line, and the call goes on. Two in one call, or a dispatch outcome that
+  asks for one, raise the hand-off signal. Thinking is off in every request (`thinking:
+  disabled`, which Claude Haiku 5.5 accepts at effort `low`): on a phone call it would delay
+  the first word and use up the 300 tokens; a `LLM_MODEL` that refuses thinking off (Claude
+  Opus 5.5 and Sonnet 5.5 do) gets the fallback line on every turn.
+- `Deps` (sessions as the runtime role, the audit log, the clinic clock with `SIMULATED_NOW`,
+  the claim hasher) is built once at start-up from the settings (`build_deps` in
+  `app/main.py`, kept on `app.state.deps`).
+- Per turn, logged as numbers only (`turn_measured`) and shown on the page: speech end to
+  final transcript, final transcript to the model's first and last token, tool rounds, and
+  speech end to the reply sent. The vendor clients' loggers (`anthropic`, `httpx2`, `httpx`,
+  `httpcore`, `websockets`, `deepgram`) keep only warnings and errors: below that they write
+  request bodies and websocket frames.
 - coturn runs as a Compose service built from `deploy/coturn`: one configuration file with
   allocation and bandwidth quotas, no relaying to private, loopback, link-local or unspecified
   IPv4 addresses, and its own logging switched off because it records caller addresses.
@@ -261,13 +304,25 @@ transport). There is no speech recognition, model or speech synthesis yet.
   IPv6 address is not denied: coturn 4.19.2 matches that rule against IPv4 peers as well and
   then refuses every relayed call.
 
-What has been run: the test suite on Windows 10, and `scripts/echo_probe.py` (an aiortc
-client that sends a tone and checks it comes back) against the app in Docker Desktop on
-Windows, both directly and forced through coturn. The forced-relay runs used the committed
-coturn configuration with only its networking changed (`deploy/docker-compose.relay-test.yml`:
-app and coturn on 203.0.113.0/24, which coturn does not deny), no peer allowed, coturn on that
-network rather than on host networking. CI runs the same forced-relay probe. No browser, phone
-or server deployment has been tried yet.
+Limits of this slice:
+
+- No voice out yet: replies are text on the page.
+- No output guard yet: the model's text reaches the page unchecked. All data is synthetic.
+- Booking, messages, transfer and call end are not wired; the hand-off signal is shown and
+  nothing acts on it. The guard's flags (an attempt to override the instructions, a request
+  about someone else) are not passed to the model.
+- One call's conversation is kept in memory only, for the call's life.
+- The verified line, said by code, puts the caller's first name in the conversation the model
+  sees; tool results are the only other patient data it receives.
+- Tests and CI never reach a vendor: the model is scripted, speech-to-text is replaced, and
+  CI's forced-relay calls run with the vendor hosts pointed at the app's own loopback. The
+  proof with the vendors is a real call on the server.
+
+What has been run: the test suite on Windows 10. `scripts/relay_probe.py` (an aiortc client
+that sends a tone and reads the server's receiver reports for it, since nothing comes back)
+runs in CI against the app forced through coturn, with only the networking changed
+(`deploy/docker-compose.relay-test.yml`: app and coturn on 203.0.113.0/24, which coturn does
+not deny, and the vendor hosts on the app's loopback).
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
@@ -278,7 +333,7 @@ A generated slot never replaces an existing slot at the same doctor and time.
 ### Call state and the tool gate
 
 The tools registered so far are the two of identity verification and the five serving tools
-(below); nothing wires dispatch to the model yet.
+(below); a call's turns (above) offer them to the model through the gate.
 
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
@@ -445,8 +500,6 @@ Limits, stated plainly:
   the step.
 - `pydantic`'s `errors()` returns a rejected value when asked for its input; the error's text
   form does not. No application code reads `errors()` of a state.
-- `IDENTITY_HASH_KEY` and `AUDIT_HMAC_KEY` are checked as settings; building the hasher and the
-  audit log from them comes with the wiring of the call pipeline.
 ### Serving tools
 
 Five tools for a verified caller, in `app/agent/serving.py`, registered by `register_tools()`.
@@ -513,6 +566,9 @@ name, message text, balance or status reaches the audit log or the logs.
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
+| `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
+| `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
+| `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup, and
 an empty value counts as unset. Environment variables take precedence over `.env`. The same
@@ -527,8 +583,8 @@ its settings before it touches the database (`python -m app.config`); the app ch
 when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
-`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`) must also not start or end with
-whitespace and must
+`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
+`DEEPGRAM_API_KEY`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -586,7 +642,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the
@@ -628,11 +684,12 @@ uv run mypy --strict app tests scripts
 uv run pytest
 ```
 
-Echo probe, against a running app (`--relay` restricts it to TURN relay candidates; the token,
-if one is set, comes from the `PROBE_TOKEN` environment variable):
+Relay probe, against a running app (`--relay` restricts it to TURN relay candidates; the
+token, if one is set, comes from the `PROBE_TOKEN` environment variable). Each call starts
+speech-to-text, so run it with real keys, or where the vendor hosts cannot be reached:
 
 ```sh
-uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2
+uv run python scripts/relay_probe.py --url http://127.0.0.1:8000 --calls 2
 ```
 
 The tests need a running database server and read its address from the `POSTGRES_*`

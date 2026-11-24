@@ -54,6 +54,8 @@ VOICE_SECRETS = {
     "DEMO_ACCESS_TOKEN": "-".join(["token", "not", "for", "logs"] + ["x" * 4] * 3),
     "TURN_HOST": "turn.example.test",
     "TURN_SHARED_SECRET": "-".join(["turn", "secret", "not", "for", "logs"] + ["y" * 4] * 3),
+    "ANTHROPIC_API_KEY": "-".join(["anthropic", "key", "not", "for", "logs"] + ["z" * 4] * 3),
+    "DEEPGRAM_API_KEY": "-".join(["deepgram", "key", "not", "for", "logs"] + ["w" * 4] * 3),
 }
 
 

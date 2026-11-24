@@ -33,6 +33,9 @@ TIMESTAMP = r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3}"
 UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
 # The WebRTC stack under Pipecat.
 WEBRTC_LOGGERS = ("aioice", "aiortc")
+# The vendors' clients: below WARNING they write request bodies (the conversation sent to the
+# model) and websocket frames (transcripts).
+VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "deepgram")
 
 CONFIGURE = (
     "import sys\n"
@@ -288,7 +291,7 @@ def restore_logging() -> Iterator[None]:
     root_level = root.level
     state = [
         (logger, logger.level, logger.propagate, list(logger.handlers))
-        for logger in map(logging.getLogger, (*UVICORN_LOGGERS, *WEBRTC_LOGGERS))
+        for logger in map(logging.getLogger, (*UVICORN_LOGGERS, *WEBRTC_LOGGERS, *VENDOR_LOGGERS))
     ]
     try:
         yield
@@ -309,6 +312,19 @@ def test_webrtc_stack_logs_warnings_only(log_level: LogLevel, expected: int) -> 
     create_app(offline_settings(log_level=log_level))
 
     assert [logging.getLogger(name).level for name in WEBRTC_LOGGERS] == [expected, expected]
+
+
+@pytest.mark.usefixtures("restore_logging")
+@pytest.mark.parametrize(
+    ("log_level", "expected"),
+    [("DEBUG", logging.WARNING), ("INFO", logging.WARNING), ("ERROR", logging.ERROR)],
+)
+def test_vendor_clients_log_warnings_only(log_level: LogLevel, expected: int) -> None:
+    create_app(offline_settings(log_level=log_level))
+
+    assert [logging.getLogger(name).level for name in VENDOR_LOGGERS] == [expected] * 6
+    # The model's client writes the whole request at DEBUG: that level is off for it.
+    assert not logging.getLogger("anthropic._base_client").isEnabledFor(logging.DEBUG)
 
 
 def uvicorn_config(log_level: LogLevel, log_config: dict[str, Any] | None) -> uvicorn.Config:
