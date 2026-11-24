@@ -26,7 +26,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
 from speech_fakes import CallPipeline, FakeTime, FakeVoice, until
-from test_turn import ADVICE_REFUSAL, ScriptedModel, deps_on, says
+from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
 import app.voice.transport
@@ -44,6 +44,7 @@ from app.main import create_app
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, open_agent_call
 from app.voice.speech import Playback
+from evals.scripted import ScriptedModel, says
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
 CALL_ID = "0f1e2d3c4b5a46978a1b2c3d4e5f6a7b"
