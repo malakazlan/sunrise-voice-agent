@@ -20,5 +20,5 @@ expect:
     - table: verification_attempts
       where: {success: false}
       count: 1
-  audit: [identity_claimed, identity_refused]
+  audit: [call_started, identity_claimed, identity_refused, call_ended]
   never: ["no record", "not a patient", "not found", "don't have"]

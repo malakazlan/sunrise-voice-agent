@@ -239,11 +239,12 @@ All data used by this project is synthetic. No real customer or personal data is
     handler a library adds after the configuration is not covered. The repo's scans that
     keep log configuration in one module are lints against accidents.
 
-### Voice call: speech in, the model and its tools, text out
+### Voice call: speech in, the model and its tools
 
 A call takes the caller's audio over WebRTC (Pipecat's SmallWebRTC transport) through voice
-activity detection (Silero) and Deepgram's streaming speech-to-text to the agent, and sends
-each turn's result to the call page over the data channel. Nothing is spoken back yet.
+activity detection (Silero) and Deepgram's streaming speech-to-text to the agent, speaks its
+lines (see "Voice out and the call's life" below) and sends each turn's result to the call page
+over the data channel.
 
 - `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch, the
   connection state, the ICE candidate types in use, and one entry per turn: what the model was
@@ -256,17 +257,17 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
 - Both need `Authorization: Bearer <DEMO_ACCESS_TOKEN>`. The token is checked before any of
   the body is read. When no token is configured (only allowed in dev without TURN) the two
   endpoints are open.
-- At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). A call ends when the caller
-  leaves, when it has not connected within 30 seconds, after `MAX_CALL_SECONDS`, when
-  speech-to-text cannot connect, or when a turn fails in a way the agent does not handle.
-  Without both vendor keys (allowed in dev only) a call is refused at set-up.
+- At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). How a call ends is in "Voice
+  out and the call's life" below; one that has not connected within 30 seconds is closed, and
+  the server stops a call still running 30 seconds after `MAX_CALL_SECONDS`. Without every
+  vendor's settings (allowed in dev only) a call is refused at set-up.
 - Speech-to-text (`app/voice/pipeline.py`): Deepgram `nova-3-general`, `en-US`, punctuation
   and smart formatting on, numerals off (smart formatting already writes numbers as numerals),
   opted out of Deepgram's model improvement programme. Smart formatting writes "three three
   four four" as `3344` and a date as `March 14, 1985`; a spelled name stays letters (`J O H N
   S O N`); the input guard reads digits and number words either way. The caller is taken to
-  have stopped after 0.8 seconds of silence; Deepgram is then asked to finalize, and only a
-  finalized transcript makes a turn.
+  have stopped after `VAD_STOP_SECONDS` of silence (0.5 by default); Deepgram is then asked to
+  finalize, and only a finalized transcript makes a turn.
 - The turn (`app/agent/turn.py`, no Pipecat in it): the input guard decides first. Emergency:
   `emergency()` (below) moves the call to `emergency` and gives the emergency line at once, its
   event written in the background; no model request. Swallowed (the SSN
@@ -295,9 +296,10 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
 - `Deps` (sessions as the runtime role, the audit log, the clinic clock with `SIMULATED_NOW`,
   the claim hasher) is built once at start-up from the settings (`build_deps` in
   `app/main.py`, kept on `app.state.deps`).
-- Per turn, logged as numbers only (`turn_measured`) and shown on the page: speech end to
-  final transcript, final transcript to the model's first and last token, tool rounds, and
-  speech end to the reply sent. The vendor clients' loggers (`anthropic`, `httpx2`, `httpx`,
+- Per turn, logged as numbers only (`turn_measured`, `turn_first_audio`) and shown on the
+  page, all from the moment the caller stopped speaking: the silence voice activity detection
+  waits for, the final transcript, the model's first and last token, tool rounds, the turn's
+  end, and the first audio of the reply, which is what the caller waits for. The vendor clients' loggers (`anthropic`, `httpx2`, `httpx`,
   `httpcore`, `websockets`, `deepgram`) keep only warnings and errors: below that they write
   request bodies and websocket frames.
 - coturn runs as a Compose service built from `deploy/coturn`: one configuration file with
@@ -311,21 +313,25 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
 
 Limits of this slice:
 
-- No voice out yet: replies are text on the page.
-- The model's text reaches the page through the output guard (see "Output guard" below). All
-  data is synthetic.
-- Booking, messages, transfer and call end are not wired; the hand-off signal is shown and
-  nothing acts on it. The guard's flags (an attempt to override the instructions, a request
+- The model's text reaches the caller and the page through the output guard (see "Output
+  guard" below). All data is synthetic.
+- The hand-off (two model failures in a call, two blocked replies in a row, or a tool outcome
+  that reaches the limit of failures or refusals) acts once, on the outcome that raises it,
+  by one code path (`hand_off` in `app/agent/tools.py`): with the office open the transfer line
+  is said in place of the turn's own and the call ends with `transferred`; with it closed the
+  caller is offered a message (the fallback line) and the call goes on. The page shows that it
+  was raised. The guard's flags (an attempt to override the instructions, a request
   about someone else) are not passed to the model.
 - One call's conversation is kept in memory only, for the call's life.
 - The verified line, said by code, puts the caller's first name in the conversation the model
   sees; tool results are the only other patient data it receives.
-- Tests and CI never reach a vendor: the model is scripted, speech-to-text is replaced, and
-  CI's forced-relay calls run with the vendor hosts pointed at the app's own loopback. The
+- Tests and CI never reach a vendor: the model is scripted, speech-to-text and speech out are
+  replaced, and CI's forced-relay calls run with the vendor hosts pointed at the app's own
+  loopback. The
   proof with the vendors is a real call on the server.
 
 What has been run: the test suite on Windows 10. `scripts/relay_probe.py` (an aiortc client
-that sends a tone and reads the server's receiver reports for it, since nothing comes back)
+that sends a tone and reads the server's receiver reports for it)
 runs in CI against the app forced through coturn, with only the networking changed
 (`deploy/docker-compose.relay-test.yml`: app and coturn on 203.0.113.0/24, which coturn does
 not deny, and the vendor hosts on the app's loopback).
@@ -846,6 +852,105 @@ Limits of the output guard:
   says another patient's digits passes `ssn_last4` (the model never has them: tools act on the
   caller's own record only).
 
+### Voice out and the call's life
+
+The agent speaks (`app/voice/speech.py`, `app/voice/pipeline.py`), and the call starts and ends
+through the functions of "Messages, transfer, emergency and the end of the call" above.
+
+- Speech out: Pipecat's `ElevenLabsTTSService` (pipecat-ai 1.17.0), ElevenLabs' multi-stream
+  WebSocket, `TTS_MODEL` (default `eleven_flash_v2_5`, Flash v2.5, ElevenLabs' lowest-latency
+  model that endpoint serves; v3 and v4 models are not served there), `ELEVENLABS_VOICE_ID`,
+  English, auto mode on (whole lines are sent), ElevenLabs' default voice settings. No voice is
+  guessed: without the key and the voice the app does not start outside dev, and in dev a call
+  is refused at set-up.
+- What is spoken: only lines the agent releases (`app/agent/turn.py`), each whole: a scripted
+  line at once, word for word; the model's sentences that passed the output guard as one line,
+  once the reply has ended as a plain answer. The words of a reply that asks for a tool, is
+  refused or is cut off are never spoken, so the model never announces an action its tool has
+  not done. Speech starts at a complete sentence, never at a token; the cost is the time
+  between the first sentence and the end of the reply (one or two short sentences).
+- The greeting, the closed line and the emergency line play to the end. From the call's start
+  until its opening line has played, and while one of those lines is to be played, the caller
+  is muted: their audio goes on as silence to voice activity detection and speech-to-text, and
+  whatever is reported anyway is neither an interruption nor a turn. Every other line can be
+  interrupted: when the caller starts speaking over it, speech out stops, the lines not yet
+  played are dropped, and the conversation keeps only the words ElevenLabs reported played of
+  the line that was cut (counted from its word timestamps), none of the others. The page notes
+  the interruption.
+- The caller cannot be heard during the greeting, the closed line or the 911 line: anything
+  they say then, an emergency included, is not acted on.
+- An emergency is heard whatever the call is doing: every finished utterance goes through the
+  input guard's emergency decision the moment it arrives, before the turn queue, while a turn
+  runs, with turns queued, and while the call is closing for any reason (during the goodbye,
+  the transfer line or the after-hours close). The running turn is cancelled (its reply, if it
+  comes, is never said), queued turns are dropped, every line that can be interrupted stops,
+  the 911 line is released in the same step of the event loop as the transcript arrived, and
+  the call ends with `emergency`, whatever reason it was ending for and whatever timer fires
+  meanwhile. Anything else said while the call is closing is not a turn. A closing call does
+  not end while the caller is speaking or their words are being transcribed (5 seconds at
+  most), so an emergency said over the last line is still heard.
+- How the adapter knows what was played: each line goes to text-to-speech between two marks.
+  Pipecat's text-to-speech service keeps frames it does not speak in order with its audio, and
+  the transport sends them on only once the audio before them has been written to the caller,
+  so the marks come out of the transport as the line starts and when it is over.
+- The call starts (`start_call`, which writes `call_started`) when the caller connects; its
+  opening is the greeting or the closed line. Tool calls go through `call_tool`; the input
+  guard's emergency through `emergency()`.
+- The call ends once (`end_call`, one `call_ended`): after the emergency line (`emergency`),
+  the transfer line (`transferred`), the goodbye or the after-hours close (`completed`) has
+  played; when the caller hangs up or the connection drops (`caller_hung_up`); after
+  `IDLE_SECONDS` without the caller speaking the agent asks "Are you still there?", and after
+  another `IDLE_SECONDS` says goodbye (`idle_timeout`); at `MAX_CALL_SECONDS` it lets a
+  running turn finish (a reported emergency in it still ends the call with `emergency`), then
+  says goodbye once the line playing is over (`max_duration`); a turn that fails, or a pipeline
+  that ends
+  without the call having decided to (a vendor that can no longer work), ends it with `error`.
+  The caller speaking resets the idle count; the idle timer does not run while a line plays or
+  a turn runs. Once a reason is decided it stands, even if the caller hangs up during the last
+  line. Then the transport sends what is left, two seconds of silence, and closes; the page
+  shows the reason.
+- Filler: when a tool round's answer has not come 1.2 seconds after the model asked for the
+  tools, the agent says "One moment while I check.", at most once per turn. Only once the
+  round's tools have answered with no scripted line (so never just before one), and never
+  while the SSN step is armed. A slow tool gets it as soon as it has answered.
+- Speech out that cannot connect: the line still reaches the page; Pipecat waits three seconds
+  for audio, then the line counts as over (so the caller is unmuted and the timers run).
+  Pipecat writes the service off after three silent lines in a row, or at once when ElevenLabs
+  rejects the key, the voice or the model, and the call then ends with `error`. In CI's relay
+  test ElevenLabs' host points at the app's own loopback: the call starts, its lines fail this
+  way, and the probe still passes.
+- Logs: event names, the call id, line ids, counts and milliseconds. Pipecat's own records from
+  the modules that quote the text being spoken (its text-to-speech service and its word
+  sequencer, at warning level) are not written; each one at warning or above leaves a line of
+  ours in its place, `pipecat_record_withheld level=<level> logger=<module>`, with nothing of
+  its message.
+- Wording (`app/agent/prompts.py`): one short sentence for an answer about the caller's
+  information, no trailing offer of help; "anything else?" only when a request is done and
+  once per request; name and date of birth asked together, with no spelling (only the scripted
+  fail line asks to spell); an off-topic remark gets one sentence naming what the agent can
+  help with.
+
+Target, measured on a real call rather than promised: from the moment the caller stops
+speaking to the first audio of the reply, shown per turn on the page (`first audio ... after
+you stopped speaking`) and logged as `turn_first_audio`. It includes `VAD_STOP_SECONDS`.
+
+Limits of this slice:
+
+- Not measured here: the first-audio time on a real call; it is the founder's live call.
+- The conversation keeps what was heard as far as ElevenLabs reports it: its word timestamps
+  run slightly ahead of or behind the audio the caller hears, so a word either side of the cut
+  may be counted wrongly.
+- ElevenLabs keeps its usual request logs (zero retention is an enterprise setting); the data
+  is synthetic.
+- A line that produced no audio (speech out that cannot connect) is recorded as heard in the
+  conversation.
+- If speech out takes more than 3 seconds to its first audio, Pipecat gives the line up as
+  silent, so the caller can be unmuted before an uninterruptible line (the greeting, the closed
+  line, the 911 line) has finished playing.
+- On a real call the agent's own voice coming back through loudspeakers can be taken for the
+  caller speaking and interrupt it: use headphones.
+- The call record (the stored, masked transcript) is not part of this slice.
+
 ### Evals
 
 The demo calls, run as text through the turn loop a live call uses, in `evals/`. Each
@@ -878,9 +983,11 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
   role of the evals' own (`sva_eval_<random>_app`, which must not exist yet and is dropped at
   the end), seeded for the scenario's day. The database is dropped after the run.
 - A run is one call as the live pipeline makes it: a call id from the call registry,
-  `start_call` on the application's tools, each caller turn through `CallAgent.handle` (the
-  input guard, the gate, dispatch, the scripted lines). The call's clock is the scenario's
-  `now`; the audit and claim keys are random for the run.
+  `start_call` on the application's tools (`call_started`), each caller turn through
+  `CallAgent.handle` (the input guard, the gate, dispatch, the scripted lines), then
+  `CallAgent.end` (`call_ended`): for the reason the call's last phase gives, or as a caller who
+  hangs up after the last turn. The phase a scenario expects is that last phase. The call's
+  clock is the scenario's `now`; the audit and claim keys are random for the run.
 - Expectations, after a turn and at the end of the call: the scripted lines said, by id; the
   tools the model asked for, in order, with chosen arguments and chosen values of what each
   returned; phase and verified; the rows the call wrote (table, count, column values, compared
@@ -931,6 +1038,11 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
 | `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
 | `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
+| `ELEVENLABS_API_KEY` | speech out's API key, never logged  | required unless dev |
+| `ELEVENLABS_VOICE_ID` | the ElevenLabs voice: 1 to 64 letters and digits | required unless dev; no default voice |
+| `TTS_MODEL`         | `eleven_flash_v2_5` or `eleven_flash_v2` | `eleven_flash_v2_5` |
+| `VAD_STOP_SECONDS`  | 0.2 to 2: the silence that ends the caller's turn | `0.5` |
+| `IDLE_SECONDS`      | 5 to 300: caller silence before "Are you still there?", and again before goodbye | `30` |
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup, and
 an empty value counts as unset. Environment variables take precedence over `.env`. The same
@@ -946,7 +1058,7 @@ when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
-`DEEPGRAM_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
+`DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -1010,7 +1122,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the

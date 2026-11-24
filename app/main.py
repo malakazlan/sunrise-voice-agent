@@ -23,7 +23,7 @@ from app.db.session import create_database_engine, create_session_factory
 from app.domain.office_hours import clinic_now
 from app.guard.logging import configure_logging
 from app.voice.calls import CallRegistry
-from app.voice.pipeline import open_agent_call
+from app.voice.pipeline import END_GRACE_SECONDS, open_agent_call
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,11 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     model = anthropic_model(settings)
     if open_call is None:
         open_call = partial(open_agent_call, settings, deps, model)
+    # A call says goodbye and ends itself at MAX_CALL_SECONDS; the registry stops one that has
+    # not, END_GRACE_SECONDS later.
     calls = CallRegistry(
-        max_calls=settings.max_concurrent_calls, max_seconds=settings.max_call_seconds
+        max_calls=settings.max_concurrent_calls,
+        max_seconds=settings.max_call_seconds + END_GRACE_SECONDS,
     )
 
     @asynccontextmanager

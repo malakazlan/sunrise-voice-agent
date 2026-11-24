@@ -24,4 +24,4 @@ turns:
 expect:
   said: [greeting, ssn_ask, verified, emergency]
   phase: emergency
-  audit: [identity_claimed, identity_verified, emergency_detected]
+  audit: [call_started, identity_claimed, identity_verified, emergency_detected, call_ended]

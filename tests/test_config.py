@@ -46,6 +46,11 @@ APPLICATION_FIELDS = {
     "anthropic_api_key",
     "deepgram_api_key",
     "llm_model",
+    "elevenlabs_api_key",
+    "elevenlabs_voice_id",
+    "tts_model",
+    "vad_stop_seconds",
+    "idle_seconds",
 }
 # The start-up steps' settings: the same database, the runtime role they set up, the owner.
 STARTUP_FIELDS = {
@@ -579,8 +584,11 @@ VOICE_FIELD_ORDER = [
     "DEMO_ACCESS_TOKEN",
     "ANTHROPIC_API_KEY",
     "DEEPGRAM_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_VOICE_ID",
 ]
 VENDOR_KEYS = ["ANTHROPIC_API_KEY", "DEEPGRAM_API_KEY"]
+SPEECH_SETTINGS = ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]
 
 
 @pytest.mark.usefixtures("db_env")
@@ -609,6 +617,87 @@ def test_app_will_not_start_without_vendor_keys_outside_dev(
     ]
     for key in VENDOR_KEYS:
         assert VOICE_SECRETS[key] not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("app_env", ["demo", "prod"])
+@pytest.mark.parametrize(
+    "missing",
+    [["ELEVENLABS_API_KEY"], ["ELEVENLABS_VOICE_ID"], SPEECH_SETTINGS],
+    ids=["key", "voice", "both"],
+)
+def test_app_will_not_start_without_the_speech_key_and_voice_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, app_env: str, missing: list[str]
+) -> None:
+    # R11: no default voice is guessed and no call goes out without the key.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", app_env)
+    for key, value in VOICE_SECRETS.items():
+        if key not in missing:
+            monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        create_app()
+
+    assert [(error["loc"], error["msg"]) for error in excinfo.value.errors()] == [
+        ((key.lower(),), f"Value error, {key.lower()} is required unless app_env is dev")
+        for key in SPEECH_SETTINGS
+        if key in missing
+    ]
+    assert VOICE_SECRETS["ELEVENLABS_API_KEY"] not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("db_env")
+def test_speech_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.elevenlabs_api_key is None
+    assert settings.elevenlabs_voice_id is None
+    # ElevenLabs' Flash v2.5: its lowest-latency model the multi-stream WebSocket serves.
+    assert settings.tts_model == "eleven_flash_v2_5"
+    assert settings.vad_stop_seconds == 0.5
+    assert settings.idle_seconds == 30
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    ("key", "value", "accepted"),
+    [
+        ("TTS_MODEL", "eleven_flash_v2_5", True),
+        ("TTS_MODEL", "eleven_flash_v2", True),
+        ("TTS_MODEL", "eleven_multilingual_v2", False),
+        ("TTS_MODEL", "eleven_v3", False),
+        ("TTS_MODEL", "eleven_flash_v2_5&enable_logging=true", False),
+        ("ELEVENLABS_VOICE_ID", "voice" + "q" * 15, True),
+        ("ELEVENLABS_VOICE_ID", "voice/../../models", False),
+        ("ELEVENLABS_VOICE_ID", "voice?model_id=x", False),
+        ("ELEVENLABS_VOICE_ID", "v" * 65, False),
+        ("VAD_STOP_SECONDS", "0.2", True),
+        ("VAD_STOP_SECONDS", "2", True),
+        ("VAD_STOP_SECONDS", "0.1", False),
+        ("VAD_STOP_SECONDS", "2.5", False),
+        ("IDLE_SECONDS", "5", True),
+        ("IDLE_SECONDS", "300", True),
+        ("IDLE_SECONDS", "4", False),
+        ("IDLE_SECONDS", "301", False),
+    ],
+)
+def test_speech_settings_take_only_their_shapes(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str, accepted: bool
+) -> None:
+    # The model and the voice go into the ElevenLabs URL: nothing but their own characters.
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv(key, value)
+
+    if accepted:
+        taken = getattr(Settings(_env_file=None), key.lower())
+        assert taken == (value if isinstance(taken, str) else type(taken)(value))
+        return
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert [error["loc"] for error in excinfo.value.errors()] == [(key.lower(),)]
 
 
 @pytest.mark.usefixtures("db_env")
@@ -834,7 +923,9 @@ def test_empty_voice_values_in_dev_leave_voice_unconfigured(
         settings.turn_shared_secret,
         settings.anthropic_api_key,
         settings.deepgram_api_key,
-    ) == (None, None, None, None, None)
+        settings.elevenlabs_api_key,
+        settings.elevenlabs_voice_id,
+    ) == (None, None, None, None, None, None, None)
 
 
 @pytest.mark.usefixtures("db_env")
@@ -1371,6 +1462,7 @@ def test_admin_password_differs_from_every_other_secret(monkeypatch: pytest.Monk
         "demo_access_token",
         "anthropic_api_key",
         "deepgram_api_key",
+        "elevenlabs_api_key",
     }
     monkeypatch.setenv("ADMIN_USER", "clinic_admin")
     for app_env in ("dev", "demo", "prod"):

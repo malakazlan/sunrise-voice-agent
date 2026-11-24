@@ -1,7 +1,7 @@
 """Call the running app as a WebRTC client, send a tone, and check that the server received it.
 
-Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. The app speaks nothing
-back, so the proof is the server's own RTCP receiver reports for this call's stream: they say
+Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. The proof is the
+server's own RTCP receiver reports for this call's stream, whatever it sends back: they say
 how many of the call's packets arrived, and they come back over the same path, so with --relay
 both directions went through TURN. A report is for one stream (its SSRC), so a call never
 counts another call's reports. A call whose reports do not show the requested length of audio

@@ -56,6 +56,8 @@ VOICE_SECRETS = {
     "TURN_SHARED_SECRET": "-".join(["turn", "secret", "not", "for", "logs"] + ["y" * 4] * 3),
     "ANTHROPIC_API_KEY": "-".join(["anthropic", "key", "not", "for", "logs"] + ["z" * 4] * 3),
     "DEEPGRAM_API_KEY": "-".join(["deepgram", "key", "not", "for", "logs"] + ["w" * 4] * 3),
+    "ELEVENLABS_API_KEY": "-".join(["elevenlabs", "key", "not", "for", "logs"] + ["v" * 4] * 3),
+    "ELEVENLABS_VOICE_ID": "voice" + "q" * 15,
 }
 
 

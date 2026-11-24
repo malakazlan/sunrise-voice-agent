@@ -10,4 +10,4 @@ expect:
   said: [closed, emergency]
   phase: emergency
   verified: false
-  audit: [emergency_detected]
+  audit: [call_started, emergency_detected, call_ended]

@@ -7,11 +7,15 @@ import logging
 import sys
 import threading
 from types import TracebackType
+from typing import TYPE_CHECKING
 
 from loguru import logger as loguru_logger
 
 from app.config import DatabaseSettings
 from app.guard.mask import mask
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,29 @@ WEBRTC_LOGGERS = ("aioice", "aiortc")
 # to the model) and websocket frames (transcripts). Only their warnings and errors are kept.
 VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "deepgram")
 THIRD_PARTY_FLOOR = logging.WARNING
+# Pipecat's modules that quote the text being spoken in their records (pipecat-ai 1.17.0): the
+# text-to-speech service warns with a line it will not speak, the frame sequencer with the words
+# it drops. Their records are not written; one at warning or above leaves a line of ours.
+SPEECH_TEXT_MODULES = frozenset(
+    {
+        "pipecat.services.tts_service",
+        "pipecat.utils.context.aggregated_frame_sequencer",
+        "pipecat.utils.context.word_completion_tracker",
+    }
+)
+
+
+def _carries_no_speech_text(record: "Record") -> bool:
+    """Whether a loguru record may be written. One of SPEECH_TEXT_MODULES' is not; one at
+    warning or above leaves a line of the application's own in its place: its level and its
+    logger, nothing of its message."""
+    if record["name"] not in SPEECH_TEXT_MODULES:
+        return True
+    if record["level"].no >= logging.WARNING:
+        logger.warning(
+            "pipecat_record_withheld level=%s logger=%s", record["level"].name, record["name"]
+        )
+    return False
 
 
 class MaskingFormatter(logging.Formatter):
@@ -101,4 +128,10 @@ def configure_logging(settings: DatabaseSettings) -> None:
     # loguru's own sink writes unmasked text to stderr. diagnose=False keeps the values of
     # local variables out of its tracebacks.
     loguru_logger.remove()
-    loguru_logger.add(handler, level=third_party_level, format="{message}", diagnose=False)
+    loguru_logger.add(
+        handler,
+        level=third_party_level,
+        format="{message}",
+        diagnose=False,
+        filter=_carries_no_speech_text,
+    )

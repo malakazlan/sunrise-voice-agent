@@ -13,4 +13,4 @@ turns:
 expect:
   said: [greeting, emergency]
   phase: emergency
-  audit: [emergency_detected]
+  audit: [call_started, emergency_detected, call_ended]

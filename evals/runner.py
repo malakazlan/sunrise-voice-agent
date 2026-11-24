@@ -2,10 +2,12 @@
 
 Each run of a scenario gets a database of its own (evals/database.py), seeded for the
 scenario's day, and is one call as the live pipeline makes it (app/voice/pipeline.py): a call
-id from the call registry, `start_call` on the application's tools, then each caller turn as
-text through `CallAgent.handle`, which runs the input guard, the gate, dispatch and the scripted
-lines; nothing of them is copied here. The call's clock is the scenario's `now`; the audit and
-claim keys are random for the run.
+id from the call registry, `start_call` on the application's tools (which writes call_started),
+then each caller turn as text through `CallAgent.handle`, which runs the input guard, the gate,
+dispatch and the scripted lines; nothing of them is copied here. The call then ends with
+`CallAgent.end` (call_ended): for the reason its phase gives (emergency, transfer, goodbye),
+otherwise as a caller who hangs up after the last turn. The call's clock is the scenario's
+`now`; the audit and claim keys are random for the run.
 
 The model is wrapped so that every request it is sent is kept: that is what the model was
 shown. In scripted mode each turn's replies come from the scenario; in real mode they come from
@@ -49,7 +51,7 @@ from app.agent.state import Phase
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import TurnResult, drain_guard_audits, start_call
-from app.audit.log import AuditLog
+from app.audit.log import AuditLog, Reason
 from app.config import Settings
 from app.db.models import AuditEvent
 from app.db.session import create_session_factory
@@ -421,9 +423,9 @@ async def run_scenario(
         if call_id is None:
             raise RuntimeError("the call registry gave no call id")
         before = await _rows(sessions)
-        agent, opening = start_call(call_id, deps, recorded, register_tools())
+        agent, opening = await start_call(call_id, deps, recorded, register_tools())
         failures: list[Failure] = []
-        lines = [opening]
+        lines = [opening.text]
         unseen: list[tuple[str, str]] = []
         try:
             for number, turn in enumerate(scenario.turns, 1):
@@ -459,12 +461,17 @@ async def run_scenario(
                 for expect in stated:
                     failures += _check(scope, expect, seen, written)
                     failures += _turn_failures(scope, expect, flags, result)
+            # The call's last phase, then its end as the live pipeline ends it: for the reason
+            # that phase gives, or, when the scenario's turns run out first, because the caller
+            # hangs up.
+            phase = agent.state.phase
+            await agent.end(agent.ending or Reason.CALLER_HUNG_UP)
             seen = _Seen(
                 lines=lines,
                 requests=recorded.requests,
                 called=_called(recorded, 0, len(recorded.replies)),
                 actions=await _actions(sessions, call_id),
-                phase=agent.state.phase,
+                phase=phase,
                 verified=agent.state.verified,
             )
             failures += _check("call", scenario.expect, seen, await _written(sessions, before))
