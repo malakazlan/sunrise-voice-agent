@@ -76,8 +76,8 @@ All data used by this project is synthetic. No real customer or personal data is
     for the app and the start-up steps alike.
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
-    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
-    slot id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
+    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication,
+    slot, request, message or audit event id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
     lower-case letters and underscores), and the actor is `agent` or `admin:` and a
     user name of letters and underscores. The database's own CHECKs are the outer bound: at
     most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
@@ -545,6 +545,70 @@ name, message text, balance or status reaches the audit log or the logs.
     four five six seven eight nine`) is not masked.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
 
+### Admin API
+
+A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages
+and audit log can be read and the chain checked without opening the database. It is off
+unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
+answer `404` and the app logs `admin_api_off` once at start.
+
+| Route (all `GET`) | Returns |
+|---|---|
+| `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
+| `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
+| `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
+| `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
+
+```sh
+curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?limit=20'
+```
+
+- Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`. The user name and the password
+  are each compared as a SHA-256 digest in constant time, both always. Anything else (no
+  header, a wrong part, a malformed or non-UTF-8 header, an `Authorization` header over 1024
+  characters) gets the same `401` and `WWW-Authenticate` challenge, and is logged as
+  `admin_sign_in_failed failures=<n>`, never the name or password tried.
+- Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): after five
+  inside a sliding minute the address gets `429`, before its credentials are looked at, until
+  the oldest of them is a minute old. A correct sign-in is not counted. Failed sign-ins are
+  not audited, so a stranger cannot make the audit chain grow.
+- Paging: newest first; `limit` 1 to 100 (default 50); `before=<id or seq>` for the next page,
+  the last id or seq of the page before. An unknown or repeated parameter, a value out of range
+  or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
+  route takes no parameters.
+- One verification runs at a time: another asked for meanwhile gets `429` with `Retry-After: 5`,
+  does no work and writes no event. It reads the whole chain, 1000 events a round trip, on the
+  one worker that also carries the calls, so on a large chain it costs that worker and the
+  database real time; run it when it is needed, not on a timer.
+- Every successful read appends one audit event (actor `admin:<ADMIN_USER>`, action
+  `admin_read_requests`, `admin_read_messages`, `admin_read_audit` or `admin_verify_audit`,
+  resource type `request`, `message` or `audit_event`, no resource id, outcome `success`) in
+  the transaction that read the rows. If the event cannot be written the answer is `503` and
+  no rows. A database that cannot be reached is `503` too, with no detail.
+- Every text value from the database passes the log masking (`mask`): SSNs, dates and email
+  addresses in a summary or body are hidden. Patient ids and call ids come out as stored.
+  Timestamps are ISO 8601.
+- A callback number shows as `***-***-` and its last four digits, whatever its shape
+  (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
+  `***-***-****`.
+- Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
+  in the API schema, and `/docs` stays off outside dev.
+- The runtime role needs no new privilege: it already reads these tables and appends events.
+- Limits:
+  - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
+    sign-in limit is shared by everyone. Refused requests are not counted, so each failure
+    ages out after a minute and is replaced by the next: one wrong password every 12 seconds,
+    from anyone, keeps the admin locked out for as long as it goes on. A sustained lockout
+    costs an attacker five requests a minute. It delays the admin; it is not a way in, and the
+    password's strength is the real control. Trusting the proxy's forwarded address is left to
+    the deploy set-up. The limit is held in memory, so a restart clears it, and it keeps at
+    most 10,000 addresses, dropping the one that failed longest ago.
+  - A real console would reveal a callback number only on an explicit, audited action; this
+    API never reveals one, it shows the masked form with the last four digits.
+  - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
+    number written another way (spelled out without a cue, for example) is shown as written.
+  - A read event records which list was read, not which rows.
+
 ## Configuration
 
 | Variable            | Allowed values                      | Default        |
@@ -566,6 +630,8 @@ name, message text, balance or status reaches the audit log or the logs.
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
+| `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
+| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off) |
 | `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
 | `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
 | `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
@@ -584,7 +650,7 @@ when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
-`DEEPGRAM_API_KEY`) must also not start or end with whitespace and must
+`DEEPGRAM_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -597,6 +663,12 @@ log fail verification.
 `IDENTITY_HASH_KEY` follows the same rules as `AUDIT_HMAC_KEY` (its own placeholder). It keys
 the hashes under which failed identity checks are counted across calls; choose one different
 from the audit key. Changing it starts every count again.
+
+`ADMIN_PASSWORD`, when set, needs `ADMIN_USER`, in every environment, and unless `APP_ENV=dev`
+at least 16 characters. In every environment it must differ from every other secret of the
+application's settings: every secret field of `Settings`, found from the class, so a secret
+added later is covered too. A clash is reported by field name only. The owner's
+`POSTGRES_PASSWORD` never reaches the app, so it cannot be compared there: choose another.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -642,7 +714,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the

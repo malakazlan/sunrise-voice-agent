@@ -994,6 +994,120 @@ def test_no_print_in_app() -> None:
     assert ("sys.stderr.write", "main") in found["app/config.py"]
 
 
+# The admin API only reads. Its one write is its own audit event, through the audit log's
+# append, so its modules name no write construct (SQLAlchemy's insert, update, delete, merge,
+# a session's add, raw SQL text) and hold no string with a writing SQL keyword; every other
+# `.append` call is refused, so the one there is is the audit log's. Docstrings are prose and
+# are not read. Like the scans above, a lint against accidents.
+ADMIN_MODULES = ("app/api/admin.py", "app/audit/read.py")
+WRITE_NAMES = {
+    "insert",
+    "update",
+    "delete",
+    "merge",
+    "add",
+    "add_all",
+    "text",
+    "exec_driver_sql",
+    "bulk_save_objects",
+    "bulk_insert_mappings",
+    "bulk_update_mappings",
+}
+WRITE_SQL = re.compile(
+    r"\b(?:insert|update|delete|truncate|merge|upsert|alter|drop|create|grant|revoke|copy)\b",
+    re.IGNORECASE,
+)
+
+
+def docstring_ids(tree: ast.AST) -> set[int]:
+    return {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+
+
+def is_audit_append(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "audit"
+    )
+
+
+def admin_write_uses(source: str) -> list[str]:
+    tree = ast.parse(source)
+    prose = docstring_ids(tree)
+    uses = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in WRITE_NAMES:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in WRITE_NAMES:
+            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] in WRITE_NAMES:
+            uses.append(f"import {node.name}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in prose
+            and WRITE_SQL.search(node.value)
+        ):
+            uses.append(repr(node.value))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and not is_audit_append(node)
+        ):
+            uses.append(".append()")
+    return uses
+
+
+def test_admin_is_read_only() -> None:
+    for sample in (
+        "from sqlalchemy import insert\n",
+        "from sqlalchemy import update as change\n",
+        "import sqlalchemy\nsqlalchemy.delete(Request)\n",
+        "await session.execute(update(Request).values(summary='x'))\n",
+        "session.add(row)\n",
+        "session.add_all(rows)\n",
+        "await session.merge(row)\n",
+        "await session.delete(row)\n",
+        "await session.execute(text('SELECT 1'))\n",
+        "await connection.exec_driver_sql('SELECT 1')\n",
+        "SQL = 'INSERT INTO requests VALUES (1)'\n",
+        "SQL = 'update requests set summary = 1'\n",
+        "SQL = 'Delete From messages'\n",
+        "SQL = 'TRUNCATE requests'\n",
+        "SQL = 'drop table requests'\n",
+        "rows.append(row)\n",
+        "self.audit.append(session, event, now=now)\n",
+    ):
+        assert admin_write_uses(sample), sample
+    assert not admin_write_uses(
+        '"""Reads only; nothing here may insert, update or delete."""\n'
+        "await audit.append(session, event, now=now)\n"
+        "await session.execute(select(Request).where(Request.id < before))\n"
+        "logger.info('admin_read action=%s rows=%d', action, count)\n"
+    )
+
+    sources = {name: (REPO_ROOT / name).read_text(encoding="utf-8") for name in ADMIN_MODULES}
+    assert {name: admin_write_uses(source) for name, source in sources.items()} == {
+        name: [] for name in ADMIN_MODULES
+    }
+    # The one write: the audit event, appended in one place.
+    appends = {
+        name: sum(1 for node in ast.walk(ast.parse(source)) if is_audit_append(node))
+        for name, source in sources.items()
+    }
+    assert appends == {"app/api/admin.py": 1, "app/audit/read.py": 0}
+
+
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last
 # four and the spoken digit words. The input guard takes them from there; no other file under
 # app/ may hold a pattern that matches what they match, or a list of the digit words. A pattern

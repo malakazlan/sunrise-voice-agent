@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
@@ -11,6 +12,8 @@ from app.agent.claims import ClaimKeys
 from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
+from app.api.admin import PREFIX as ADMIN_PREFIX
+from app.api.admin import build_admin_app
 from app.api.offer import OpenCall, build_router
 from app.audit.log import AuditLog
 from app.config import Settings
@@ -19,6 +22,8 @@ from app.domain.office_hours import clinic_now
 from app.guard.logging import configure_logging
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import open_agent_call
+
+logger = logging.getLogger(__name__)
 
 CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 
@@ -78,5 +83,13 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         return FileResponse(CALL_PAGE, media_type="text/html")
 
     app.include_router(build_router(settings, calls, open_call))
+
+    if settings.admin_password is None:
+        logger.warning("admin_api_off")
+    else:
+        app.mount(
+            ADMIN_PREFIX,
+            build_admin_app(settings, deps.sessions, deps.audit),
+        )
 
     return app

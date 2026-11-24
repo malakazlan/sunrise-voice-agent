@@ -844,7 +844,7 @@ def test_registration_rules() -> None:
                 list[Any],
             )
         ],
-        # The actions dispatch writes itself are not a tool's to declare.
+        # The actions dispatch writes itself, and the admin API's, are not a tool's to declare.
         *[
             ("reserved", Tool(**valid(audit_action=action)))
             for action in (
@@ -852,6 +852,10 @@ def test_registration_rules() -> None:
                 Action.TOOL_FAILED,
                 Action.CALL_STARTED,
                 Action.CALL_ENDED,
+                Action.ADMIN_READ_REQUESTS,
+                Action.ADMIN_READ_MESSAGES,
+                Action.ADMIN_READ_AUDIT,
+                Action.ADMIN_VERIFY_AUDIT,
             )
         ],
         # A tool that may verify the caller: not a patient-data tool, in intake only, and never
@@ -899,7 +903,13 @@ def test_registration_rules() -> None:
         # default action again.
         *[
             ("reserved", Tool(**valid(outcome_actions={action: Outcome.REFUSED})))
-            for action in (Action.TOOL_REFUSED, Action.TOOL_FAILED, Action.CALL_ENDED)
+            for action in (
+                Action.TOOL_REFUSED,
+                Action.TOOL_FAILED,
+                Action.CALL_ENDED,
+                Action.ADMIN_READ_REQUESTS,
+                Action.ADMIN_VERIFY_AUDIT,
+            )
         ],
         ("default action", Tool(**valid(outcome_actions={Action.TOOL_CALLED: Outcome.SUCCESS}))),
         # The name is the tool's audit id: lower-case letters and underscores, 2 to 40.
