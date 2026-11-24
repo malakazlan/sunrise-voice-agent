@@ -1,8 +1,9 @@
 """The audit log: who did what to which record, when, and how it ended.
 
-This module is the only code that writes or verifies `audit_events` (a repo hygiene test keeps
-it that way). Each event is chained to the one before it with a keyed MAC, so that changing,
-removing, reordering or forging an event breaks the chain where it happened.
+This module is the only code that writes or verifies `audit_events` (a repo hygiene test, a lint
+against accidents, keeps it that way). Each event is chained to the one before it with a keyed
+MAC, so that changing, removing, reordering or forging an event breaks the chain where it
+happened.
 
 MAC
     HMAC-SHA256 under the audit key over `prev_mac` (the 64 lowercase hex characters stored
@@ -27,37 +28,68 @@ Canonical form (version `sunrise-audit-v1`)
     `prev_mac` is always 64 ASCII bytes, never share a MAC input either. A change to any of
     this is a new version, and the version text is part of every MAC.
 
-Concurrency
-    `append` takes a transaction-scoped advisory lock before it reads the chain head, so
-    appends are serialised and the lock ends with the caller's transaction, committed, rolled
-    back or killed. Other writers wait for it, so callers append last, just before they commit.
-    The primary key on `seq` refuses a duplicate even if the lock were bypassed.
+Identifiers
+    Every identifier has a declared shape, and none of them admits a date, a phone number or
+    nine digits (an SSN's length):
+
+    - `call_id`, and the id of a `call`: 32 lowercase hex digits in uuid4 form, as
+      app/voice/calls.py gives each call (`uuid.uuid4().hex`).
+    - the id of a `patient`: `P` and 3 to 6 digits, as the seed data has them (`P001`).
+    - the id of an `appointment`, `medication` or `slot`: the row's number, 1 to 8 digits, no
+      leading zero.
+    - `actor`: `agent`, or `admin:` and a user name of 2 to 32 lowercase letters, digits, `.`
+      and `-`, starting with a letter.
+
+    A resource type without a declared id shape cannot be used. The database's CHECKs (letters,
+    digits, `_ - : .`, at most 64) stay as the outer bound.
+
+Concurrency and the caller's transaction
+    `append` runs at the top level of the caller's transaction, never inside a savepoint, and
+    the caller uses the default isolation level, READ COMMITTED. It waits at most
+    LOCK_TIMEOUT_MS for the chain's transaction-scoped advisory lock, then reads the head; the
+    lock ends with the caller's transaction, committed, rolled back or killed, so callers
+    append last, just before they commit. The database refuses a row out of chain position on
+    its own (see the position trigger in app/db/models.py). Under REPEATABLE READ or
+    SERIALIZABLE a contended append sees a stale head and fails on the primary key: it fails
+    closed. Any failure, cancellation included, rolls back the caller's whole transaction.
 """
 
+import asyncio
 import hashlib
 import hmac
+import logging
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
 from pydantic import SecretStr
-from sqlalchemy import func, insert, select
+from sqlalchemy import BigInteger, and_, case, cast, extract, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AUDIT_TEXT_PATTERN, AuditEvent
+from app.db.models import AUDIT_CHAIN_LOCK, AuditEvent
 from app.db.session import in_database_transaction
+
+logger = logging.getLogger(__name__)
 
 CANONICAL_VERSION = "sunrise-audit-v1"
 ZERO_MAC = "0" * 64
-# The advisory lock that serialises appends: a fixed number, the bytes of "audit".
-CHAIN_LOCK = int.from_bytes(b"audit", "big")
 # Rows fetched from the server per round trip while verifying; memory stays at one batch.
 VERIFY_BATCH_SIZE = 1000
+# verify lists at most this many breaks and says when there were more.
+MAX_REPORTED_BREAKS = 100
+# How long append waits for the chain's lock before it fails, like any other failure.
+LOCK_TIMEOUT_MS = 5000
 
-IDENTIFIER = re.compile(AUDIT_TEXT_PATTERN)
 AGENT = "agent"
 ADMIN_PREFIX = "admin:"
+ADMIN_NAME = re.compile(r"[a-z][a-z0-9.-]{1,31}")
+CALL_ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}")
+PATIENT_ID = re.compile(r"P[0-9]{3,6}")
+ROW_ID = re.compile(r"[1-9][0-9]{0,7}")
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class Action(StrEnum):
@@ -67,6 +99,20 @@ class Action(StrEnum):
 
 class ResourceType(StrEnum):
     CALL = "call"
+    PATIENT = "patient"
+    APPOINTMENT = "appointment"
+    MEDICATION = "medication"
+    SLOT = "slot"
+
+
+# The shape of each resource type's ids.
+ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
+    ResourceType.CALL: CALL_ID,
+    ResourceType.PATIENT: PATIENT_ID,
+    ResourceType.APPOINTMENT: ROW_ID,
+    ResourceType.MEDICATION: ROW_ID,
+    ResourceType.SLOT: ROW_ID,
+}
 
 
 class Outcome(StrEnum):
@@ -83,24 +129,44 @@ def _check_member(name: str, value: object, registry: type[StrEnum]) -> None:
         raise TypeError(f"{name} must be a member of {registry.__name__}")
 
 
-def _check_identifier(name: str, value: object) -> str:
+def _check_id(name: str, value: object, pattern: re.Pattern[str]) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{name} must be text")
-    if not IDENTIFIER.fullmatch(value):
-        raise ValueError(f"{name} must be 1 to 64 letters, digits, _ - : or .")
+    if not pattern.fullmatch(value):
+        raise ValueError(f"{name} does not have the declared shape of its kind of id")
     return value
 
 
 def _check_actor(value: object) -> None:
-    actor = _check_identifier("actor", value)
-    if actor != AGENT and not (actor.startswith(ADMIN_PREFIX) and len(actor) > len(ADMIN_PREFIX)):
-        raise ValueError("actor must be agent, or admin: followed by an identifier")
+    if not isinstance(value, str):
+        raise TypeError("actor must be text")
+    if value == AGENT:
+        return
+    if not (value.startswith(ADMIN_PREFIX) and ADMIN_NAME.fullmatch(value[len(ADMIN_PREFIX) :])):
+        raise ValueError("actor must be agent, or admin: followed by a user name")
+
+
+def _validate(event: "Event") -> None:
+    """Every rule an event must meet. An error names the field, never the value."""
+    _check_actor(event.actor)
+    _check_member("action", event.action, Action)
+    _check_member("resource_type", event.resource_type, ResourceType)
+    _check_member("outcome", event.outcome, Outcome)
+    if event.reason is not None:
+        _check_member("reason", event.reason, Reason)
+    if event.call_id is not None:
+        _check_id("call_id", event.call_id, CALL_ID)
+    pattern = ID_PATTERNS.get(event.resource_type)
+    if pattern is None:
+        raise ValueError("resource_type has no declared shape for its ids")
+    if event.resource_id is not None:
+        _check_id("resource_id", event.resource_id, pattern)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Event:
-    """What happened, built from registry members and identifiers only. Values are checked
-    here; an error names the field, never the value.
+    """What happened, built from registry members and identifiers only. Checked when it is
+    made and again when it is written.
     """
 
     actor: str
@@ -112,16 +178,7 @@ class Event:
     reason: Reason | None = None
 
     def __post_init__(self) -> None:
-        _check_actor(self.actor)
-        _check_member("action", self.action, Action)
-        _check_member("resource_type", self.resource_type, ResourceType)
-        _check_member("outcome", self.outcome, Outcome)
-        if self.reason is not None:
-            _check_member("reason", self.reason, Reason)
-        for name in ("call_id", "resource_id"):
-            value = getattr(self, name)
-            if value is not None:
-                _check_identifier(name, value)
+        _validate(self)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -146,16 +203,26 @@ class ChainBreak(StrEnum):
     GAP = "gap"
     DUPLICATE = "duplicate"
     WRONG_START = "wrong_start"
+    # A stored value that cannot be read or put in canonical form, such as ts = infinity.
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Break:
+    seq: int
+    kind: ChainBreak
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Verification:
-    """`checked` counts the events found good, in seq order, before the first break."""
+    """`checked` counts every event read. `breaks` lists every break in seq order, at most
+    MAX_REPORTED_BREAKS of them; `truncated` says more were found. `ok` only with none.
+    """
 
     ok: bool
     checked: int
-    first_bad_seq: int | None = None
-    kind: ChainBreak | None = None
+    breaks: tuple[Break, ...] = ()
+    truncated: bool = False
 
 
 def _field(value: str | None) -> bytes:
@@ -205,6 +272,33 @@ async def _chain_head(session: AsyncSession) -> tuple[int, str] | None:
     return None if head is None else (head.seq, head.mac)
 
 
+async def _roll_back_to_the_end(session: AsyncSession) -> None:
+    """Roll the session back, and finish rolling back even if the task is cancelled while it
+    runs: the rollback runs as its own task and is waited for until it is done.
+    """
+    rollback = asyncio.ensure_future(session.rollback())
+    while not rollback.done():
+        try:
+            await asyncio.shield(rollback)
+        except asyncio.CancelledError:
+            continue
+    rollback.result()
+
+
+# The stored instant as microseconds since 1970 when Python can hold it (years 1 to 9999),
+# otherwise null: infinity or a year the driver cannot represent never fails the read.
+_TS_MICROSECONDS = case(
+    (
+        and_(
+            func.isfinite(AuditEvent.ts),
+            extract("year", func.timezone("UTC", AuditEvent.ts)).between(1, 9999),
+        ),
+        cast(extract("epoch", AuditEvent.ts) * 1_000_000, BigInteger),
+    ),
+    else_=None,
+)
+
+
 class AuditLog:
     """Appends to and verifies the chain under one key. Build it once from
     `Settings.audit_hmac_key` and share it; it holds nothing else.
@@ -224,17 +318,28 @@ class AuditLog:
 
     async def append(self, session: AsyncSession, event: Event, *, now: datetime) -> int:
         """Add `event` at the instant `now` inside the caller's open transaction and return
-        its seq. Does not commit. If the event cannot be written, the caller's whole
-        transaction is rolled back before the error is raised, so the action it records can
-        never commit without it, however the caller handles the error. A session in
-        autocommit mode is refused before anything is written.
+        its seq. Does not commit. Any failure, from a refused argument to cancellation, rolls
+        back the caller's whole transaction before the original error is raised, so the
+        action it records can never commit without it, however the caller handles the error.
+        A session in autocommit mode or inside a savepoint is refused.
         """
-        if not isinstance(now, datetime):
-            raise TypeError("now must be a datetime")
-        if now.utcoffset() is None:
-            raise ValueError("now must carry a time zone")
         try:
-            await session.execute(select(func.pg_advisory_xact_lock(CHAIN_LOCK)))
+            if type(event) is not Event:
+                raise TypeError("append takes an Event")
+            _validate(event)
+            if not isinstance(now, datetime):
+                raise TypeError("now must be a datetime")
+            if now.utcoffset() is None:
+                raise ValueError("now must carry a time zone")
+            if session.in_nested_transaction():
+                raise RuntimeError(
+                    "append runs at the top level of the caller's transaction, not nested"
+                    " in a savepoint"
+                )
+            await session.execute(
+                select(func.set_config("lock_timeout", f"{LOCK_TIMEOUT_MS}ms", True))
+            )
+            await session.execute(select(func.pg_advisory_xact_lock(AUDIT_CHAIN_LOCK)))
             if not await in_database_transaction(session):
                 raise RuntimeError(
                     "append needs a database transaction to roll back; the session is in"
@@ -254,8 +359,9 @@ class AuditLog:
                 reason=None if event.reason is None else event.reason.value,
                 prev_mac=prev_mac,
             )
-            await session.execute(
-                insert(AuditEvent).values(
+            written = await session.execute(
+                insert(AuditEvent)
+                .values(
                     seq=row.seq,
                     ts=row.ts,
                     call_id=row.call_id,
@@ -268,9 +374,16 @@ class AuditLog:
                     prev_mac=row.prev_mac,
                     mac=self._mac(row),
                 )
+                .returning(AuditEvent.seq)
             )
-        except Exception:
-            await session.rollback()
+            # A rule or trigger can make an INSERT store nothing without an error.
+            if written.scalars().all() != [seq]:
+                raise RuntimeError("the audit event was not stored")
+        except BaseException:
+            try:
+                await _roll_back_to_the_end(session)
+            except Exception as failure:
+                logger.warning("audit_append_rollback_failed error=%s", type(failure).__name__)
             raise
         return seq
 
@@ -284,12 +397,14 @@ class AuditLog:
 
     async def verify(self, session: AsyncSession) -> Verification:
         """Walk the whole chain in seq order, VERIFY_BATCH_SIZE rows at a time, and report
-        the first break. Reads only; the caller ends the transaction.
+        every break. After a break the walk goes on from the broken row's stored MAC and seq,
+        so later tampering is still found. Never raises because of what is stored. Reads
+        only; the caller ends the transaction.
         """
         statement = (
             select(
                 AuditEvent.seq,
-                AuditEvent.ts,
+                _TS_MICROSECONDS.label("ts_microseconds"),
                 AuditEvent.call_id,
                 AuditEvent.actor,
                 AuditEvent.action,
@@ -304,49 +419,61 @@ class AuditLog:
             .execution_options(yield_per=VERIFY_BATCH_SIZE)
         )
         checked = 0
-        previous_mac = ZERO_MAC
+        breaks: list[Break] = []
+        truncated = False
+        anchor: str = ZERO_MAC
+        expected_seq = 1
         result = await session.stream(statement)
         try:
             async for batch in result.partitions():
                 for stored in batch:
-                    row = ChainRow(
-                        seq=stored.seq,
-                        ts=stored.ts,
-                        call_id=stored.call_id,
-                        actor=stored.actor,
-                        action=stored.action,
-                        resource_type=stored.resource_type,
-                        resource_id=stored.resource_id,
-                        outcome=stored.outcome,
-                        reason=stored.reason,
-                        prev_mac=stored.prev_mac,
-                    )
-                    kind = self._break_at(row, stored.mac, checked, previous_mac)
+                    kind = self._break_at(stored, expected_seq, anchor, first=checked == 0)
                     if kind is not None:
-                        return Verification(
-                            ok=False, checked=checked, first_bad_seq=row.seq, kind=kind
-                        )
-                    previous_mac = stored.mac
+                        if len(breaks) < MAX_REPORTED_BREAKS:
+                            breaks.append(Break(seq=stored.seq, kind=kind))
+                        else:
+                            truncated = True
+                    anchor = stored.mac
+                    expected_seq = stored.seq + 1
                     checked += 1
         finally:
             await result.close()
-        return Verification(ok=True, checked=checked)
+        return Verification(
+            ok=not breaks, checked=checked, breaks=tuple(breaks), truncated=truncated
+        )
 
     def _break_at(
-        self, row: ChainRow, mac: str, checked: int, previous_mac: str
+        self, stored: Any, expected_seq: int, anchor: str, *, first: bool
     ) -> ChainBreak | None:
-        """The first rule `row` breaks, given that `checked` good events came before it.
-        The MAC comes first: a row that was edited in any way is reported as edited.
+        """The first rule a stored row breaks, given the seq and the previous MAC that should
+        come next. The MAC comes first: a row that was edited in any way is reported as edited.
         """
-        if not self._is_authentic(row, mac):
+        try:
+            if stored.ts_microseconds is None:
+                return ChainBreak.UNREADABLE
+            row = ChainRow(
+                seq=stored.seq,
+                ts=EPOCH + timedelta(microseconds=stored.ts_microseconds),
+                call_id=stored.call_id,
+                actor=stored.actor,
+                action=stored.action,
+                resource_type=stored.resource_type,
+                resource_id=stored.resource_id,
+                outcome=stored.outcome,
+                reason=stored.reason,
+                prev_mac=stored.prev_mac,
+            )
+            authentic = self._is_authentic(row, stored.mac)
+        except Exception:
+            return ChainBreak.UNREADABLE
+        if not authentic:
             return ChainBreak.MAC_MISMATCH
-        expected_seq = checked + 1
-        if checked == 0 and (row.seq != 1 or row.prev_mac != ZERO_MAC):
+        if first and (row.seq != 1 or row.prev_mac != ZERO_MAC):
             return ChainBreak.WRONG_START
         if row.seq < expected_seq:
             return ChainBreak.DUPLICATE
         if row.seq > expected_seq:
             return ChainBreak.GAP
-        if row.prev_mac != previous_mac:
+        if row.prev_mac != anchor:
             return ChainBreak.PREV_MAC_MISMATCH
         return None

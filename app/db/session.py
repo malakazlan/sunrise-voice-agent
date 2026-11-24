@@ -127,19 +127,38 @@ def _withhold_driver_error(
     )
 
 
+# The server ends a session that sits this long inside a transaction without a statement, so
+# an abandoned transaction cannot hold the audit chain's lock (or any other) indefinitely.
+# Statements that run, however long, are not idle; migrations and the seed run statement after
+# statement.
+IDLE_IN_TRANSACTION_TIMEOUT_MS = 30_000
+
+
+def _connect_args() -> dict[str, Any]:
+    # libpq's `options` sets the server setting for the whole session, at connect time.
+    return {"options": f"-c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"}
+
+
 def _protect(engine: Engine) -> None:
     event.listen(engine, "handle_error", withhold_row_values, retval=True)
 
 
 def create_database_engine(settings: Settings) -> AsyncEngine:
-    engine = create_async_engine(settings.database_url, pool_pre_ping=True, **SAFE_ENGINE_OPTIONS)
+    engine = create_async_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        connect_args=_connect_args(),
+        **SAFE_ENGINE_OPTIONS,
+    )
     _protect(engine.sync_engine)
     return engine
 
 
 def create_sync_engine(settings: Settings, **options: Any) -> Engine:
     """A synchronous engine, for Alembic and for test set-up."""
-    engine = create_engine(settings.database_url, **options, **SAFE_ENGINE_OPTIONS)
+    engine = create_engine(
+        settings.database_url, connect_args=_connect_args(), **options, **SAFE_ENGINE_OPTIONS
+    )
     _protect(engine)
     return engine
 

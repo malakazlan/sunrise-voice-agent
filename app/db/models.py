@@ -123,6 +123,9 @@ class Appointment(Base):
 # Every text column of an audit event except the MACs: identifiers and registry codes only.
 # Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
 AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"
+# The advisory lock that serialises writes to the chain, taken by append and by the position
+# trigger: a fixed number, the bytes of "audit".
+AUDIT_CHAIN_LOCK = int.from_bytes(b"audit", "big")
 
 
 def _audit_text(column: str) -> CheckConstraint:
@@ -162,7 +165,7 @@ class AuditEvent(Base):
 
 # audit_events is append-only for every role, the owner and superusers included: a statement
 # that would update, delete or truncate is refused before it touches a row, even when it
-# matches none. The migration creates the same function and triggers.
+# matches none. The migrations create the same functions and triggers.
 AUDIT_PROTECTION = (
     "CREATE FUNCTION audit_events_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$\n"
     "BEGIN\n"
@@ -176,6 +179,37 @@ AUDIT_PROTECTION = (
     " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
     "CREATE TRIGGER audit_events_refuse_truncate BEFORE TRUNCATE"
     " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    *(
+        # The database itself keeps the chain in position: a row is accepted only at seq
+        # head + 1 (1 on an empty table) after the head's MAC (64 zeros on an empty table).
+        # The function takes the chain's advisory lock before it reads the head, so two
+        # inserts never both pass: the second waits for the first's transaction to end and,
+        # since in READ COMMITTED each statement of the function reads a fresh snapshot,
+        # then sees the first's row and is refused. Under REPEATABLE READ or SERIALIZABLE the
+        # head it reads can be stale, and the primary key refuses the duplicate seq instead.
+        # Only the fixed integer lock id is formatted into the text.
+        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"  # noqa: S608
+        "DECLARE\n"
+        "  head_seq bigint;\n"
+        "  head_mac char(64);\n"
+        "BEGIN\n"
+        f"  PERFORM pg_advisory_xact_lock({AUDIT_CHAIN_LOCK});\n"
+        "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
+        "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
+        "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+        "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME, COLUMN = 'seq';\n"
+        "  END IF;\n"
+        "  IF NEW.prev_mac IS DISTINCT FROM coalesce(head_mac, repeat('0', 64)) THEN\n"
+        "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+        "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME,\n"
+        "      COLUMN = 'prev_mac';\n"
+        "  END IF;\n"
+        "  RETURN NEW;\n"
+        "END\n"
+        "$$",
+        "CREATE TRIGGER audit_events_check_position BEFORE INSERT"
+        " ON audit_events FOR EACH ROW EXECUTE FUNCTION audit_events_check_position()",
+    ),
 )
 
 

@@ -293,22 +293,25 @@ def close_async_driver_connection() -> Callable[[AsyncConnection], Awaitable[Non
     return close
 
 
-# audit_events refuses UPDATE, DELETE and TRUNCATE through triggers that fire for every role,
-# the owner and superusers included. Tamper tests must change rows anyway, to show that the chain
-# catches it. This fixture is the only way past those triggers in the repo (the hygiene test
-# keeps the setting below out of every other file): session_replication_role=replica switches
-# ordinary triggers off for one transaction, and Postgres lets only a superuser set it. The
-# schema itself has no switch, flag or role check that turns the protection off.
+# audit_events' triggers refuse UPDATE, DELETE and TRUNCATE, and any INSERT out of chain
+# position, for ordinary statements from every role, superusers included. Tamper tests must get
+# past them, to show that the chain catches what an owner could do: this fixture switches
+# ordinary triggers off for one transaction with session_replication_role=replica, which only a
+# superuser may set. It is not the only way past them: whoever owns the table can disable or
+# drop the triggers, or drop the table. The hygiene scan that keeps this setting out of other
+# files is a lint against accidents, not a control; the control is a runtime role that neither
+# owns the table nor is a superuser.
 @pytest.fixture
 def tamper_with_audit_events() -> Callable[..., None]:
-    """`tamper_with_audit_events(engine, *sql)`: run statements past audit_events' triggers,
-    in one transaction.
+    """`tamper_with_audit_events(engine, *statements)`: run statements past audit_events'
+    triggers, in one transaction. A statement is SQL text, or (SQL text, bound parameters).
     """
 
-    def tamper(engine: Engine, *statements: str) -> None:
+    def tamper(engine: Engine, *statements: str | tuple[str, dict[str, Any]]) -> None:
         with engine.begin() as connection:
             connection.execute(text("SET LOCAL session_replication_role = replica"))
             for statement in statements:
-                connection.execute(text(statement))
+                sql, parameters = (statement, {}) if isinstance(statement, str) else statement
+                connection.execute(text(sql), parameters)
 
     return tamper

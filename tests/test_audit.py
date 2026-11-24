@@ -1,8 +1,11 @@
+import asyncio
 import hashlib
 import itertools
+import logging
 import re
+import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,7 +16,7 @@ from psycopg import errors
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, event, text
 from sqlalchemy.engine.interfaces import ExecutionContext
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
 
@@ -33,6 +36,7 @@ from app.audit.log import (
     canonical_form,
 )
 from app.config import Settings
+from app.db import session as session_module
 from app.db.session import create_database_engine, create_session_factory, create_sync_engine
 
 pytestmark = pytest.mark.anyio
@@ -62,9 +66,21 @@ LOCK_WAITERS = text(
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
     " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
 )
+# Owner-level ways to make an INSERT store nothing, created past the table's protection.
+SWALLOW_BY_RULE = "CREATE RULE swallow AS ON INSERT TO audit_events DO INSTEAD NOTHING"
+SWALLOW_BY_TRIGGER = (
+    "CREATE FUNCTION swallow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+    "CREATE TRIGGER swallow BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION swallow()",
+)
 
 
-def call_started(call_id: str = "call-1") -> Event:
+def cid(number: int) -> str:
+    """A call id in the format calls are given (uuid4 hex), distinct per number."""
+    return f"{number:012x}4{number:03x}8{number:015x}"
+
+
+def call_started(call_id: str | None = None) -> Event:
+    call_id = cid(1) if call_id is None else call_id
     return Event(
         actor="agent",
         action=Action.CALL_STARTED,
@@ -75,7 +91,8 @@ def call_started(call_id: str = "call-1") -> Event:
     )
 
 
-def call_ended(call_id: str = "call-1") -> Event:
+def call_ended(call_id: str | None = None) -> Event:
+    call_id = cid(1) if call_id is None else call_id
     return Event(
         actor="agent",
         action=Action.CALL_ENDED,
@@ -88,7 +105,7 @@ def call_ended(call_id: str = "call-1") -> Event:
 
 
 # Event 1 has no reason; event 2 has every column set.
-THREE = [call_started("call-1"), call_ended("call-1"), call_started("call-2")]
+THREE = [call_started(cid(1)), call_ended(cid(1)), call_started(cid(2))]
 
 
 @pytest.fixture
@@ -128,12 +145,26 @@ async def verified(audit: AuditLog, session: AsyncSession) -> Verification:
     return result
 
 
-def broken(seq: int, kind: ChainBreak, checked: int) -> Verification:
-    return Verification(ok=False, checked=checked, first_bad_seq=seq, kind=kind)
+def broken(checked: int, *breaks: tuple[int, str], truncated: bool = False) -> Verification:
+    """A failed verification: `checked` events read, then every break as (seq, kind)."""
+    return Verification(
+        ok=False,
+        checked=checked,
+        breaks=tuple(log.Break(seq=seq, kind=ChainBreak(kind)) for seq, kind in breaks),
+        truncated=truncated,
+    )
 
 
 def intact(checked: int) -> Verification:
-    return Verification(ok=True, checked=checked, first_bad_seq=None, kind=None)
+    return Verification(ok=True, checked=checked, breaks=(), truncated=False)
+
+
+MAC = "mac_mismatch"
+PREV = "prev_mac_mismatch"
+GAP = "gap"
+DUPLICATE = "duplicate"
+WRONG_START = "wrong_start"
+UNREADABLE = "unreadable"
 
 
 async def lock_waiters(session: AsyncSession) -> int:
@@ -147,6 +178,15 @@ async def wait_for_lock_waiters(session: AsyncSession, expected: int) -> None:
             await session.rollback()
             await anyio.sleep(0.01)
     await session.rollback()
+
+
+def counts(sync_engine: Engine) -> tuple[int, int]:
+    """(patients, audit events) as committed."""
+    with sync_engine.connect() as connection:
+        return (
+            connection.execute(PATIENTS).scalar_one(),
+            connection.execute(COUNT).scalar_one(),
+        )
 
 
 # --- Neighbours ---------------------------------------------------------------------------
@@ -277,12 +317,12 @@ async def test_verify_reads_in_batches(
     event.listen(engine.sync_engine, "before_cursor_execute", record)
     try:
         async with create_session_factory(engine)() as session:
-            await append_all(audit, session, [call_started(f"call-{n}") for n in range(5)])
+            await append_all(audit, session, [call_started(cid(n)) for n in range(5)])
             assert await verified(audit, session) == intact(5)
 
             # Event 3 opens the second batch; its removal is seen across the batch boundary.
             tamper_with_audit_events(sync_engine, "DELETE FROM audit_events WHERE seq = 3")
-            assert await verified(audit, session) == broken(4, ChainBreak.GAP, checked=2)
+            assert await verified(audit, session) == broken(4, (4, GAP))
     finally:
         await engine.dispose()
 
@@ -304,7 +344,7 @@ async def test_duplicate_seq_is_detected(
         "INSERT INTO audit_events SELECT * FROM audit_events WHERE seq = 2",
     )
 
-    assert await verified(audit, session) == broken(2, ChainBreak.DUPLICATE, checked=2)
+    assert await verified(audit, session) == broken(4, (2, DUPLICATE))
 
 
 async def test_event_spliced_from_another_chain_is_detected(
@@ -312,16 +352,19 @@ async def test_event_spliced_from_another_chain_is_detected(
 ) -> None:
     # A second chain under the same key, for example a copy of the database, supplies an
     # event 2 whose own MAC is genuine but which follows a different event 1.
-    await append_all(audit, session, [call_started("call-x"), call_ended("call-x")])
+    await append_all(audit, session, [call_started(cid(7)), call_ended(cid(7))])
     foreign = (await stored(session))[1]
     tamper_with_audit_events(sync_engine, "TRUNCATE audit_events")
 
     await append_all(audit, session, THREE)
-    tamper_with_audit_events(sync_engine, "DELETE FROM audit_events WHERE seq = 2")
-    with sync_engine.begin() as connection:
-        connection.execute(INSERT_ROW, dict(zip(ROW_COLUMNS, foreign, strict=True)))
+    tamper_with_audit_events(
+        sync_engine,
+        "DELETE FROM audit_events WHERE seq = 2",
+        (INSERT_ROW.text, dict(zip(ROW_COLUMNS, foreign, strict=True))),
+    )
 
-    assert await verified(audit, session) == broken(2, ChainBreak.PREV_MAC_MISMATCH, checked=1)
+    # Event 2 does not follow event 1, and event 3 does not follow the foreign event 2.
+    assert await verified(audit, session) == broken(3, (2, PREV), (3, PREV))
 
 
 ROW_COLUMNS = (
@@ -341,30 +384,36 @@ ROW_COLUMNS = (
 
 # --- R1 to R5: tampering is detected -------------------------------------------------------
 
-# One edit per stored column, each made past the table's own protection, the seq at which
-# verification must first fail and how many events it finds good before that. The seq edit
-# renumbers the last event, so that the rows keep their order and only the MAC can tell.
+# One edit per stored column, each made past the table's own protection, and every break
+# verification must then report. The seq edit renumbers the last event, so that the rows keep
+# their order and only the MAC can tell. Editing a MAC breaks its own row and, because the
+# walk goes on from the stored MAC, the link of the row after it.
 EDITS = {
-    "seq": ("UPDATE audit_events SET seq = 4 WHERE seq = 3", 4, 2),
-    "ts": ("UPDATE audit_events SET ts = ts + interval '1 microsecond' WHERE seq = 2", 2, 1),
-    "call_id": ("UPDATE audit_events SET call_id = 'call-9' WHERE seq = 2", 2, 1),
-    "call_id_to_null": ("UPDATE audit_events SET call_id = NULL WHERE seq = 2", 2, 1),
-    "actor": ("UPDATE audit_events SET actor = 'admin:ops' WHERE seq = 2", 2, 1),
-    "action": ("UPDATE audit_events SET action = 'call_started' WHERE seq = 2", 2, 1),
-    "resource_type": ("UPDATE audit_events SET resource_type = 'patient' WHERE seq = 2", 2, 1),
-    "resource_id": ("UPDATE audit_events SET resource_id = 'call-9' WHERE seq = 2", 2, 1),
-    "resource_id_to_null": ("UPDATE audit_events SET resource_id = NULL WHERE seq = 2", 2, 1),
-    "outcome": ("UPDATE audit_events SET outcome = 'success' WHERE seq = 2", 2, 1),
-    "reason": ("UPDATE audit_events SET reason = 'timeout' WHERE seq = 2", 2, 1),
-    "reason_to_null": ("UPDATE audit_events SET reason = NULL WHERE seq = 2", 2, 1),
-    "reason_from_null": ("UPDATE audit_events SET reason = 'caller_hung_up' WHERE seq = 1", 1, 0),
-    "prev_mac": ("UPDATE audit_events SET prev_mac = repeat('0', 64) WHERE seq = 2", 2, 1),
+    "seq": ("UPDATE audit_events SET seq = 4 WHERE seq = 3", [(4, MAC)]),
+    "ts": ("UPDATE audit_events SET ts = ts + interval '1 microsecond' WHERE seq = 2", [(2, MAC)]),
+    "call_id": ("UPDATE audit_events SET call_id = md5('nine') WHERE seq = 2", [(2, MAC)]),
+    "call_id_to_null": ("UPDATE audit_events SET call_id = NULL WHERE seq = 2", [(2, MAC)]),
+    "actor": ("UPDATE audit_events SET actor = 'admin:ops' WHERE seq = 2", [(2, MAC)]),
+    "action": ("UPDATE audit_events SET action = 'call_started' WHERE seq = 2", [(2, MAC)]),
+    "resource_type": (
+        "UPDATE audit_events SET resource_type = 'patient' WHERE seq = 2",
+        [(2, MAC)],
+    ),
+    "resource_id": ("UPDATE audit_events SET resource_id = md5('nine') WHERE seq = 2", [(2, MAC)]),
+    "resource_id_to_null": ("UPDATE audit_events SET resource_id = NULL WHERE seq = 2", [(2, MAC)]),
+    "outcome": ("UPDATE audit_events SET outcome = 'success' WHERE seq = 2", [(2, MAC)]),
+    "reason": ("UPDATE audit_events SET reason = 'timeout' WHERE seq = 2", [(2, MAC)]),
+    "reason_to_null": ("UPDATE audit_events SET reason = NULL WHERE seq = 2", [(2, MAC)]),
+    "reason_from_null": (
+        "UPDATE audit_events SET reason = 'caller_hung_up' WHERE seq = 1",
+        [(1, MAC)],
+    ),
+    "prev_mac": ("UPDATE audit_events SET prev_mac = repeat('0', 64) WHERE seq = 2", [(2, MAC)]),
     "prev_mac_not_ascii": (
         "UPDATE audit_events SET prev_mac = repeat(chr(233), 64) WHERE seq = 2",
-        2,
-        1,
+        [(2, MAC)],
     ),
-    "mac": ("UPDATE audit_events SET mac = repeat('f', 64) WHERE seq = 2", 2, 1),
+    "mac": ("UPDATE audit_events SET mac = repeat('f', 64) WHERE seq = 2", [(2, MAC), (3, PREV)]),
 }
 
 
@@ -376,7 +425,7 @@ async def test_edit_to_any_column_is_detected(
     tamper_with_audit_events: Tamper,
     column: str,
 ) -> None:
-    statement, bad_seq, checked = EDITS[column]
+    statement, breaks = EDITS[column]
     await append_all(audit, session, THREE)
     assert await verified(audit, session) == intact(3)
     before = await stored(session)
@@ -384,13 +433,13 @@ async def test_edit_to_any_column_is_detected(
     tamper_with_audit_events(sync_engine, statement)
 
     assert await stored(session) != before
-    assert await verified(audit, session) == broken(bad_seq, ChainBreak.MAC_MISMATCH, checked)
+    assert await verified(audit, session) == broken(3, *breaks)
 
 
 DELETIONS = {
-    "middle": (["DELETE FROM audit_events WHERE seq = 2"], broken(3, ChainBreak.GAP, 1)),
-    "first": (["DELETE FROM audit_events WHERE seq = 1"], broken(2, ChainBreak.WRONG_START, 0)),
-    "two": (["DELETE FROM audit_events WHERE seq IN (2, 3)"], broken(4, ChainBreak.GAP, 1)),
+    "middle": (["DELETE FROM audit_events WHERE seq = 2"], 3, [(3, GAP)]),
+    "first": (["DELETE FROM audit_events WHERE seq = 1"], 3, [(2, WRONG_START)]),
+    "two": (["DELETE FROM audit_events WHERE seq IN (2, 3)"], 2, [(4, GAP)]),
 }
 
 
@@ -402,26 +451,29 @@ async def test_deleted_event_is_detected(
     tamper_with_audit_events: Tamper,
     case: str,
 ) -> None:
-    statements, expected = DELETIONS[case]
-    await append_all(audit, session, [*THREE, call_ended("call-2")])
+    statements, checked, breaks = DELETIONS[case]
+    await append_all(audit, session, [*THREE, call_ended(cid(2))])
 
     tamper_with_audit_events(sync_engine, *statements)
 
-    assert await verified(audit, session) == expected
+    assert await verified(audit, session) == broken(checked, *breaks)
 
 
 REORDERINGS = {
+    # Both moved rows fail their MAC; event 4 then follows the wrong neighbour.
     "swap": (
         [
             "UPDATE audit_events SET seq = 0 WHERE seq = 2",
             "UPDATE audit_events SET seq = 2 WHERE seq = 3",
             "UPDATE audit_events SET seq = 3 WHERE seq = 0",
         ],
-        broken(2, ChainBreak.MAC_MISMATCH, 1),
+        4,
+        [(2, MAC), (3, MAC), (4, PREV)],
     ),
     "renumber_all": (
         ["UPDATE audit_events SET seq = seq + 10"],
-        broken(11, ChainBreak.MAC_MISMATCH, 0),
+        4,
+        [(11, MAC), (12, MAC), (13, MAC), (14, MAC)],
     ),
     "close_a_gap": (
         [
@@ -429,7 +481,8 @@ REORDERINGS = {
             "UPDATE audit_events SET seq = 2 WHERE seq = 3",
             "UPDATE audit_events SET seq = 3 WHERE seq = 4",
         ],
-        broken(2, ChainBreak.MAC_MISMATCH, 1),
+        3,
+        [(2, MAC), (3, MAC)],
     ),
 }
 
@@ -442,12 +495,30 @@ async def test_reordered_events_are_detected(
     tamper_with_audit_events: Tamper,
     case: str,
 ) -> None:
-    statements, expected = REORDERINGS[case]
-    await append_all(audit, session, [*THREE, call_ended("call-2")])
+    statements, checked, breaks = REORDERINGS[case]
+    await append_all(audit, session, [*THREE, call_ended(cid(2))])
 
     tamper_with_audit_events(sync_engine, *statements)
 
-    assert await verified(audit, session) == expected
+    assert await verified(audit, session) == broken(checked, *breaks)
+
+
+def forged_row(seq: int, prev_mac: str) -> dict[str, Any]:
+    """A row in the right place, made without the key: a plain hash of the documented input."""
+    forged = ChainRow(
+        seq=seq,
+        ts=T0,
+        call_id=cid(1),
+        actor="admin:intruder",
+        action="call_ended",
+        resource_type="call",
+        resource_id=cid(1),
+        outcome="success",
+        reason=None,
+        prev_mac=prev_mac,
+    )
+    digest = hashlib.sha256(prev_mac.encode() + canonical_form(forged)).hexdigest()
+    return {**{name: getattr(forged, name) for name in ROW_COLUMNS[:-1]}, "mac": digest}
 
 
 async def test_forged_event_is_detected(
@@ -458,28 +529,12 @@ async def test_forged_event_is_detected(
 
     # Inserting needs no bypass. Without the key the forger can follow every other rule: the
     # next seq, the head's MAC as prev_mac, a hash of the documented input.
-    forged = ChainRow(
-        seq=3,
-        ts=T0,
-        call_id="call-1",
-        actor="admin:intruder",
-        action="call_ended",
-        resource_type="call",
-        resource_id="call-1",
-        outcome="success",
-        reason=None,
-        prev_mac=head_mac,
-    )
-    digest = hashlib.sha256(head_mac.encode() + canonical_form(forged)).hexdigest()
     with sync_engine.begin() as connection:
-        connection.execute(
-            INSERT_ROW,
-            {**{name: getattr(forged, name) for name in ROW_COLUMNS[:-1]}, "mac": digest},
-        )
+        connection.execute(INSERT_ROW, forged_row(3, head_mac))
 
     # A genuine event written afterwards chains onto the forgery; the break is still found.
-    assert await append_all(audit, session, [call_started("call-3")]) == [4]
-    assert await verified(audit, session) == broken(3, ChainBreak.MAC_MISMATCH, checked=2)
+    assert await append_all(audit, session, [call_started(cid(3))]) == [4]
+    assert await verified(audit, session) == broken(4, (3, MAC))
 
 
 async def test_wrong_key_fails_verification(audit: AuditLog, session: AsyncSession) -> None:
@@ -487,11 +542,94 @@ async def test_wrong_key_fails_verification(audit: AuditLog, session: AsyncSessi
     other_key = "-".join(["other", "audit", "key"] * 4)
     other = AuditLog(SecretStr(other_key))
 
-    assert await verified(other, session) == broken(1, ChainBreak.MAC_MISMATCH, checked=0)
+    assert await verified(other, session) == broken(3, (1, MAC), (2, MAC), (3, MAC))
     assert await verified(audit, session) == intact(3)
     assert other_key not in repr(other)
     with pytest.raises(ValueError, match="key"):
         AuditLog(SecretStr(""))
+
+
+# --- F2: position enforced by the database, and every break reported ---------------------
+
+
+def position_refusal(error: DBAPIError) -> str | None:
+    """The column the position trigger refused on, or fail if something else refused."""
+    refusal = error.orig
+    assert isinstance(refusal, errors.IntegrityConstraintViolation), type(refusal)
+    assert refusal.sqlstate == "23000", refusal.sqlstate
+    assert refusal.diag.table_name == "audit_events"
+    return refusal.diag.column_name
+
+
+async def test_database_refuses_out_of_position_insert(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+) -> None:
+    def insert(seq: int, prev_mac: str) -> IntegrityError:
+        with pytest.raises(IntegrityError) as excinfo, sync_engine.begin() as connection:
+            connection.execute(INSERT_ROW, forged_row(seq, prev_mac))
+        return excinfo.value
+
+    # An empty table takes only seq 1 after 64 zeros.
+    assert position_refusal(insert(2, ZERO_MAC)) == "seq"
+    assert position_refusal(insert(1, "ab" * 32)) == "prev_mac"
+
+    await append_all(audit, session, THREE[:2])
+    head_mac = (await stored(session))[-1][10]
+    for seq in (2**63 - 1, 4, 2, 1):  # the top of bigint, a gap, a repeat, the start again
+        assert position_refusal(insert(seq, head_mac)) == "seq", seq
+    assert position_refusal(insert(3, ZERO_MAC)) == "prev_mac"
+
+    # The next position is accepted, and genuine appends go on after it.
+    with sync_engine.begin() as connection:
+        connection.execute(INSERT_ROW, forged_row(3, head_mac))
+    assert await append_all(audit, session, [call_started(cid(3))]) == [4]
+
+
+async def test_verify_reports_every_break(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # A junk row at head + 1 needs only INSERT. Genuine events follow it, and a later one is
+    # edited: both breaks are found, and nothing else.
+    await append_all(audit, session, THREE[:2])
+    head_mac = (await stored(session))[-1][10]
+    with sync_engine.begin() as connection:
+        connection.execute(INSERT_ROW, forged_row(3, head_mac))
+    assert await append_all(audit, session, [call_started(cid(3)), call_ended(cid(3))]) == [4, 5]
+    tamper_with_audit_events(
+        sync_engine, "UPDATE audit_events SET outcome = 'success' WHERE seq = 5"
+    )
+
+    assert await verified(audit, session) == broken(5, (3, MAC), (5, MAC))
+
+
+async def test_verify_caps_the_list_of_breaks(
+    audit: AuditLog, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await append_all(audit, session, THREE)
+    monkeypatch.setattr(log, "MAX_REPORTED_BREAKS", 2)
+    other = AuditLog(SecretStr("-".join(["other", "audit", "key"] * 4)))
+
+    # Every event is checked; the list stops at the cap and says so.
+    assert await verified(other, session) == broken(3, (1, MAC), (2, MAC), truncated=True)
+    assert log.MAX_REPORTED_BREAKS == 2
+    monkeypatch.undo()
+    assert log.MAX_REPORTED_BREAKS == 100
+
+
+async def test_verify_reports_unreadable_rows_and_goes_on(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # One batch: an edited row, a timestamp at infinity, one beyond the year 9999 that the
+    # driver can represent, then a genuine row. verify raises for none of them.
+    await append_all(audit, session, [*THREE, call_ended(cid(2))])
+    tamper_with_audit_events(
+        sync_engine,
+        "UPDATE audit_events SET outcome = 'failure' WHERE seq = 1",
+        "UPDATE audit_events SET ts = 'infinity' WHERE seq = 2",
+        "UPDATE audit_events SET ts = '20000-01-01 00:00:00+00' WHERE seq = 3",
+    )
+
+    assert await verified(audit, session) == broken(4, (1, MAC), (2, UNREADABLE), (3, UNREADABLE))
 
 
 # --- R6: concurrency ----------------------------------------------------------------------
@@ -532,11 +670,12 @@ async def test_concurrent_appends_keep_one_chain(
         try:
             async with factory() as session:
                 for index in range(APPENDS_EACH):
-                    item = call_started(f"call-{number}-{index}")
+                    item = call_started(cid(number * 16 + index))
                     seqs.append(await audit.append(session, item, now=T0))
                     await session.commit()
         except Exception as error:  # noqa: BLE001 (collected and asserted below)
-            failures.append(type(error).__name__)
+            sqlstate = getattr(getattr(error, "orig", None), "sqlstate", None)
+            failures.append(f"{type(error).__name__} {sqlstate}")
         finally:
             remaining -= 1
 
@@ -551,7 +690,28 @@ async def test_concurrent_appends_keep_one_chain(
         assert await verified(audit, session) == intact(WORKERS * APPENDS_EACH)
 
 
-# --- R7, R8: the event and its action commit together -------------------------------------
+@pytest.mark.parametrize("level", ["REPEATABLE READ", "SERIALIZABLE"])
+async def test_contended_append_fails_closed_above_read_committed(
+    audit: AuditLog, factory: Callable[[], AsyncSession], level: str
+) -> None:
+    # The snapshot is taken before another writer commits, so the head it sees is stale: the
+    # append fails on the primary key instead of writing a second event 1. Callers use the
+    # default isolation level, READ COMMITTED.
+    async with factory() as early, factory() as other:
+        await early.connection(execution_options={"isolation_level": level})
+        await early.execute(text("SELECT 1"))
+        await append_all(audit, other, [call_started()])
+
+        with pytest.raises(IntegrityError) as excinfo:
+            await audit.append(early, call_ended(), now=T0)
+        assert isinstance(excinfo.value.orig, errors.UniqueViolation)
+        assert excinfo.value.orig.diag.constraint_name == "pk_audit_events"
+
+        await early.commit()
+        assert await verified(audit, other) == intact(1)
+
+
+# --- R7, R8, F1, F3, F4, F5, F12: the event and its action commit together -----------------
 
 
 async def test_event_rolls_back_with_the_action(audit: AuditLog, session: AsyncSession) -> None:
@@ -596,54 +756,231 @@ async def test_append_refuses_a_session_outside_a_transaction(
         assert connection.execute(COUNT).scalar_one() == 1
 
 
-def unwritable_event() -> Event:
-    """An event the database refuses: free text forced past the API's own check."""
-    item = call_started()
-    object.__setattr__(item, "actor", "free text")
-    return item
+@pytest.mark.parametrize("swallow", ["rule", "trigger"])
+async def test_action_fails_when_the_insert_is_swallowed(
+    audit: AuditLog,
+    session: AsyncSession,
+    sync_engine: Engine,
+    tamper_with_audit_events: Tamper,
+    swallow: str,
+) -> None:
+    if swallow == "rule":
+        tamper_with_audit_events(sync_engine, SWALLOW_BY_RULE)
+    else:
+        tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
+
+    await session.execute(INSERT_PATIENT)
+    with pytest.raises((RuntimeError, DBAPIError)):
+        await audit.append(session, call_started(), now=T0)
+    await session.commit()
+
+    assert counts(sync_engine) == (0, 0)
+
+
+# Each caller below meets an append that fails while the database transaction is still
+# healthy (the INSERT stores nothing), so only append's own rollback keeps the action out.
 
 
 async def ignore_the_error_and_commit(audit: AuditLog, session: AsyncSession) -> None:
     await session.execute(INSERT_PATIENT)
-    with pytest.raises(IntegrityError) as excinfo:
-        await audit.append(session, unwritable_event(), now=T0)
-    refusal = excinfo.value.orig
-    assert isinstance(refusal, errors.CheckViolation)
-    assert refusal.diag.constraint_name == "ck_audit_events_actor"
+    with pytest.raises(RuntimeError, match="not stored"):
+        await audit.append(session, call_started(), now=T0)
     await session.commit()
 
 
-async def catch_it_in_a_savepoint(audit: AuditLog, session: AsyncSession) -> None:
-    await session.execute(INSERT_PATIENT)
-    with pytest.raises(IntegrityError):
-        async with session.begin_nested():
-            await audit.append(session, unwritable_event(), now=T0)
-    await session.commit()
-
-
-async def inside_a_transaction_block(audit: AuditLog, session: AsyncSession) -> None:
-    with pytest.raises(IntegrityError):
-        async with session.begin():
-            await session.execute(INSERT_PATIENT)
-            await audit.append(session, unwritable_event(), now=T0)
+async def catch_it_inside_a_transaction_block(audit: AuditLog, session: AsyncSession) -> None:
+    # The block commits on leaving; append has already ended its transaction, so there is
+    # nothing left to commit.
+    async with session.begin():
+        await session.execute(INSERT_PATIENT)
+        with pytest.raises(RuntimeError, match="not stored"):
+            await audit.append(session, call_started(), now=T0)
 
 
 CALLERS = {
     "ignore_the_error_and_commit": ignore_the_error_and_commit,
-    "catch_it_in_a_savepoint": catch_it_in_a_savepoint,
-    "inside_a_transaction_block": inside_a_transaction_block,
+    "catch_it_inside_a_transaction_block": catch_it_inside_a_transaction_block,
 }
 
 
-@pytest.mark.parametrize("caller", CALLERS)
+@pytest.mark.parametrize("caller", [*CALLERS, "inside_a_savepoint"])
 async def test_action_fails_when_event_cannot_be_written(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, caller: str
+    audit: AuditLog,
+    session: AsyncSession,
+    sync_engine: Engine,
+    tamper_with_audit_events: Tamper,
+    caller: str,
 ) -> None:
-    await CALLERS[caller](audit, session)
+    if caller == "inside_a_savepoint":
+        # A savepoint could roll the event back while the action commits: append refuses to
+        # run inside one, and rolls back the whole transaction.
+        await session.execute(INSERT_PATIENT)
+        with pytest.raises(RuntimeError, match="nested"):
+            async with session.begin_nested():
+                await audit.append(session, call_started(), now=T0)
+        await session.commit()
+    else:
+        tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
+        await CALLERS[caller](audit, session)
 
-    with sync_engine.connect() as connection:
-        assert connection.execute(PATIENTS).scalar_one() == 0
-        assert connection.execute(COUNT).scalar_one() == 0
+    assert counts(sync_engine) == (0, 0)
+
+
+@dataclass(frozen=True)
+class LookAlike:
+    """Has every field of an event and none of its checks."""
+
+    actor: str = "agent"
+    action: str = "call_started"
+    resource_type: str = "call"
+    outcome: str = "success"
+    call_id: str | None = None
+    resource_id: str | None = None
+    reason: str | None = None
+
+
+def ssn_shaped() -> str:
+    return "-".join(["9" * 3, "8" * 2, "7" * 4])
+
+
+def mutated(field: str, value: object) -> Event:
+    item = call_started()
+    object.__setattr__(item, field, value)
+    return item
+
+
+async def test_append_revalidates_the_event(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+) -> None:
+    attempts: list[tuple[object, type[Exception]]] = [
+        (LookAlike(), TypeError),
+        (mutated("action", "unregistered_action"), TypeError),
+        (mutated("actor", "free text"), ValueError),
+        (mutated("call_id", ssn_shaped()), ValueError),
+        (mutated("resource_id", "2026-11-24"), ValueError),
+    ]
+    for item, error in attempts:
+        await session.execute(INSERT_PATIENT)
+        with pytest.raises(error):
+            await audit.append(session, item, now=T0)  # type: ignore[arg-type]
+        await session.commit()
+
+        assert counts(sync_engine) == (0, 0), item
+
+
+async def test_cancelled_append_rolls_back_the_action(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The caller hangs up after the head is read; the caller's own `finally` then commits.
+    # The second time, the task is cancelled again while the rollback is running.
+    read_head = log._chain_head
+    head_read = asyncio.Event()
+
+    async def head_then_wait(session: AsyncSession) -> tuple[int, str] | None:
+        head = await read_head(session)
+        head_read.set()
+        await asyncio.Event().wait()
+        return head
+
+    monkeypatch.setattr(log, "_chain_head", head_then_wait)
+    real_rollback = session.rollback
+    rollback_started = asyncio.Event()
+
+    async def slow_rollback() -> None:
+        rollback_started.set()
+        await asyncio.sleep(0.2)
+        await real_rollback()
+
+    monkeypatch.setattr(session, "rollback", slow_rollback)
+
+    async def caller() -> None:
+        try:
+            await session.execute(INSERT_PATIENT)
+            await audit.append(session, call_started(), now=T0)
+        finally:
+            await session.commit()
+
+    for cancel_again in (False, True):
+        head_read.clear()
+        rollback_started.clear()
+        task = asyncio.ensure_future(caller())
+        with anyio.fail_after(10):
+            await head_read.wait()
+        task.cancel()
+        if cancel_again:
+            with anyio.fail_after(10):
+                await rollback_started.wait()
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert counts(sync_engine) == (0, 0), cancel_again
+
+
+async def test_failed_rollback_keeps_the_original_error(
+    audit: AuditLog,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def failing_rollback() -> None:
+        raise ConnectionError("rollback failed")
+
+    monkeypatch.setattr(session, "rollback", failing_rollback)
+    caplog.set_level(logging.WARNING, logger="app.audit.log")
+
+    with pytest.raises(ValueError, match="now"):
+        await audit.append(session, call_started(), now=datetime(2026, 11, 24, 15, 30))
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "audit_append_rollback_failed error=ConnectionError"
+    ]
+
+
+async def test_append_gives_up_when_the_lock_is_held(
+    audit: AuditLog, factory: Callable[[], AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert log.LOCK_TIMEOUT_MS == 5000
+    monkeypatch.setattr(log, "LOCK_TIMEOUT_MS", 200)
+    async with factory() as holder, factory() as waiter:
+        await audit.append(holder, call_started(), now=T0)
+        await waiter.execute(INSERT_PATIENT)
+
+        with anyio.fail_after(10), pytest.raises(OperationalError) as excinfo:
+            await audit.append(waiter, call_ended(), now=T0)
+
+        assert isinstance(excinfo.value.orig, errors.LockNotAvailable)
+        await waiter.commit()
+        assert (await waiter.execute(PATIENTS)).scalar_one() == 0
+        await holder.rollback()
+
+
+async def test_idle_transaction_is_ended_by_the_server(
+    database: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    show = text("SHOW idle_in_transaction_session_timeout")
+    engine = create_database_engine(database)
+    sync = create_sync_engine(database, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            assert (await connection.execute(show)).scalar_one() == "30s"
+        with sync.connect() as connection:
+            assert connection.execute(show).scalar_one() == "30s"
+    finally:
+        await engine.dispose()
+        sync.dispose()
+
+    monkeypatch.setattr(session_module, "IDLE_IN_TRANSACTION_TIMEOUT_MS", 300)
+    engine = create_database_engine(database)
+    try:
+        async with create_session_factory(engine)() as session:
+            await session.execute(text("SELECT 1"))
+            await anyio.sleep(1.5)
+            with pytest.raises(DBAPIError) as excinfo:
+                await session.execute(text("SELECT 1"))
+            assert isinstance(excinfo.value.orig, errors.IdleInTransactionSessionTimeout)
+    finally:
+        await engine.dispose()
 
 
 # --- R9, R10: the database's own rules ----------------------------------------------------
@@ -710,8 +1047,7 @@ def test_fields_reject_free_text() -> None:
                 assert value not in str(excinfo.value), (field, value)
         with pytest.raises(TypeError):
             changed(base, **{field: 7})
-        longest = "Az09_-:." + "x" * 56
-        assert getattr(changed(base, **{field: longest}), field) == longest
+        assert getattr(changed(base, **{field: cid(5)}), field) == cid(5)
         assert getattr(changed(base, **{field: None}), field) is None
 
     for value in FREE_TEXT:
@@ -724,11 +1060,61 @@ def test_fields_reject_free_text() -> None:
         with pytest.raises(ValueError, match="actor"):
             replace(base, actor=actor)
     with pytest.raises(ValueError, match="actor"):
-        replace(base, actor="admin:" + "x" * 59)
+        replace(base, actor="admin:" + "x" * 33)
     with pytest.raises(TypeError, match="actor"):
         changed(base, actor=None)
-    for actor in ("agent", "admin:ops", "admin:ops.lead-2:x_y", "admin:" + "x" * 58):
+    for actor in ("agent", "admin:ops", "admin:ops.lead-2", "admin:" + "x" * 32):
         assert replace(base, actor=actor).actor == actor
+
+
+# Literal rows: what each kind of identifier refuses, and one real example it accepts.
+NOT_IDENTIFIERS = [
+    ssn_shaped(),
+    "".join(["9" * 3, "8" * 2, "7" * 4]),  # nine digits
+    "2026-11-24",
+    "5552013344",
+    "555-201-3344",
+    "mary_ann_lee",
+]
+
+
+def test_identifiers_must_fit_their_declared_pattern(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = call_started()
+    real_call_id = uuid.uuid4().hex
+    kinds: list[tuple[str, dict[str, Any], str]] = [
+        ("call_id", {}, real_call_id),
+        ("resource_id", {"resource_type": ResourceType.CALL}, real_call_id),
+        ("resource_id", {"resource_type": log.ResourceType.PATIENT}, "P001"),
+        ("resource_id", {"resource_type": log.ResourceType.APPOINTMENT}, "42"),
+        ("resource_id", {"resource_type": log.ResourceType.MEDICATION}, "12345678"),
+        ("resource_id", {"resource_type": log.ResourceType.SLOT}, "7"),
+    ]
+    for field, context, example in kinds:
+        assert getattr(changed(base, **context, **{field: example}), field) == example
+        for value in NOT_IDENTIFIERS:
+            with pytest.raises(ValueError) as excinfo:
+                changed(base, **context, **{field: value})
+            assert field in str(excinfo.value)
+            assert value not in str(excinfo.value), (field, context, value)
+    for value in ("123456789", "P0001234567", "0", "042", "p001"):
+        with pytest.raises(ValueError):
+            changed(base, resource_type=log.ResourceType.MEDICATION, resource_id=value)
+        with pytest.raises(ValueError):
+            changed(base, resource_type=log.ResourceType.PATIENT, resource_id=value)
+
+    # An admin is named, not described: no digits first, no underscores, no SSN or phone.
+    assert replace(base, actor="admin:mlee").actor == "admin:mlee"
+    for value in NOT_IDENTIFIERS:
+        with pytest.raises(ValueError, match="actor"):
+            replace(base, actor=f"admin:{value}")
+
+    # A resource type without a declared pattern cannot be used.
+    patterns = dict(log.ID_PATTERNS)
+    del patterns[log.ResourceType.SLOT]
+    monkeypatch.setattr(log, "ID_PATTERNS", patterns)
+    with pytest.raises(ValueError, match="resource_type"):
+        changed(base, resource_type=log.ResourceType.SLOT, resource_id="7")
+    assert set(log.ResourceType) - set(patterns) == {log.ResourceType.SLOT}
 
 
 def valid_row(seq: int) -> dict[str, Any]:
@@ -748,12 +1134,12 @@ def valid_row(seq: int) -> dict[str, Any]:
 
 
 def test_database_rejects_free_text(sync_engine: Engine) -> None:
-    seq = 0
+    # Every row is placed at the next position (all MACs zero), so the CHECKs decide.
+    accepted = 0
     for column in TEXT_COLUMNS:
         for value in FREE_TEXT:
-            seq += 1
             with pytest.raises(IntegrityError) as excinfo, sync_engine.begin() as connection:
-                connection.execute(INSERT_ROW, {**valid_row(seq), column: value})
+                connection.execute(INSERT_ROW, {**valid_row(accepted + 1), column: value})
             refusal = excinfo.value.orig
             assert isinstance(refusal, errors.CheckViolation), (column, value)
             assert refusal.diag.constraint_name == f"ck_audit_events_{column}", (column, value)
@@ -761,9 +1147,9 @@ def test_database_rejects_free_text(sync_engine: Engine) -> None:
                 assert value not in str(excinfo.value)
 
         # The longest allowed value, every allowed character, is accepted.
-        seq += 1
+        accepted += 1
         with sync_engine.begin() as connection:
-            connection.execute(INSERT_ROW, {**valid_row(seq), column: "Az09_-:." + "x" * 56})
+            connection.execute(INSERT_ROW, {**valid_row(accepted), column: "Az09_-:." + "x" * 56})
 
     with sync_engine.connect() as connection:
         assert connection.execute(COUNT).scalar_one() == len(TEXT_COLUMNS)
@@ -796,12 +1182,19 @@ def test_only_registry_members_are_accepted() -> None:
 
     # This slice's members, each a valid stored value.
     assert {member.value for member in Action} == {"call_started", "call_ended"}
-    assert {member.value for member in ResourceType} == {"call"}
+    assert {member.value for member in ResourceType} == {
+        "call",
+        "patient",
+        "appointment",
+        "medication",
+        "slot",
+    }
     assert {member.value for member in Outcome} == {"success", "failure"}
     assert {member.value for member in Reason} == {"caller_hung_up"}
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:
             assert re.fullmatch("[a-z0-9_]{1,64}", member.value)
+    assert set(log.ID_PATTERNS) == set(ResourceType)
 
 
 async def test_naive_timestamp_is_rejected(audit: AuditLog, session: AsyncSession) -> None:
@@ -819,20 +1212,22 @@ async def test_naive_timestamp_is_rejected(audit: AuditLog, session: AsyncSessio
 # --- R13 to R15: the MAC and the canonical form -------------------------------------------
 
 FAKE_KEY = "-".join(["fake", "audit", "key"] * 3)
+KNOWN_CALL_ID = "".join(["3f8e2a1c", "9b7d4e6f", "8a1b2c3d", "4e5f6a7b"])
 
 # Computed with openssl, not with the code under test (Git Bash or any POSIX shell). E1 and E2
 # are the two events' canonical forms; each MAC is one command, over prev_mac then the form:
 #   K=fake-audit-key-fake-audit-key-fake-audit-key; Z=$(printf '%064d' 0); V=16:sunrise-audit-v1
+#   C=<KNOWN_CALL_ID>
 #   E1="${V}1:127:2026-11-24T15:30:00.000001Z-5:agent12:call_started4:call-7:success-64:${Z}"
 #   A=$(printf '%s' "$Z$E1" | openssl dgst -sha256 -hmac "$K" | cut -d' ' -f2)
-#   E2="${V}1:227:2026-07-01T13:05:09.500000Z9:call-7f3a14:admin:ops.lead10:call_ended4:call"
-#   E2="${E2}9:call-7f3a7:failure14:caller_hung_up64:${A}"
+#   E2="${V}1:227:2026-07-01T13:05:09.500000Z32:${C}14:admin:ops.lead10:call_ended4:call"
+#   E2="${E2}32:${C}7:failure14:caller_hung_up64:${A}"
 #   B=$(printf '%s' "$A$E2" | openssl dgst -sha256 -hmac "$K" | cut -d' ' -f2)
 KNOWN_MAC_1 = "".join(
     "98091bc7 666c5dff 1b9b4e9f 073b8b66 621db182 cb347e1e f469dfb2 0c3f2b83".split()
 )
 KNOWN_MAC_2 = "".join(
-    "991e079d 75a78ba9 f180eb7c 24873962 019a74f7 f008766b 6a06ebf1 9047f4a0".split()
+    "b56d5b90 2d450025 ac34f8c9 e41b0dd8 e73b5032 6a4be49e f1a31e5e fac4a5bb".split()
 )
 
 
@@ -849,8 +1244,8 @@ async def test_mac_matches_known_vector(session: AsyncSession) -> None:
         action=Action.CALL_ENDED,
         resource_type=ResourceType.CALL,
         outcome=Outcome.FAILURE,
-        call_id="call-7f3a",
-        resource_id="call-7f3a",
+        call_id=KNOWN_CALL_ID,
+        resource_id=KNOWN_CALL_ID,
         reason=Reason.CALLER_HUNG_UP,
     )
 

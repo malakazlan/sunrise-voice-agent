@@ -192,7 +192,8 @@ def test_raw_driver_connections_only_in_allowed_modules() -> None:
 # app/audit/ is the only code that writes or verifies the audit log. Everywhere else under app/
 # the model may not be named and the table's name may not appear in a string (SQL text, a
 # metadata lookup). The model's own definition and the migrations that create the table are
-# the only other places that name them.
+# the only other places that name them. Like the trigger scan below, this is a lint against
+# accidents: a name assembled at runtime gets past it. The control is the database role.
 AUDIT_MODEL = "AuditEvent"
 AUDIT_TABLE = "audit_events"
 AUDIT_PACKAGE = "app/audit/"
@@ -246,9 +247,10 @@ def test_audit_table_is_written_only_by_the_audit_module() -> None:
     assert outside == set()
 
 
-# The two ways to switch off a table's triggers. Only the tamper fixture in tests/conftest.py
-# may use the first; nothing may use the second. The names are assembled here so that this file
-# does not match its own scan.
+# Two ways to switch off a table's triggers by name. Only the tamper fixture in tests/conftest.py
+# may use the first; nothing may use the second. A lint against accidents, not a control: the
+# table's owner can still drop the triggers, and a string assembled at runtime is not seen. The
+# names are assembled here so that this file does not match its own scan.
 TRIGGER_BYPASS = re.compile(
     "session_" + "replication_role" + r"|disable\s+" + "trigger", re.IGNORECASE
 )

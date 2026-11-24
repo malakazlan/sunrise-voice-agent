@@ -145,10 +145,14 @@ def test_migration_matches_models(
         ("audit_events", "audit_events_refuse_update", "O"),
         ("audit_events", "audit_events_refuse_delete", "O"),
         ("audit_events", "audit_events_refuse_truncate", "O"),
+        ("audit_events", "audit_events_check_position", "O"),
     }
     assert migrated_triggers == definitions(from_models, TRIGGER_DEFINITIONS)
     migrated_functions = definitions(migrated, FUNCTION_DEFINITIONS)
-    assert {name for name, _ in migrated_functions} == {"audit_events_refuse_change"}
+    assert {name for name, _ in migrated_functions} == {
+        "audit_events_refuse_change",
+        "audit_events_check_position",
+    }
     assert migrated_functions == definitions(from_models, FUNCTION_DEFINITIONS)
     assert (
         "available_slots",
