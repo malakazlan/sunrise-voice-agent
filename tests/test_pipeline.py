@@ -28,7 +28,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
-from test_turn import ScriptedModel, deps_on, says
+from test_turn import deps_on
 
 import app.voice.pipeline
 import app.voice.transport
@@ -40,6 +40,7 @@ from app.db.session import create_database_engine
 from app.main import create_app
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import AgentProcessor, deepgram_stt, open_agent_call
+from evals.scripted import ScriptedModel, says
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
 CALL_ID = "0f1e2d3c4b5a46978a1b2c3d4e5f6a7b"
