@@ -105,6 +105,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Show the Docker and Compose versions
+        run: |
+          docker version --format 'Docker client {{.Client.Version}}, server {{.Server.Version}}'
+          docker compose version
       - name: Plant decoy env files that must not reach the image
         run: |
           printf 'DECOY=1\n' > app/.env
@@ -278,6 +282,17 @@ jobs:
         run: |
           . .github/ci-wait.sh
           compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # Compose may restart a container in place or recreate it (a new id) when the stack
+          # comes up again, depending on its version: containers are looked up by service
+          # every time, never kept across a restart.
+          inspect() {
+            id=$($compose ps -a -q "$1")
+            test -n "$id"
+            docker inspect --format "$2" "$id"
+          }
+          nanoseconds() {
+            date -d "$1" +%s%N
+          }
           snapshot() {
             bounded 30 "the role and privilege snapshot" $compose exec -T db \
               psql -U sunrise -d sunrise -tA \
@@ -288,29 +303,21 @@ jobs:
               -c "SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public'" \
               -c "SELECT datname, datacl FROM pg_database ORDER BY datname"
           }
-          setups() {
-            bounded 60 "the start-up service's logs" $compose logs --no-color startup \
-              > "$RUNNER_TEMP/startup-logs"
-            grep -c "runtime_role_ready created=$1" "$RUNNER_TEMP/startup-logs" || true
-          }
-          app=$($compose ps -q app)
-          startup=$($compose ps -a -q startup)
           snapshot > "$RUNNER_TEMP/privileges-before"
           cat "$RUNNER_TEMP/privileges-before"
           # The snapshot holds the role and its grants, so the comparisons below mean something.
           grep -qx 'sunrise_app|f|f|f|t|f|f' "$RUNNER_TEMP/privileges-before"
           grep -q '^audit_events|.*sunrise_app=ar/sunrise' "$RUNNER_TEMP/privileges-before"
-          test "$(setups True)" = 1
-          test "$(setups False)" = 0
+          setup_finished=$(inspect startup '{{.State.FinishedAt}}')
+          echo "start-up finished at $setup_finished"
 
           echo "--- the app container alone: no start-up run is needed"
-          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
-          startup_started=$(docker inspect --format '{{.State.StartedAt}}' "$startup")
+          app_started=$(inspect app '{{.State.StartedAt}}')
           bounded 120 "the app to restart" $compose restart app
           wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
-          test "$(docker inspect --format '{{.State.StartedAt}}' "$app")" != "$started"
-          test "$(docker inspect --format '{{.State.StartedAt}}' "$startup")" = "$startup_started"
-          test "$(setups False)" = 0
+          test "$(inspect app '{{.State.StartedAt}}')" != "$app_started"
+          # The start-up service did not run again: it last finished when it did before.
+          test "$(inspect startup '{{.State.FinishedAt}}')" = "$setup_finished"
           snapshot > "$RUNNER_TEMP/privileges-after-app"
           diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-app"
 
@@ -318,14 +325,25 @@ jobs:
           bounded 120 "the stack to stop" $compose stop
           bounded 300 "the stack to start again" $compose up -d
           wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
-          state=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")
-          echo "start-up service: $state"
+          # The start-up service (whichever container Compose now has for it) started and
+          # finished after the earlier run, with 0, and its log has this run's set-up, which
+          # found the role. Without a new run, none of this holds, restarted in place or not.
+          state=$(inspect startup '{{.State.Status}} {{.State.ExitCode}}')
+          started=$(inspect startup '{{.State.StartedAt}}')
+          finished=$(inspect startup '{{.State.FinishedAt}}')
+          echo "start-up service: $state, started $started, finished $finished"
           test "$state" = "exited 0"
-          test "$(setups True)" = 1
-          test "$(setups False)" = 1
-          finished=$(docker inspect --format '{{.State.FinishedAt}}' "$startup")
-          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
-          test "$(date -d "$started" +%s%N)" -gt "$(date -d "$finished" +%s%N)"
+          test "$(nanoseconds "$started")" -gt "$(nanoseconds "$setup_finished")"
+          test "$(nanoseconds "$finished")" -gt "$(nanoseconds "$started")"
+          id=$($compose ps -a -q startup)
+          bounded 60 "the start-up service's log" docker logs --since "$started" "$id" \
+            > "$RUNNER_TEMP/startup-log" 2>&1
+          grep runtime_role_ready "$RUNNER_TEMP/startup-log"
+          test "$(grep -c 'runtime_role_ready created=False' "$RUNNER_TEMP/startup-log")" = 1
+          # And the app was started after it had finished.
+          app_started=$(inspect app '{{.State.StartedAt}}')
+          echo "app started $app_started"
+          test "$(nanoseconds "$app_started")" -gt "$(nanoseconds "$finished")"
           snapshot > "$RUNNER_TEMP/privileges-after-stack"
           diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-stack"
       - name: The db container holds only the database variables
