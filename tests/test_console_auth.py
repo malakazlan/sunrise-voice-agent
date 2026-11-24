@@ -130,8 +130,8 @@ def test_every_page_needs_a_session(database: StartupSettings, owner_engine: Eng
         token = form_token(page)
         assert client.post("/admin/logout", data={"token": token}).status_code == 303
         idle = fresh_sign_in(client)
+        # Expired by the clock alone: no sign-in after it, which would clear the table of it.
         clock.now += console_sessions.IDLE_SECONDS
-        fresh_sign_in(client)
         written = events(owner_engine)
 
         cases: dict[str, str | None] = {
