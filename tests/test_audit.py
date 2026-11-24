@@ -620,16 +620,21 @@ async def test_verify_reports_unreadable_rows_and_goes_on(
     audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # One batch: an edited row, a timestamp at infinity, one beyond the year 9999 that the
-    # driver can represent, then a genuine row. verify raises for none of them.
-    await append_all(audit, session, [*THREE, call_ended(cid(2))])
+    # driver can represent, a MAC made null by the owner, then a genuine row whose link to
+    # that null MAC fails. verify raises for none of them.
+    await append_all(audit, session, [*THREE, call_ended(cid(2)), call_started(cid(3))])
     tamper_with_audit_events(
         sync_engine,
         "UPDATE audit_events SET outcome = 'failure' WHERE seq = 1",
         "UPDATE audit_events SET ts = 'infinity' WHERE seq = 2",
         "UPDATE audit_events SET ts = '20000-01-01 00:00:00+00' WHERE seq = 3",
+        "ALTER TABLE audit_events ALTER COLUMN mac DROP NOT NULL",
+        "UPDATE audit_events SET mac = NULL WHERE seq = 4",
     )
 
-    assert await verified(audit, session) == broken(4, (1, MAC), (2, UNREADABLE), (3, UNREADABLE))
+    assert await verified(audit, session) == broken(
+        5, (1, MAC), (2, UNREADABLE), (3, UNREADABLE), (4, UNREADABLE), (5, PREV)
+    )
 
 
 # --- R6: concurrency ----------------------------------------------------------------------
