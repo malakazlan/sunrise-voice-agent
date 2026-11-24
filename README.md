@@ -277,8 +277,9 @@ A generated slot never replaces an existing slot at the same doctor and time.
 
 ### Call state and the tool gate
 
-The tools registered so far are the two of identity verification and the five serving tools
-(below); nothing wires dispatch to the model yet.
+The tools registered so far are the two of identity verification, the five serving tools and
+the four ways a call ends, with the code-only hand-off (below); nothing wires dispatch to the
+model yet.
 
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
@@ -296,8 +297,8 @@ The tools registered so far are the two of identity verification and the five se
   against the model and the caller; code that deliberately bypasses validation
   (`model_construct`, `object.__setattr__`) can still forge a state.
 - `app/agent/tool_registry.py`: a tool is declared once (name, argument model, handler,
-  whether it touches patient data, its phases, whether it needs the office open, whether it
-  writes, whether the model may call it, whether it may verify the caller, whether it takes
+  whether it touches patient data, its phases while the office is open and its phases while it
+  is closed (none for a tool that needs the office open), whether it writes, whether the model may call it, whether it may verify the caller, whether it takes
   an identity claim, its audit action, any other actions its events may carry with each one's
   fixed outcome, and its resource type). Registration
   refuses a declaration that breaks a rule: every field given and of the right kind, the
@@ -306,7 +307,8 @@ The tools registered so far are the two of identity verification and the five se
   or a record owner (`patient`, `patient_id`, `ssn`, `dob` and the like), by field name,
   alias or any validation alias (each choice, each step of a path), in nested models too;
   every argument model, nested ones included, forbids unknown fields; no argument takes free
-  keys (a mapping), `Any` or `object`; a patient-data tool only in `serving` and `booking`; a
+  keys (a mapping), `Any` or `object`; a patient-data tool only in `serving` and `booking`,
+  and never with the office closed; a
   writing tool the model can call has `confirmed: bool = False` among its arguments (a
   code-only tool is never called on the model's word); a tool that may verify is not a
   patient-data tool, is in `intake` only, is code-only, and there is at most one; a tool that
@@ -324,9 +326,9 @@ The tools registered so far are the two of identity verification and the five se
   refuses any tool that grant was not registered with. The grant is an object held by the code
   that calls the tool, never anything the model sends. The gate below applies to both.
 - The gate: no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
-  `ended`; a tool only in its declared phases; an office-hours tool only while the office is
-  open; a patient-data tool only for a verified caller with a patient id, while the office is
-  open. Since such a tool can only be declared for `serving` and `booking`, it is never
+  `ended`; a tool only in the phases it declares for the office's state, open or closed (the
+  state's `office_open`, decided when the call starts); a patient-data tool only for a verified
+  caller with a patient id, while the office is open. Since such a tool can only be declared for `serving` and `booking`, it is never
   offered anywhere else.
 - `dispatch` is the only caller of a handler. It refuses a tool name that is not a registered
   one (or not text), a tool the gate does not allow, arguments larger than 16 KiB as JSON (or
@@ -491,6 +493,80 @@ name, message text, balance or status reaches the audit log or the logs.
     such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
     four five six seven eight nine`) is not masked.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
+
+### Messages, transfer, emergency and the end of the call
+
+The four ways a call ends or leaves the agent, in `app/agent/endings.py`, and the call's start
+and end. With the office closed the model is offered exactly `take_message`,
+`report_emergency` and `close_call`, in `intake`, and nothing else anywhere: each tool
+declares its closed-office phases, and every other tool declares none.
+
+- `take_message(name, callback_number, reason_short, confirmed)`: in `intake` with the office
+  closed, and in `serving`. The name is 1 to 80 characters and the reason 1 to 120, each
+  trimmed, with no control character, SSNs masked and the bound checked after masking; the
+  number is exactly ten digits once spaces, hyphens, dots and brackets are taken out, and is
+  stored as those digits (staff call back). Without `confirmed: true`: `needs_confirmation`
+  with the three to read back, nothing written. Confirmed: a `messages` row (kind `callback`,
+  `after_hours` when the office was closed at the start of the call, the state's patient id
+  for a verified caller and none otherwise) and a `requests` row (type `callback`, the reason).
+  It never reads `patients`. With the office closed the call then moves to `closing` and the
+  outcome names `after_hours_close`, with the name and `day` or `night` (before or from 5 PM
+  clinic time) as its script values.
+- `transfer_to_staff(reason, confirmed)`: in `intake`, `serving` and `booking`, office open
+  only. The reason is one of `caller_request`, `frustration`, `verification_locked` (the
+  caller accepts the transfer the locked line offers) and `other`. Confirmed: a `requests` row
+  (type `transfer`, the reason), the call moves to `handoff` and the outcome names `transfer`.
+- `report_emergency()`: in every phase that has tools, open or closed. The call moves to
+  `emergency` and the outcome names `emergency`. After that no tool runs, a second report
+  included, and the only move left is to `ended`.
+- `close_call()`: in `intake`, `serving` and `booking` (`intake` only when closed). The call
+  moves to `closing`, which ends any identity claim and SSN step, and the outcome names
+  `goodbye`.
+- `call_tool(state, name, args, deps)` in `app/agent/tools.py` is the model's tool call as the
+  pipeline is to make it: dispatch, then code's part. When an outcome asks for a hand-off (two
+  failures, five refusals), code runs the code-only `hand_off_to_staff` with the office open
+  (a `transfer` request, reason `verification_locked` for a locked call and `other`
+  otherwise); with the office closed the call stays where it is and the outcome names
+  `guard_fallback`, which offers the message. A call already in `closing`, `emergency` or
+  `handoff` is left to go.
+- `emergency(state, trigger, deps)`: the input guard's emergency, applied by code. Every live
+  phase moves to `emergency` and the line is `emergency`; the event is `emergency_detected`
+  with reason `guard`, as the tool's has `model`.
+- `start_call(call_id, deps)`: the call's first state, `office_open` from the call's clock,
+  and its first line, `greeting` or `closed`; it writes `call_started`.
+- `end_call(state, reason, deps)`: the one way a call ends. `completed` from `closing`,
+  `emergency` from `emergency`, `transferred` from `handoff`; `caller_hung_up`,
+  `idle_timeout`, `max_duration` and `error` from any live phase. Anything else is refused,
+  and a reason is a member of the audit registry's `Reason`, never text. It writes
+  `call_ended` with the reason once per call, however many times it is called.
+- Every tool call's work, state change and event commit together, as for every tool. The
+  call's own events (`call_started`, `call_ended`, `emergency_detected` from the guard) are
+  written in their own transaction within 2 seconds; one that fails or runs out of time is
+  logged (`call_audit_failed`) and nothing else changes: the 911 line never depends on the
+  database. When dispatch cannot carry out `report_emergency`, `call_tool` moves the call and
+  names the line all the same.
+- Events: `message_taken`, `message_previewed`, `transfer_requested` (with its reason),
+  `transfer_previewed`, `emergency_detected` (`guard` or `model`), `call_closed`,
+  `call_started`, `call_ended` (with its reason), each on resource type `call` with the call
+  id. No name, number or message text reaches an event or a log line.
+- Schema: `messages.after_hours` (false by default), the message kind `callback`, and the
+  request types `callback` and `transfer`.
+
+Limits, stated plainly:
+
+- The transfer is simulated. There is no phone system behind it: the request row and the
+  event are real, and a real deployment would dial the staff where the call moves to
+  `handoff`.
+- A transfer the model asks for needs `confirmed: true` like any other write the model asks
+  for; the code-only hand-off does not.
+- `end_call` writes `call_ended` only for a call `start_call` started in the same process; the
+  calls started and not yet ended are held in memory, so a restart forgets them.
+- With the database not answering, `report_emergency` through `call_tool` waits for dispatch
+  to fail (up to its connect and statement limits) before it moves the call; the input guard's
+  emergency waits at most the 2 seconds of its event's write.
+- `part_of_day` is `day` for any time before 5 PM clinic time, the small hours included.
+- Nothing calls `start_call`, `end_call`, `emergency` or `call_tool` yet; the voice pipeline
+  will, with the idle and maximum-duration timers.
 
 ## Configuration
 

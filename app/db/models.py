@@ -38,8 +38,8 @@ NAMING_CONVENTION = {
 
 SLOT_SOURCES = ("task", "generated")
 SCHEDULED = "scheduled"
-REQUEST_TYPES = ("refill", "doctor_message")
-MESSAGE_KINDS = ("doctor_message",)
+REQUEST_TYPES = ("refill", "doctor_message", "callback", "transfer")
+MESSAGE_KINDS = ("doctor_message", "callback")
 MAX_REQUEST_SUMMARY = 200
 MAX_MESSAGE_BODY = 120
 
@@ -151,7 +151,7 @@ class Request(Base):
 
 class Message(Base):
     """A message a caller left for the clinic. The body is the caller's text. A call leaves
-    the same message once."""
+    the same message once. `after_hours` says the office was closed when the call started."""
 
     __tablename__ = "messages"
     __table_args__ = (
@@ -167,6 +167,7 @@ class Message(Base):
     callback_number: Mapped[str | None]
     body: Mapped[str]
     kind: Mapped[str]
+    after_hours: Mapped[bool] = mapped_column(server_default=false())
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

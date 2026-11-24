@@ -23,6 +23,14 @@ def is_open(at: datetime) -> bool:
     return local.weekday() <= FRIDAY and OPENS <= local.time() < CLOSES
 
 
+def part_of_day(at: datetime) -> str:
+    """`day` before 17:00 in clinic time, `night` from then to midnight, for the after-hours
+    line's good-bye."""
+    if at.utcoffset() is None:
+        raise ValueError("part_of_day needs a timezone-aware datetime")
+    return "day" if at.astimezone(CLINIC_TZ).time() < CLOSES else "night"
+
+
 def clinic_now(settings: ClockSettings) -> datetime:
     """The current clinic time, or the configured simulated time in clinic time."""
     simulated = settings.simulated_now

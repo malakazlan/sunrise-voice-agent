@@ -126,8 +126,9 @@ def recording(
 
 
 def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
-    """A valid declaration: callable by the model, no patient data, every phase, no write,
-    audited as tool_called."""
+    """A valid declaration: callable by the model, no patient data, every phase, the same with
+    the office open or closed unless its closed phases are given, no write, audited as
+    tool_called."""
     values: dict[str, Any] = {
         "name": name,
         "arguments": NoArguments,
@@ -135,7 +136,6 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "model_callable": True,
         "phi": False,
         "phases": frozenset(Phase),
-        "office_open_only": False,
         "writes": False,
         "may_verify": False,
         "takes_identity_claim": False,
@@ -144,12 +144,18 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "resource_type": ResourceType.TOOL,
     }
     values.update(overrides)
+    values.setdefault("closed_phases", values["phases"])
     return Tool(**values)
 
 
 def phi_tool(name: str, handler: Handler) -> Tool:
     return declared(
-        name, handler, phi=True, phases=frozenset(PHI_PHASES), resource_type=ResourceType.PATIENT
+        name,
+        handler,
+        phi=True,
+        phases=frozenset(PHI_PHASES),
+        closed_phases=frozenset(),
+        resource_type=ResourceType.PATIENT,
     )
 
 
@@ -299,7 +305,10 @@ async def test_office_open_only_tools_need_the_office_open(
     desk: Calls = []
     registry = registry_of(
         declared(
-            "transfer_desk", recording(desk), phases=frozenset(LIVE_PHASES), office_open_only=True
+            "transfer_desk",
+            recording(desk),
+            phases=frozenset(LIVE_PHASES),
+            closed_phases=frozenset(),
         )
     )
     for state in every_combination(LIVE_PHASES):
@@ -314,6 +323,34 @@ async def test_office_open_only_tools_need_the_office_open(
     assert desk == []
     assert (await registry.dispatch(intake(), "transfer_desk", {}, deps))[1].status is Status.DONE
     assert len(desk) == 1
+
+
+async def test_closed_office_has_phases_of_its_own(deps: Deps, owner_engine: Engine) -> None:
+    # A tool declared for serving with the office open and for intake with it closed.
+    notes: Calls = []
+    registry = registry_of(
+        declared(
+            "leave_note",
+            recording(notes),
+            phases=frozenset({SERVING}),
+            closed_phases=frozenset({INTAKE}),
+        )
+    )
+    offered_in = {
+        (state.phase, state.office_open)
+        for state in every_combination()
+        if names(registry, state) == ["leave_note"]
+    }
+    assert offered_in == {(SERVING, True), (INTAKE, False)}
+    for state in (intake(), forced(SERVING, verified=False, office_open=False)):
+        assert await registry.dispatch(state, "leave_note", {}, deps) == (
+            after_refusal(state),
+            REFUSED,
+        )
+    assert notes == []
+    for state in (intake(office_open=False), verified_serving()):
+        assert (await registry.dispatch(state, "leave_note", {}, deps))[1].status is Status.DONE
+    assert len(notes) == 2
 
 
 async def test_no_tools_in_terminal_phases(deps: Deps, owner_engine: Engine) -> None:
@@ -645,7 +682,7 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "model_callable": True,
         "phi": True,
         "phases": frozenset(PHI_PHASES),
-        "office_open_only": True,
+        "closed_phases": frozenset(),
         "writes": False,
         "may_verify": False,
         "takes_identity_claim": False,
@@ -762,7 +799,7 @@ def test_registration_rules() -> None:
                 "phases",
                 "writes",
                 "audit_action",
-                "office_open_only",
+                "closed_phases",
                 "may_verify",
                 "resource_type",
                 "arguments",
@@ -812,6 +849,13 @@ def test_registration_rules() -> None:
             ("phi", Tool(**valid(phases=frozenset({SERVING, phase}))))
             for phase in (INTAKE, *NO_TOOL_PHASES)
         ],
+        # A phi tool runs only while the office is open.
+        *[
+            ("phi", Tool(**valid(closed_phases=frozenset(phases))))
+            for phases in ({SERVING}, {BOOKING}, {INTAKE}, set(Phase))
+        ],
+        ("declare", Tool.model_construct(**valid(closed_phases={INTAKE}))),
+        ("declare", Tool.model_construct(**valid(closed_phases=frozenset({"intake"})))),
         # A writing tool's arguments carry `confirmed: bool = False`.
         ("confirmed", Tool(**valid(writes=True))),
         *[
@@ -880,7 +924,7 @@ def test_registration_rules() -> None:
                 {"phi": True},
                 {"phases": frozenset({INTAKE, SERVING})},
                 {"phases": frozenset({SERVING})},
-                {"office_open_only": False},
+                {"closed_phases": frozenset({INTAKE})},
                 {"model_callable": False},
                 {"may_verify": True},
             )
@@ -1007,7 +1051,7 @@ def gate_violations(registry: Registry) -> list[str]:
                 problems.append(f"claim: {where}")
             if state.phase in NO_TOOL_PHASES:
                 problems.append(f"no tools: {where}")
-            if state.phase not in item.phases:
+            if state.phase not in item.phases | item.closed_phases:
                 problems.append(f"undeclared phase: {where}")
             if item.phi and not (
                 state.verified
@@ -1018,8 +1062,10 @@ def gate_violations(registry: Registry) -> list[str]:
                 problems.append(f"phi: {where}")
             if item.may_verify and (item.phi or state.phase is not INTAKE):
                 problems.append(f"verifier: {where}")
-            if item.office_open_only and not state.office_open:
+            if not state.office_open and state.phase not in item.closed_phases:
                 problems.append(f"office closed: {where}")
+            if state.office_open and state.phase not in item.phases:
+                problems.append(f"office open: {where}")
     return problems
 
 
@@ -1045,6 +1091,7 @@ def test_application_registry_obeys_the_gate() -> None:
                     noop,
                     phi=True,
                     phases=frozenset({SERVING, phase}),
+                    closed_phases=frozenset(),
                     resource_type=ResourceType.PATIENT,
                 )
             )
@@ -1054,7 +1101,10 @@ def test_application_registry_obeys_the_gate() -> None:
     tools = [
         phi_tool("read_chart", noop),
         declared("office_info", noop),
-        declared("transfer_desk", noop, phases=frozenset({INTAKE}), office_open_only=True),
+        declared("transfer_desk", noop, phases=frozenset({INTAKE}), closed_phases=frozenset()),
+        declared(
+            "leave_note", noop, phases=frozenset({SERVING}), closed_phases=frozenset({INTAKE})
+        ),
         declared(
             "check_identity",
             noop,
@@ -1079,6 +1129,7 @@ def test_application_registry_obeys_the_gate() -> None:
         "undeclared phase",
         "phi",
         "office closed",
+        "office open",
         "verifier",
         "code only",
         "claim",

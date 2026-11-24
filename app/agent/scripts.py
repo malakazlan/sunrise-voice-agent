@@ -1,7 +1,9 @@
 """The fixed lines code speaks, each with an id and whether the caller may interrupt it.
 
 A tool outcome or a guard decision names a line by its id; the text is never the model's.
-`verified` carries the caller's first name in `{first_name}`.
+`verified` carries the caller's first name in `{first_name}`; `after_hours_close` the name the
+caller left in `{name}` and `day` or `night` in `{part_of_day}`, which the outcome that names it
+gives as its script values.
 """
 
 from dataclasses import dataclass
@@ -18,6 +20,10 @@ class ScriptId(StrEnum):
     VERIFY_FAIL = "verify_fail"
     VERIFY_LOCKED = "verify_locked"
     EMERGENCY = "emergency"
+    TRANSFER = "transfer"
+    GOODBYE = "goodbye"
+    AFTER_HOURS_CLOSE = "after_hours_close"
+    GUARD_FALLBACK = "guard_fallback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,22 @@ SCRIPTS = MappingProxyType(
             "If you're experiencing a medical emergency, please hang up and call 911 or go to"
             " the nearest emergency room right away.",
             interruptible=False,
+        ),
+        ScriptId.TRANSFER: Script(
+            "I'm transferring you to our staff now. Please hold.", interruptible=True
+        ),
+        ScriptId.GOODBYE: Script(
+            "Thank you for calling Sunrise Family Clinic. Goodbye.", interruptible=True
+        ),
+        ScriptId.AFTER_HOURS_CLOSE: Script(
+            "Thank you, {name}. Your message has been recorded, and our team will get back to"
+            " you on the next business day. If this is an emergency, please hang up and call"
+            " 911. Have a good {part_of_day}.",
+            interruptible=True,
+        ),
+        ScriptId.GUARD_FALLBACK: Script(
+            "I'm sorry, I can't help with that. I can take a message for our staff instead.",
+            interruptible=True,
         ),
     }
 )

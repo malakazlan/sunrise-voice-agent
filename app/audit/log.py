@@ -120,6 +120,12 @@ class Action(StrEnum):
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
+    MESSAGE_TAKEN = "message_taken"
+    MESSAGE_PREVIEWED = "message_previewed"
+    TRANSFER_REQUESTED = "transfer_requested"
+    TRANSFER_PREVIEWED = "transfer_previewed"
+    EMERGENCY_DETECTED = "emergency_detected"
+    CALL_CLOSED = "call_closed"
 
 
 class ResourceType(StrEnum):
@@ -149,7 +155,22 @@ class Outcome(StrEnum):
 
 
 class Reason(StrEnum):
+    # Why a call ended.
     CALLER_HUNG_UP = "caller_hung_up"
+    COMPLETED = "completed"
+    EMERGENCY = "emergency"
+    TRANSFERRED = "transferred"
+    IDLE_TIMEOUT = "idle_timeout"
+    MAX_DURATION = "max_duration"
+    ERROR = "error"
+    # What detected an emergency.
+    GUARD = "guard"
+    MODEL = "model"
+    # Why a call was transferred to the staff.
+    CALLER_REQUEST = "caller_request"
+    FRUSTRATION = "frustration"
+    VERIFICATION_LOCKED = "verification_locked"
+    OTHER = "other"
 
 
 def _check_member(name: str, value: object, registry: type[StrEnum]) -> None:

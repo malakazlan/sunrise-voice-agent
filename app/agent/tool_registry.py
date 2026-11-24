@@ -57,7 +57,7 @@ from app.agent.state import (
     count_refusal,
     count_tool_error,
 )
-from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, ResourceType
+from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.domain.clinic import CLINIC_TZ
 
 logger = logging.getLogger(__name__)
@@ -112,15 +112,18 @@ FAILED_MESSAGE = "That could not be done right now."
 
 class ToolResult(BaseModel):
     """What a handler returns: data for its caller, the transition it asks for, a line for code
-    to speak, the action of its event when the tool declares more than one, and, for a tool
-    whose resource type is neither `tool` nor `patient`, the id of the record it acted on."""
+    to speak and the values it is spoken with, the action of its event when the tool declares
+    more than one, the reason its event records, and, for a tool whose resource type is
+    neither `tool` nor `patient`, the id of the record it acted on."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     data: dict[str, Any] = {}
     transition: Move | Verify | IdentityClaim | FailedAttempt | EndClaim | None = None
     script: ScriptId | None = None
+    script_values: dict[str, str] = {}
     audit_action: Action | None = None
+    audit_reason: Reason | None = None
     resource_id: str | None = None
 
 
@@ -158,8 +161,10 @@ class Tool(BaseModel):
     # False for a tool only code calls, with the grant registered with it.
     model_callable: bool
     phi: bool
+    # The phases it runs in while the office is open, and while it is closed: none for a tool
+    # that runs only while it is open.
     phases: frozenset[Phase] = Field(min_length=1)
-    office_open_only: bool
+    closed_phases: frozenset[Phase]
     writes: bool
     # The one tool that may ask to verify the caller (a Verify transition).
     may_verify: bool
@@ -198,6 +203,7 @@ class ToolOutcome(BaseModel):
     data: dict[str, Any]
     hand_off: bool
     script: ScriptId | None = None
+    script_values: dict[str, str] = {}
 
 
 class Grant:
@@ -316,7 +322,7 @@ def check_declaration(tool: Tool) -> Tool:
     if declared.takes_identity_claim and (
         declared.phi
         or declared.phases != {Phase.INTAKE}
-        or not declared.office_open_only
+        or declared.closed_phases
         or not declared.model_callable
         or declared.may_verify
     ):
@@ -329,6 +335,8 @@ def check_declaration(tool: Tool) -> Tool:
 
     if declared.phi and not declared.phases <= PHI_PHASES:
         raise DeclarationError("a phi tool may list only the serving and booking phases")
+    if declared.phi and declared.closed_phases:
+        raise DeclarationError("a phi tool runs only while the office is open")
 
     if declared.may_verify and (
         declared.phi or declared.phases != {Phase.INTAKE} or declared.model_callable
@@ -358,9 +366,8 @@ def check_declaration(tool: Tool) -> Tool:
 
 def is_available(tool: Tool, state: CallState) -> bool:
     """The gate, for the model's calls and code's alike."""
-    if state.phase in NO_TOOL_PHASES or state.phase not in tool.phases:
-        return False
-    if tool.office_open_only and not state.office_open:
+    phases = tool.phases if state.office_open else tool.closed_phases
+    if state.phase in NO_TOOL_PHASES or state.phase not in phases:
         return False
     # A phi tool's phases are serving or booking only: registration refuses any other.
     if tool.phi and not (state.verified and state.patient_id is not None and state.office_open):
@@ -396,23 +403,20 @@ def _event(tool: Tool, result: ToolResult) -> tuple[Action, Outcome]:
     raise PermissionError("a handler names only an action its tool declares")
 
 
-def _outcome(
-    status: Status,
-    state: CallState,
-    data: dict[str, Any] | None = None,
-    script: ScriptId | None = None,
-) -> ToolOutcome:
+def _outcome(status: Status, state: CallState, result: ToolResult | None = None) -> ToolOutcome:
     message = {
         Status.DONE: None,
         Status.REFUSED: REFUSED_MESSAGE,
         Status.FAILED: FAILED_MESSAGE,
     }[status]
+    given = ToolResult() if result is None else result
     return ToolOutcome(
         status=status,
         message=message,
-        data={} if data is None else data,
+        data=given.data,
         hand_off=(state.tool_errors >= MAX_TOOL_ERRORS or state.tool_refusals >= MAX_TOOL_REFUSALS),
-        script=script,
+        script=given.script,
+        script_values=given.script_values,
     )
 
 
@@ -547,6 +551,7 @@ class Registry:
                             outcome=outcome,
                             call_id=state.call_id,
                             resource_id=resource_id,
+                            reason=result.audit_reason,
                         ),
                         now=deps.now(),
                     )
@@ -570,7 +575,7 @@ class Registry:
             await self._record(failed, Action.TOOL_FAILED, Outcome.FAILURE, tool.name, deps)
             return failed, _outcome(Status.FAILED, failed)
         logger.info("tool_called tool=%s call_id=%s", tool.name, state.call_id)
-        return after, _outcome(Status.DONE, after, result.data, result.script)
+        return after, _outcome(Status.DONE, after, result)
 
     async def _refuse(
         self, state: CallState, name: str | None, reason: str, deps: Deps

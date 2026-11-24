@@ -153,8 +153,34 @@ def test_migration_matches_models(
         ("messages", "uq_messages_call_id_kind_body", "UNIQUE (call_id, kind, body)"),
     } <= migrated_constraints
 
+    # The kinds of request and message, and whether a message was left after hours.
+    assert {
+        (
+            "requests",
+            "ck_requests_type",
+            "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'callback'::text,"
+            " 'transfer'::text])))",
+        ),
+        (
+            "messages",
+            "ck_messages_kind",
+            "CHECK ((kind = ANY (ARRAY['doctor_message'::text, 'callback'::text])))",
+        ),
+    } <= migrated_constraints
+
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 64
+    assert len(migrated_columns) == 65
+    assert (
+        "messages",
+        "after_hours",
+        "boolean",
+        None,
+        None,
+        None,
+        "NO",
+        "false",
+        "NO",
+    ) in migrated_columns
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
     # seq has no default: the app assigns it under the lock, never a sequence.

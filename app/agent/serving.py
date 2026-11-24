@@ -249,7 +249,7 @@ def _serving_tool(
         model_callable=True,
         phi=True,
         phases=frozenset({Phase.SERVING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=writes,
         may_verify=False,
         takes_identity_claim=False,

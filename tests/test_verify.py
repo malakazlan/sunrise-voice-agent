@@ -400,7 +400,12 @@ async def test_cross_call_lockout(deps: Deps, seeded: Engine, clock: Clock) -> N
 
 async def test_no_verification_when_closed(deps: Deps, seeded: Engine) -> None:
     closed = intake(office_open=False)
-    assert REGISTRY.tools_for(closed) == []
+    # Only the message, the emergency line and the goodbye: nothing that verifies.
+    assert [item.name for item in REGISTRY.tools_for(closed)] == [
+        "take_message",
+        "report_emergency",
+        "close_call",
+    ]
     after, outcome = await claim(closed, deps, *SARAH)
     assert (after, outcome) == (closed.model_copy(update={"tool_refusals": 1}), REFUSED)
     assert after.expecting_ssn4 is False

@@ -1379,6 +1379,12 @@ def test_only_registry_members_are_accepted() -> None:
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
+        "message_taken",
+        "message_previewed",
+        "transfer_requested",
+        "transfer_previewed",
+        "emergency_detected",
+        "call_closed",
     }
     assert {member.value for member in ResourceType} == {
         "call",
@@ -1389,7 +1395,21 @@ def test_only_registry_members_are_accepted() -> None:
         "tool",
     }
     assert {member.value for member in Outcome} == {"success", "failure", "refused"}
-    assert {member.value for member in Reason} == {"caller_hung_up"}
+    assert {member.value for member in Reason} == {
+        "caller_hung_up",
+        "completed",
+        "emergency",
+        "transferred",
+        "idle_timeout",
+        "max_duration",
+        "error",
+        "guard",
+        "model",
+        "caller_request",
+        "frustration",
+        "verification_locked",
+        "other",
+    }
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:
             assert re.fullmatch("[a-z0-9_]{1,64}", member.value)
