@@ -117,6 +117,9 @@ class Action(StrEnum):
     LAB_STATUS_READ = "lab_status_read"
     BALANCE_READ = "balance_read"
     DOCTOR_MESSAGE_SENT = "doctor_message_sent"
+    REFILL_PREVIEWED = "refill_previewed"
+    REFILL_NOT_FOUND = "refill_not_found"
+    DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
 
 
 class ResourceType(StrEnum):

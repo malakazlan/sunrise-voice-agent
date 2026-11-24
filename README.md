@@ -434,9 +434,12 @@ Limits, stated plainly:
 
 Five tools for a verified caller, in `app/agent/serving.py`, registered by `register_tools()`.
 Each is a patient-data tool offered only in `serving`, with the office open, and acts only on
-the state's patient id; none takes a patient identifier. Dispatch audits every call with the
-tool's own action (`appointment_read`, `refill_requested`, `lab_status_read`, `balance_read`,
-`doctor_message_sent`), resource type `patient` and the caller's patient id. No medication
+the state's patient id; none takes a patient identifier. Dispatch audits every call with
+resource type `patient`, the caller's patient id and an action that says what happened:
+`appointment_read`, `lab_status_read`, `balance_read`; for a refill `refill_requested` (the
+request row written, or already there for this call), `refill_previewed` (needs confirmation)
+or `refill_not_found` (outcome `refused`); for a message `doctor_message_sent` (written, or
+already there) or `doctor_message_previewed`. Every other outcome is `success`. No medication
 name, message text, balance or status reaches the audit log or the logs.
 
 - `get_next_appointment`: the caller's earliest `scheduled` appointment at or after the moment
@@ -470,9 +473,6 @@ name, message text, balance or status reaches the audit log or the logs.
     anything else in it are stored unmasked. The cue rule also masks an innocent number after
     such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
     four five six seven eight nine`) is not masked.
-  - The audit action names the tool, not what came of it: a `request_refill` that ends in
-    `needs_confirmation` or `not_found` is still recorded as `refill_requested`. The request
-    row is the record of what was asked for.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
 
 ## Configuration

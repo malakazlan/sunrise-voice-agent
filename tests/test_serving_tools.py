@@ -155,8 +155,8 @@ def message(body: str, confirmed: bool | None = None) -> dict[str, Any]:
     return arguments
 
 
-def event(action: str, state: CallState) -> tuple[Any, ...]:
-    return (action, "patient", state.patient_id, "success", state.call_id, "agent", None)
+def event(action: str, state: CallState, outcome: str = "success") -> tuple[Any, ...]:
+    return (action, "patient", state.patient_id, outcome, state.call_id, "agent", None)
 
 
 @pytest.fixture
@@ -841,10 +841,10 @@ async def test_audit_carries_no_text(
     assert stored == [
         event("appointment_read", state),
         event("refill_requested", state),
-        event("refill_requested", state),
+        event("refill_not_found", state, "refused"),
         event("lab_status_read", state),
         event("balance_read", state),
-        event("doctor_message_sent", state),
+        event("doctor_message_previewed", state),
         event("doctor_message_sent", state),
     ]
     secrets_said = (MARKER, "Lisinopril", "CVS", "45.00", SARAH_LABS, "December", "Patel")
@@ -919,3 +919,38 @@ async def test_request_columns_are_constrained(owner_engine: Engine, seeded: Non
         execute(owner_engine, insert_message, call_id=new_call_id())
     assert isinstance(excinfo.value.orig, errors.CheckViolation)
     assert excinfo.value.orig.diag.constraint_name == "ck_messages_kind"
+
+
+async def test_audit_says_what_happened(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    # Each path of the two writing tools, with the status it answers and the action and outcome
+    # its event records, written by hand.
+    state = sarah()
+    paths: list[tuple[str, dict[str, Any], str, str, str]] = [
+        (REFILL, refill("ibuprofen"), "not_found", "refill_not_found", "refused"),
+        (REFILL, refill("ibuprofen", True), "not_found", "refill_not_found", "refused"),
+        (REFILL, refill("lisinopril"), "needs_confirmation", "refill_previewed", "success"),
+        (REFILL, refill("lisinopril", False), "needs_confirmation", "refill_previewed", "success"),
+        (REFILL, refill("lisinopril", True), "requested", "refill_requested", "success"),
+        # The same request again in this call: the row already exists.
+        (REFILL, refill("lisinopril", True), "requested", "refill_requested", "success"),
+        (REFILL, refill("metformin", True), "sent_to_doctor", "refill_requested", "success"),
+        (MESSAGE, message("call me"), "needs_confirmation", "doctor_message_previewed", "success"),
+        (MESSAGE, message("call me", True), "sent", "doctor_message_sent", "success"),
+        # The same message again in this call: it already exists.
+        (MESSAGE, message("call me", True), "sent", "doctor_message_sent", "success"),
+    ]
+    for name, arguments, status, _action, _outcome in paths:
+        assert (await data_of(registry, deps, state, name, arguments))["status"] == status, (
+            name,
+            arguments,
+        )
+    assert rows(owner_engine, EVENTS) == [
+        event(action, state, outcome) for _name, _arguments, _status, action, outcome in paths
+    ]
+    assert [row[2:4] for row in rows(owner_engine, REQUESTS)] == [
+        ("refill", "Lisinopril 10mg at CVS Main St"),
+        ("refill", "Metformin 500mg at CVS Main St"),
+        ("doctor_message", "call me"),
+    ]
