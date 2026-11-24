@@ -3,13 +3,15 @@ HTTP Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is 
 
 Every successful read appends one audit event naming the admin, in the transaction that read
 the rows, and the rows leave only once that transaction has committed. Every text value from
-the database passes `mask` on its way out. Every response carries `Cache-Control: no-store`,
-errors included.
+the database passes `mask` on its way out, and a callback number shows only its last four
+digits, whatever its shape. Every response carries `Cache-Control: no-store`, errors included.
+One verification of the chain runs at a time.
 """
 
 import hashlib
 import hmac
 import logging
+import re
 from base64 import b64decode
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -44,6 +46,9 @@ SIGN_IN_FAILURES = 5
 SIGN_IN_WINDOW_SECONDS = 60
 MAX_TRACKED_ADDRESSES = 10_000
 CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
+# A verification asked for while another runs is refused; this is when to ask again.
+VERIFY_RETRY_SECONDS = 5
+DIGIT = re.compile(r"\d")
 
 REQUEST_COLUMNS = (
     models.Request.id,
@@ -135,6 +140,15 @@ def _masked(row: Mapping[str, Any]) -> dict[str, Any]:
         else:
             raise TypeError(f"{name} has a type the admin API does not show")
     return shown
+
+
+def _shown_callback(value: str | None) -> str | None:
+    """A callback number as `***-***-` and its last four digits, however it was written;
+    with fewer than four digits, nothing of it."""
+    if value is None:
+        return None
+    digits = DIGIT.findall(value)
+    return "***-***-" + ("".join(digits[-4:]) if len(digits) >= 4 else "****")
 
 
 async def _newest(
@@ -247,6 +261,8 @@ def build_admin_app(
         logger.info("admin_read action=%s", action.value)
         return result
 
+    verifying = False
+
     app = FastAPI(
         openapi_url=None,
         docs_url=None,
@@ -271,7 +287,12 @@ def build_admin_app(
             ResourceType.MESSAGE,
             lambda session: _newest(session, MESSAGE_COLUMNS, models.Message.id, page),
         )
-        return {"messages": [_masked(row) for row in rows]}
+        return {
+            "messages": [
+                {**_masked(row), "callback_number": _shown_callback(row["callback_number"])}
+                for row in rows
+            ]
+        }
 
     @app.get("/audit")
     async def read_audit(page: Annotated[AuditPage, Query()]) -> dict[str, Any]:
@@ -290,9 +311,23 @@ def build_admin_app(
 
     @app.get("/audit/verify")
     async def verify_audit(_query: Annotated[NoQuery, Query()]) -> dict[str, Any]:
-        verification = await read_and_audit(
-            Action.ADMIN_VERIFY_AUDIT, ResourceType.AUDIT_EVENT, audit.verify
-        )
+        # The whole chain is read, on the worker that carries the calls: one run at a time.
+        # The check and the claim have no await between them, so two requests cannot both pass.
+        nonlocal verifying
+        if verifying:
+            logger.warning("admin_verify_busy")
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="A verification is already running",
+                headers={"Retry-After": str(VERIFY_RETRY_SECONDS)},
+            )
+        verifying = True
+        try:
+            verification = await read_and_audit(
+                Action.ADMIN_VERIFY_AUDIT, ResourceType.AUDIT_EVENT, audit.verify
+            )
+        finally:
+            verifying = False
         return {
             "ok": verification.ok,
             "checked": verification.checked,

@@ -3,6 +3,7 @@ import asyncio
 import base64
 import logging
 import socket
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -19,7 +20,7 @@ from sqlalchemy import Engine, text
 from app import main as main_module
 from app.api import admin
 from app.audit import read as audit_read
-from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
+from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.config import Settings, StartupSettings
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.rate_limit import RateLimiter
@@ -494,7 +495,9 @@ def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: Startu
             seen: list[int] = []
             sizes: list[int] = []
             query = f"limit=50{extra}"
-            while True:
+            # Four pages hold the 120 rows and the empty end; a fifth means paging does not
+            # move on, and the test stops there instead of asking for ever.
+            for _ in range(5):
                 response = client.get(f"{route}?{query}", headers=SIGNED_IN)
                 assert response.status_code == 200, route
                 rows = response.json()[LISTS[route]]
@@ -766,3 +769,136 @@ def test_admin_shares_the_app_engine(
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert not built & {"create_database_engine", "create_session_factory", "AuditLog"}
+
+
+def call_ended(number: int) -> Event:
+    return Event(
+        actor="agent",
+        action=Action.CALL_ENDED,
+        resource_type=ResourceType.CALL,
+        outcome=Outcome.FAILURE,
+        call_id=cid(number),
+        resource_id=cid(number),
+        reason=Reason.CALLER_HUNG_UP,
+    )
+
+
+def test_admin_audit_filters(
+    admin_app: FastAPI, owner_engine: Engine, database: StartupSettings
+) -> None:
+    append_events(database, [call_started(1), call_started(2), call_ended(1), call_ended(2)])
+    rows = {
+        "call_id=" + cid(1): [3, 1],
+        "call_id=" + cid(2): [4, 2],
+        "action=call_ended": [4, 3],
+        "action=call_started&call_id=" + cid(2): [2],
+        "action=call_ended&call_id=" + cid(1): [3],
+        "call_id=" + cid(3): [],
+        "action=tool_called": [],
+    }
+    with client_from(admin_app) as client:
+        for query, seqs in rows.items():
+            response = client.get(f"/admin/api/audit?{query}", headers=SIGNED_IN)
+            assert response.status_code == 200, query
+            assert [event["seq"] for event in response.json()["events"]] == seqs, query
+        # The reads' own events carry no call id, and their own action.
+        reads = client.get("/admin/api/audit?action=admin_read_audit", headers=SIGNED_IN)
+    assert [event["seq"] for event in reads.json()["events"]] == list(range(11, 4, -1))
+
+
+def test_admin_verify_runs_one_at_a_time(
+    admin_app: FastAPI, owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    runs: list[int] = []
+    original = AuditLog.verify
+
+    async def held_verify(self: AuditLog, session: Any) -> Any:
+        runs.append(1)
+        entered.set()
+        await asyncio.to_thread(release.wait, 10)
+        return await original(self, session)
+
+    monkeypatch.setattr(AuditLog, "verify", held_verify)
+    with client_from(admin_app) as client:
+        first: list[Any] = []
+        worker = threading.Thread(
+            target=lambda: first.append(client.get("/admin/api/audit/verify", headers=SIGNED_IN))
+        )
+        worker.start()
+        assert entered.wait(10)
+        second = client.get("/admin/api/audit/verify", headers=SIGNED_IN)
+        release.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        # Once the first has finished, a new run is accepted.
+        third = client.get("/admin/api/audit/verify", headers=SIGNED_IN)
+
+    assert second.status_code == 429
+    assert second.json() == {"detail": "A verification is already running"}
+    assert second.headers["retry-after"] == "5"
+    assert second.headers["cache-control"] == "no-store"
+    assert first[0].status_code == 200
+    assert third.status_code == 200
+    assert len(runs) == 2
+    # The refused run did no work and left no event.
+    assert [row[1:] for row in events(owner_engine)] == [
+        admin_event("/admin/api/audit/verify"),
+        admin_event("/admin/api/audit/verify"),
+    ]
+
+
+def test_admin_callback_numbers_show_only_last_four(
+    admin_app: FastAPI, owner_engine: Engine
+) -> None:
+    shown = {
+        "555-201-3344": "***-***-3344",
+        "+44 20 7946 0958": "***-***-0958",
+        "555 201 33 44": "***-***-3344",
+        "201-3344": "***-***-3344",
+        "(555) 201-3344 ext 12": "***-***-4412",
+        "3344": "***-***-3344",
+        "344": "***-***-****",
+        "12": "***-***-****",
+        "no number": "***-***-****",
+    }
+    with owner_engine.begin() as connection:
+        for number, raw in enumerate([*shown, None], start=1):
+            connection.execute(
+                INSERT_MESSAGE,
+                {
+                    "id": number,
+                    "call_id": cid(number),
+                    "patient_id": None,
+                    "name": None,
+                    "callback_number": raw,
+                    "body": f"Message number {number}",
+                    "created_at": T0,
+                },
+            )
+    with client_from(admin_app) as client:
+        response = client.get("/admin/api/messages", headers=SIGNED_IN)
+    by_id = {row["id"]: row["callback_number"] for row in response.json()["messages"]}
+    assert by_id == {
+        **{number: masked for number, masked in enumerate(shown.values(), start=1)},
+        len(shown) + 1: None,
+    }
+    for raw in shown:
+        if len(raw) > 4:
+            assert raw not in response.text, raw
+
+
+def test_rate_limiter_keeps_an_address_that_failed_again() -> None:
+    now = [1000.0]
+    limiter = RateLimiter(limit=5, window_seconds=60, max_addresses=3, clock=lambda: now[0])
+    for address in ("a", "b", "c"):
+        limiter.record_failure(address)
+        now[0] += 1
+    # "a" failed first but fails again, so "b" is now the one that failed longest ago.
+    assert limiter.record_failure("a") == 2
+    limiter.record_failure("d")
+    assert limiter.tracked == 3
+    assert limiter.record_failure("a") == 3
+    # "b" was dropped: it starts again from one (and "c" makes room for it).
+    assert limiter.record_failure("b") == 1

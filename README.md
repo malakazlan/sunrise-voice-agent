@@ -576,24 +576,33 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
   the last id or seq of the page before. An unknown or repeated parameter, a value out of range
   or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
   route takes no parameters.
+- One verification runs at a time: another asked for meanwhile gets `429` with `Retry-After: 5`,
+  does no work and writes no event. It reads the whole chain, 1000 events a round trip, on the
+  one worker that also carries the calls, so on a large chain it costs that worker and the
+  database real time; run it when it is needed, not on a timer.
 - Every successful read appends one audit event (actor `admin:<ADMIN_USER>`, action
   `admin_read_requests`, `admin_read_messages`, `admin_read_audit` or `admin_verify_audit`,
   resource type `request`, `message` or `audit_event`, no resource id, outcome `success`) in
   the transaction that read the rows. If the event cannot be written the answer is `503` and
   no rows. A database that cannot be reached is `503` too, with no detail.
-- Every text value from the database passes the log masking (`mask`): a callback number shows
-  as `***-***-3344`, and SSNs, dates and email addresses in a summary or body are hidden.
-  Patient ids and call ids come out as stored. Timestamps are ISO 8601.
+- Every text value from the database passes the log masking (`mask`): SSNs, dates and email
+  addresses in a summary or body are hidden. Patient ids and call ids come out as stored.
+  Timestamps are ISO 8601.
+- A callback number shows as `***-***-` and its last four digits, whatever its shape
+  (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
+  `***-***-****`.
 - Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
   in the API schema, and `/docs` stays off outside dev.
 - The runtime role needs no new privilege: it already reads these tables and appends events.
 - Limits:
   - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
-    sign-in limit is shared by everyone: five wrong passwords from anyone delay the real admin
-    for up to a minute. That is a delay, not a way in; the password's strength is the real
-    control. Trusting the proxy's forwarded address is left to the deploy set-up. The limit
-    is held in memory, so a restart clears it, and it keeps at most 10,000 addresses, dropping
-    the one that failed longest ago.
+    sign-in limit is shared by everyone. Refused requests are not counted, so each failure
+    ages out after a minute and is replaced by the next: one wrong password every 12 seconds,
+    from anyone, keeps the admin locked out for as long as it goes on. A sustained lockout
+    costs an attacker five requests a minute. It delays the admin; it is not a way in, and the
+    password's strength is the real control. Trusting the proxy's forwarded address is left to
+    the deploy set-up. The limit is held in memory, so a restart clears it, and it keeps at
+    most 10,000 addresses, dropping the one that failed longest ago.
   - A real console would reveal a callback number only on an explicit, audited action; this
     API never reveals one, it shows the masked form with the last four digits.
   - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
