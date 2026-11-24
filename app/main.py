@@ -26,6 +26,8 @@ from app.domain.office_hours import clinic_now
 from app.guard.logging import configure_logging
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import END_GRACE_SECONDS, open_agent_call
+from app.voice.speech_check import SpeechCheck
+from app.voice.vocabulary import Vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,14 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     engine = create_database_engine(settings)
     deps = build_deps(settings, engine)
     model = anthropic_model(settings)
+    vocabulary = Vocabulary()
+    speech_check = SpeechCheck(settings)
     # Every call's turn rows, written in the background with the call's clock.
     turns = TurnRecorder(deps.sessions, deps.now)
     if open_call is None:
-        open_call = partial(open_agent_call, settings, deps, model, turns=turns)
+        open_call = partial(
+            open_agent_call, settings, deps, model, vocabulary, speech_check, turns=turns
+        )
     # A call says goodbye and ends itself at MAX_CALL_SECONDS; the registry stops one that has
     # not, END_GRACE_SECONDS later.
     calls = CallRegistry(
@@ -66,8 +72,11 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # Speech-to-text's hints, read once before the first call.
+        await vocabulary.load(deps.sessions)
         yield
         await calls.close()
+        await speech_check.drain()
         # The call events and guard blocks still being written (each bounded) end before the
         # engine goes.
         await drain_call_events()
@@ -89,6 +98,7 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     )
     app.state.calls = calls
     app.state.deps = deps
+    app.state.vocabulary = vocabulary
     app.state.turns = turns
 
     @app.get("/health")

@@ -187,6 +187,10 @@ def now() -> datetime:
     return T0
 
 
+def never_refused() -> None:
+    """Speech out here is the fake's, which never refuses to speak."""
+
+
 def adapter(agent: Says, turns: TurnRecorder, time_: FakeTime) -> tuple[AgentProcessor, Playback]:
     async def start() -> tuple[Says, Line]:
         return agent, Line(id=0, text="Hello.", script=ScriptId.GREETING)
@@ -199,6 +203,7 @@ def adapter(agent: Says, turns: TurnRecorder, time_: FakeTime) -> tuple[AgentPro
         idle_seconds=30,
         max_seconds=600,
         vad_stop_seconds=0.5,
+        speech_refused=never_refused,
         clock=time_.clock,
         sleep=time_.sleep,
         turns=turns,

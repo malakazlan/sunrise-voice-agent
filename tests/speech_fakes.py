@@ -25,7 +25,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineWorker
+from pipecat.pipeline.worker import PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import QueuedFrameProcessor
 from pipecat.utils.text.base_text_aggregator import TextType
@@ -187,8 +187,13 @@ class CallPipeline:
         pipeline = Pipeline(
             [source, CallerGate(playback), processor, voice, PlayoutTracker(playback), sink]
         )
+        # As a call's worker: a processor that can no longer work ends the pipeline.
         self.worker = PipelineWorker(
-            pipeline, cancel_on_idle_timeout=False, enable_rtvi=False, idle_timeout_secs=None
+            pipeline,
+            cancel_on_idle_timeout=False,
+            enable_rtvi=False,
+            idle_timeout_secs=None,
+            processor_unusable_policy=ProcessorUnusablePolicy.END,
         )
         self._runner = WorkerRunner(handle_sigint=False)
         self._started = asyncio.Event()
@@ -250,7 +255,8 @@ def agent_call(
     turns: TurnRecorder | None = None,
 ) -> tuple[AgentProcessor, Playback]:
     """The voice adapter of a call whose agent is the real one, its timers on `time`; its turn
-    rows go to `turns`, if given."""
+    rows go to `turns`, if given. Speech out is the fake's, which ElevenLabs never refuses:
+    nothing is checked."""
     playback = Playback()
     processor = AgentProcessor(
         call_id,
@@ -259,11 +265,16 @@ def agent_call(
         idle_seconds=idle_seconds,
         max_seconds=max_seconds,
         vad_stop_seconds=0.5,
+        speech_refused=_never_checked,
         clock=time.clock,
         sleep=time.sleep,
         turns=turns,
     )
     return processor, playback
+
+
+def _never_checked() -> None:
+    raise AssertionError("speech out was not refused")
 
 
 def caller_says(text: str) -> list[Frame]:
