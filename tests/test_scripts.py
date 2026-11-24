@@ -41,6 +41,12 @@ LINES = [
         " nearest emergency room right away.",
         False,
     ),
+    (
+        "booking_instructions",
+        "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
+        " receive a confirmation by email.",
+        True,
+    ),
 ]
 
 

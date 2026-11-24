@@ -1,11 +1,14 @@
 from datetime import date, datetime
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 CLINIC_TZ = ZoneInfo("America/New_York")
 
-DR_PATEL = "Dr. Patel"
-DR_LEE = "Dr. Lee"
-DOCTORS = (DR_PATEL, DR_LEE)
+# The clinic's doctors: the only names a slot, an appointment or a tool argument may carry.
+Doctor = Literal["Dr. Patel", "Dr. Lee"]
+DR_PATEL: Doctor = "Dr. Patel"
+DR_LEE: Doctor = "Dr. Lee"
+DOCTORS: tuple[Doctor, ...] = (DR_PATEL, DR_LEE)
 
 
 def clinic_date(instant: datetime) -> date:

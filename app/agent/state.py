@@ -14,6 +14,12 @@ claim ends with `verify` or a failed attempt, or with any phase change. The SSN 
 (`pending_ssn4`, `verified_ssn4`) are excluded from every dump and from the text form, by their
 declaration; validation errors never show input.
 
+A new patient's call is the intake -> booking move: `is_new_patient` is set and the call can
+never be verified. Its details (`new_patient_details`, the draft) are stored by `collect`, in
+booking only, and are hidden like the SSN digits. `offer` remembers the slots a caller was
+offered (`offered_slots`): a verified caller in serving or booking, or a new patient with the
+details. Every phase change ends the draft and the offered slots.
+
 These rules protect against the model and the caller. Code that deliberately bypasses
 validation (`model_construct`, `object.__setattr__`) can still forge a state.
 """
@@ -43,6 +49,25 @@ class Phase(StrEnum):
 VERIFIED_PHASES = frozenset(
     {Phase.SERVING, Phase.BOOKING, Phase.EMERGENCY, Phase.HANDOFF, Phase.CLOSING, Phase.ENDED}
 )
+# The phases a new patient's call can be in: booking, where intake moves it, and every phase
+# reachable from there.
+NEW_PATIENT_PHASES = frozenset(
+    {Phase.BOOKING, Phase.EMERGENCY, Phase.HANDOFF, Phase.CLOSING, Phase.ENDED}
+)
+# Where a caller may have been offered slots.
+OFFER_PHASES = frozenset({Phase.SERVING, Phase.BOOKING})
+
+
+class Caller(StrEnum):
+    """Who is calling, as far as code knows."""
+
+    # Verified: a patient of the clinic, identified by code.
+    PATIENT = "patient"
+    # A first-time caller, booking, before and after their details are collected.
+    NEW_PATIENT = "new_patient"
+    NEW_PATIENT_WITH_DETAILS = "new_patient_with_details"
+    # Nobody known yet.
+    UNIDENTIFIED = "unidentified"
 
 
 class IllegalTransitionError(ValueError):
@@ -74,6 +99,32 @@ class IdentityClaim(BaseModel):
     dob: date = Field(repr=False)
 
 
+class NewPatientDetails(BaseModel):
+    """A new patient's details as collect_new_patient took them, checked and normalized: the
+    draft the booking saves. Also the transition that stores it. None of it is in the text
+    form."""
+
+    model_config = _FROZEN
+
+    first_name: str = Field(repr=False)
+    last_name: str = Field(repr=False)
+    dob: date = Field(repr=False)
+    phone: str = Field(repr=False)
+    email: str = Field(repr=False)
+    insurance_provider: str | None = Field(repr=False)
+    member_id: str | None = Field(repr=False)
+    self_pay: bool = Field(repr=False)
+    reason_short: str = Field(repr=False)
+
+
+class SlotsOffered(BaseModel):
+    """The slots find_slots offered, by id: the transition that adds them to `offered_slots`."""
+
+    model_config = _FROZEN
+
+    slot_ids: tuple[int, ...]
+
+
 class CallState(BaseModel):
     """`call_id` comes from the call registry (app/voice/calls.py), never from the caller or
     the model. `office_open` is decided by code when the call starts."""
@@ -98,6 +149,10 @@ class CallState(BaseModel):
     ssn_turns: int = Field(default=0, ge=0)
     pending_ssn4: str | None = _hidden_digits(_PENDING_DIGITS)
     verified_ssn4: str | None = _hidden_digits(_VERIFIED_DIGITS)
+    # Never in a dump, never in the text form.
+    new_patient_details: NewPatientDetails | None = Field(default=None, exclude=True, repr=False)
+    # Each slot id find_slots returned in this call, once, in the order first offered.
+    offered_slots: tuple[int, ...] = ()
 
     @field_validator("call_id")
     @classmethod
@@ -121,7 +176,28 @@ class CallState(BaseModel):
         if self.verified_ssn4 is not None and not self.verified:
             raise ValueError("verified_ssn4 is set only for a verified caller")
         self._consistent_step()
+        self._consistent_booking()
         return self
+
+    def _consistent_booking(self) -> None:
+        if self.is_new_patient:
+            if self.verified:
+                raise ValueError("a new patient's call is never verified")
+            if self.phase not in NEW_PATIENT_PHASES:
+                raise ValueError(f"a new patient's call is not in {self.phase.value}")
+        if self.new_patient_details is not None and not (
+            self.is_new_patient and self.phase is Phase.BOOKING
+        ):
+            raise ValueError("new_patient_details exist only in a new patient's call, in booking")
+        if self.offered_slots and caller_of(self) not in (
+            Caller.PATIENT,
+            Caller.NEW_PATIENT_WITH_DETAILS,
+        ):
+            raise ValueError("offered_slots are kept only for a patient or a new patient's details")
+        if self.offered_slots and self.phase not in OFFER_PHASES:
+            raise ValueError("offered_slots are kept only in serving and booking")
+        if len(set(self.offered_slots)) != len(self.offered_slots):
+            raise ValueError("offered_slots holds each slot once")
 
     def _consistent_step(self) -> None:
         claimed = self.pending_claim is not None
@@ -136,6 +212,19 @@ class CallState(BaseModel):
             raise ValueError("verify_locked is set exactly when verify_attempts reaches the limit")
         if self.verify_locked and claimed:
             raise ValueError("a locked call holds no pending_claim")
+
+
+def caller_of(state: CallState) -> Caller | None:
+    """Who is calling. None for a state that is both a patient's and a new patient's, or
+    verified without a patient id: no transition makes one, and no tool is offered to it."""
+    if state.verified:
+        consistent = state.patient_id is not None and not state.is_new_patient
+        return Caller.PATIENT if consistent else None
+    if state.is_new_patient:
+        if state.new_patient_details is None:
+            return Caller.NEW_PATIENT
+        return Caller.NEW_PATIENT_WITH_DETAILS
+    return Caller.UNIDENTIFIED
 
 
 def new_call(*, call_id: str, started_at: datetime, office_open: bool) -> CallState:
@@ -156,6 +245,8 @@ _NO_STEP: dict[str, Any] = {
     "ssn_turns": 0,
     "pending_ssn4": None,
 }
+# What a phase change ends besides: the new patient's draft and the slots offered.
+_NO_BOOKING: dict[str, Any] = {"new_patient_details": None, "offered_slots": ()}
 
 
 # The moves `move` makes, from each phase. intake -> serving is not here: it is `verify`. The
@@ -185,7 +276,8 @@ def _refuse(state: CallState, to: Phase, why: str = "not a legal move") -> Illeg
 def move(state: CallState, to: Phase) -> CallState:
     """Every legal move except intake -> serving. Hand-off needs the office open; intake ->
     booking is a new patient's booking, and booking -> serving needs a verified caller. Every
-    move ends the identity claim and the SSN step."""
+    move ends the identity claim and the SSN step, the new patient's draft and the slots
+    offered."""
     if to not in _MOVES[state.phase]:
         raise _refuse(state, to)
     if to is Phase.HANDOFF and not state.office_open:
@@ -193,8 +285,8 @@ def move(state: CallState, to: Phase) -> CallState:
     if to is Phase.SERVING and not state.verified:
         raise _refuse(state, to, "refused for a caller who is not verified")
     if state.phase is Phase.INTAKE and to is Phase.BOOKING:
-        return _next(state, phase=to, is_new_patient=True, **_NO_STEP)
-    return _next(state, phase=to, **_NO_STEP)
+        return _next(state, phase=to, is_new_patient=True, **_NO_STEP, **_NO_BOOKING)
+    return _next(state, phase=to, **_NO_STEP, **_NO_BOOKING)
 
 
 def verify(state: CallState, *, patient_id: str, first_name: str) -> CallState:
@@ -262,6 +354,31 @@ def drop_claim(state: CallState) -> CallState:
     return _next(state, **_NO_STEP)
 
 
+def collect(state: CallState, details: NewPatientDetails) -> CallState:
+    """Store a new patient's details: in a new patient's call, in booking, with the office
+    open. Details collected again replace the first, and the slots offered so far go."""
+    if state.phase is not Phase.BOOKING or not state.is_new_patient:
+        raise _refuse_step(state, "new patient details", "not a legal move")
+    if not state.office_open:
+        raise _refuse_step(state, "new patient details", "refused while the office is closed")
+    return _next(state, new_patient_details=details, offered_slots=())
+
+
+def offer(state: CallState, offered: SlotsOffered) -> CallState:
+    """Remember the slots offered, after those offered before: for a verified caller in serving
+    or booking, or a new patient with the details collected, with the office open."""
+    if state.phase not in OFFER_PHASES or caller_of(state) not in (
+        Caller.PATIENT,
+        Caller.NEW_PATIENT_WITH_DETAILS,
+    ):
+        raise _refuse_step(state, "an offer of slots", "not a legal move")
+    if not state.office_open:
+        raise _refuse_step(state, "an offer of slots", "refused while the office is closed")
+    known = state.offered_slots
+    added = tuple(dict.fromkeys(slot for slot in offered.slot_ids if slot not in known))
+    return _next(state, offered_slots=known + added)
+
+
 # The counters change nothing the consistency rules look at, so counting never fails: dispatch
 # counts on whatever state it is given and always returns a result.
 def count_tool_error(state: CallState) -> CallState:
@@ -323,7 +440,16 @@ def _step(state: CallState, change: SsnStep) -> CallState:
     )
 
 
-Transition = Move | Verify | IdentityClaim | FailedAttempt | EndClaim | SsnStep
+Transition = (
+    Move
+    | Verify
+    | IdentityClaim
+    | FailedAttempt
+    | EndClaim
+    | SsnStep
+    | NewPatientDetails
+    | SlotsOffered
+)
 
 
 def apply(state: CallState, transition: Transition) -> CallState:
@@ -334,6 +460,10 @@ def apply(state: CallState, transition: Transition) -> CallState:
         return verify(state, patient_id=transition.patient_id, first_name=transition.first_name)
     if isinstance(transition, IdentityClaim):
         return claim(state, transition)
+    if isinstance(transition, NewPatientDetails):
+        return collect(state, transition)
+    if isinstance(transition, SlotsOffered):
+        return offer(state, transition)
     if isinstance(transition, FailedAttempt):
         return fail_attempt(state)
     if isinstance(transition, EndClaim):

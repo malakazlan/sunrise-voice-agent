@@ -143,9 +143,10 @@ All data used by this project is synthetic. No real customer or personal data is
     and only that goes into the `ALTER ROLE` statement, which is sent straight through the
     driver, so no log line, SQLAlchemy event or error message contains it, at any log level.
     A verifier in any other form is refused before it is sent.
-  - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`,
-    `UPDATE` on `patients` and `appointments`; `SELECT` on `medications`; `SELECT`, `UPDATE`
-    on `available_slots`; `SELECT`, `INSERT` on `audit_events`, `requests` and `messages`;
+  - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`
+    on `patients` and `appointments` (never `UPDATE`); `SELECT` on `medications`; `SELECT` on
+    `available_slots` and `UPDATE` of its one column `is_available`; `SELECT`, `INSERT` on
+    `audit_events`, `verification_attempts`, `requests` and `messages`;
     nothing on `alembic_version`; `USAGE` on the appointment, request and message id
     sequences only; no `EXECUTE` on the trigger functions (a
     trigger runs its function whoever may call it) or on the functions that create large
@@ -491,6 +492,60 @@ name, message text, balance or status reaches the audit log or the logs.
     such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
     four five six seven eight nine`) is not masked.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
+
+### Booking
+
+Five tools in `app/agent/booking.py`, registered by `register_tools()`, book an appointment
+for a verified patient and for a first-time caller. All need the office open.
+
+- `start_new_patient` (intake, nobody verified): the call moves to `booking` as a new patient's
+  call, which can never be verified and never reaches a patient-data tool.
+- `collect_new_patient` (booking, a new patient's call): `full_name` (a first and a last name,
+  no digits), `dob` (ISO, not in the future), `phone` (ten digits once spaces, dots, dashes and
+  brackets are removed; stored as `555-410-2233`), `email` (one `@`, a dot in the domain, at
+  most 254 characters, letters, digits and `. _ % + -`), either `insurance_provider` and
+  `member_id` or `self_pay: true`, and `reason_short` (1 to 120 characters, SSNs masked).
+  Nothing else is accepted. The details are kept in the call's state only, hidden from its text
+  form, its dumps, logs and errors; a second call replaces them and forgets the slots offered.
+  The answer is the email spelled letter by letter for reading back.
+- `find_slots(doctor?, preferred_days?, preferred_time_of_day?)` (serving or booking, a
+  verified patient or a new patient with details): at most three open slots after the moment of
+  the question, earliest first, as `{slot_id, doctor, date, time}` in clinic time. The doctor is
+  one of the clinic's; days are day names; morning is before noon. The state remembers every
+  slot it offered in the call.
+- `book_appointment(slot_id, reason_short, confirmed)` (serving, the verified patient) and
+  `book_new_patient(slot_id, confirmed)` (booking, a new patient with details): only a slot
+  offered in this call. A slot not offered, taken, or begun: `slot_taken`, the same answer
+  whatever the reason. Without `confirmed: true`: `needs_confirmation` with the doctor, date
+  and time. Confirmed, in one transaction: the slot is taken by a single `UPDATE` that changes
+  it only while it is still open and in the future, so of two callers only one gets it; then
+  the new patient's record (`NP-` and a random UUID, `is_new`, no SSN, labs `None on file`,
+  balance 0), the appointment and a `requests` row of type `booking`, and the audit event. A
+  failure at any point leaves the slot open and nothing written. The slot row is kept, marked
+  unavailable. `book_new_patient` then moves the call to `closing` and answers with the
+  `booking_instructions` line; a verified patient may book more than one slot, and asking
+  again for one this call booked gives the same `booked` answer and writes nothing.
+- A new patient whose name key and date of birth match an existing record still gets a new
+  record, flagged `possible_duplicate` for staff. The caller is told exactly the same.
+- Audit actions: `new_patient_started`, `new_patient_details_collected`, `slots_offered`,
+  `appointment_booked` (resource: the patient), `new_patient_booked` (resource: the
+  appointment), `booking_previewed`, and `slot_taken` (outcome `refused`).
+- The runtime role may insert patients and appointments but not change or delete them, and may
+  change only `is_available` on a slot.
+- Limits:
+  - No email is sent. The request's summary tells staff to `confirm by email` when an email is
+    on file or was given, `confirm by phone` otherwise. The `booking_instructions` line still
+    says a confirmation will come by email, as the task's text has it.
+  - The last word of the name is stored as the last name, the rest as the first name; a
+    suffix (`Jr`) becomes the last name.
+  - A name that is a single word cannot be collected.
+  - A member id is letters, digits, spaces and dashes. In booking the input guard masks only
+    SSN-shaped numbers, so a member id that reads as nine digits reaches the model masked and
+    is refused; the caller needs staff for it.
+  - A verified caller moved to `booking` may look for slots there but books from `serving`;
+    moving between them forgets the slots offered.
+  - A new patient books once per call: after booking, a repeat is refused, not answered.
+  - Slot times are rendered without the year to the caller; the staff summary carries it.
 
 ## Configuration
 

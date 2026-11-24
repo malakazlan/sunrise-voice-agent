@@ -19,8 +19,17 @@ time submit one after another, and once the identity is locked a submit counts n
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+)
 from sqlalchemy import Integer, cast, func, insert, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,36 +57,39 @@ _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 CLAIM_LOCKS = int.from_bytes(b"idnt", "big")
 
 
+def _iso_text(value: object) -> date:
+    if not isinstance(value, str) or not _ISO_DATE.fullmatch(value):
+        raise ValueError("dob must be an ISO date, YYYY-MM-DD")
+    return date.fromisoformat(value)
+
+
+def _not_in_the_future(value: date, info: ValidationInfo) -> date:
+    today = (info.context or {}).get("today")
+    if not isinstance(today, date):
+        raise ValueError("dob is checked against the clinic's date, which is missing")
+    if value > today:
+        raise ValueError("dob is in the future")
+    return value
+
+
+# A date of birth as the caller gives it: strictly an ISO date (YYYY-MM-DD), not after the
+# clinic's date, which dispatch passes in the validation context.
+DateOfBirth = Annotated[date, BeforeValidator(_iso_text), AfterValidator(_not_in_the_future)]
+
+
 class VerifyIdentityArguments(BaseModel):
     """The caller's full name, and their date of birth as an ISO date (YYYY-MM-DD)."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     full_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    dob: date
+    dob: DateOfBirth
 
     @field_validator("full_name")
     @classmethod
     def _is_a_name(cls, value: str) -> str:
         if name_key(value) is None:
             raise ValueError("full_name is not a name")
-        return value
-
-    @field_validator("dob", mode="before")
-    @classmethod
-    def _iso_text(cls, value: object) -> date:
-        if not isinstance(value, str) or not _ISO_DATE.fullmatch(value):
-            raise ValueError("dob must be an ISO date, YYYY-MM-DD")
-        return date.fromisoformat(value)
-
-    @field_validator("dob")
-    @classmethod
-    def _not_in_the_future(cls, value: date, info: ValidationInfo) -> date:
-        today = (info.context or {}).get("today")
-        if not isinstance(today, date):
-            raise ValueError("dob is checked against the clinic's date, which is missing")
-        if value > today:
-            raise ValueError("dob is in the future")
         return value
 
 

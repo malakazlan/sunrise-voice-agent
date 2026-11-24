@@ -8,11 +8,13 @@ the structural tests call it too, so every tool registered here is bound by the 
 way code calls it.
 """
 
+from app.agent.booking import BOOKING_TOOLS
 from app.agent.serving import SERVING_TOOLS
-from app.agent.state import CallState, Phase, drop_claim
+from app.agent.state import Caller, CallState, Phase, drop_claim
 from app.agent.tool_registry import (
     REGISTRY,
     Deps,
+    DobKind,
     Grant,
     NoArguments,
     Registry,
@@ -35,7 +37,8 @@ VERIFY_IDENTITY = Tool(
     office_open_only=True,
     writes=False,
     may_verify=False,
-    takes_identity_claim=True,
+    takes_date_of_birth=DobKind.IDENTITY_CLAIM,
+    callers=frozenset({Caller.UNIDENTIFIED}),
     audit_action=Action.IDENTITY_CLAIMED,
     outcome_actions={Action.IDENTITY_LOCKED: Outcome.REFUSED},
     resource_type=ResourceType.TOOL,
@@ -51,7 +54,8 @@ SUBMIT_IDENTITY = Tool(
     office_open_only=True,
     writes=True,
     may_verify=True,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=frozenset({Caller.UNIDENTIFIED}),
     audit_action=Action.IDENTITY_VERIFIED,
     outcome_actions={
         Action.IDENTITY_REFUSED: Outcome.REFUSED,
@@ -66,7 +70,7 @@ def register_tools() -> Registry:
     if not REGISTRY.sealed:
         REGISTRY.register(VERIFY_IDENTITY)
         REGISTRY.register(SUBMIT_IDENTITY, grant=_SUBMIT_GRANT)
-        for tool in SERVING_TOOLS:
+        for tool in (*SERVING_TOOLS, *BOOKING_TOOLS):
             REGISTRY.register(tool)
         REGISTRY.seal()
     return REGISTRY

@@ -18,6 +18,7 @@ class ScriptId(StrEnum):
     VERIFY_FAIL = "verify_fail"
     VERIFY_LOCKED = "verify_locked"
     EMERGENCY = "emergency"
+    BOOKING_INSTRUCTIONS = "booking_instructions"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,11 @@ SCRIPTS = MappingProxyType(
             "If you're experiencing a medical emergency, please hang up and call 911 or go to"
             " the nearest emergency room right away.",
             interruptible=False,
+        ),
+        ScriptId.BOOKING_INSTRUCTIONS: Script(
+            "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
+            " receive a confirmation by email.",
+            interruptible=True,
         ),
     }
 )
