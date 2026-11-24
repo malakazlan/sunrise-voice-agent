@@ -1,6 +1,7 @@
 import asyncio
 import os
 import secrets
+import socket
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -121,6 +122,17 @@ def offline_env(db_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """The required database settings plus the voice settings a demo or prod app needs."""
     for key, value in VOICE_SECRETS.items():
         monkeypatch.setenv(key, value)
+
+
+@pytest.fixture
+def silent_server() -> Iterator[int]:
+    """The port of a server that takes TCP connections and never answers, like a database
+    server that has stopped responding: the listening socket's backlog completes each
+    connection and nothing ever reads from it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        yield int(listener.getsockname()[1])
 
 
 @pytest.fixture(scope="session")

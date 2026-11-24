@@ -134,7 +134,6 @@ class Outcome(StrEnum):
     SUCCESS = "success"
     FAILURE = "failure"
     REFUSED = "refused"
-    FAILED = "failed"
 
 
 class Reason(StrEnum):

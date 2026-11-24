@@ -70,7 +70,9 @@ All data used by this project is synthetic. No real customer or personal data is
     SERIALIZABLE an append that meets another writer fails on the primary key (it fails
     closed).
   - Every database connection the app opens is ended by the server after 30 seconds idle
-    inside a transaction, so an abandoned transaction cannot hold the lock for long.
+    inside a transaction, so an abandoned transaction cannot hold the lock for long. Opening
+    a connection gives up after 5 seconds (`connect_timeout`) when the server does not answer,
+    for the app and the start-up steps alike.
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
     variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
@@ -252,7 +254,8 @@ them to the model.
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A state changes
   only through transition functions, which refuse illegal moves (`IllegalTransitionError`):
-  greeting to intake; intake to booking (a new patient); serving and booking either way;
+  greeting to intake; intake to booking (a new patient); serving to booking, and booking to
+  serving for a verified caller only (a new patient's booking never reaches serving);
   intake, serving or booking to closing, or to handoff while the office is open; any phase but
   ended to emergency; emergency, handoff or closing to ended. Ended is final. `verify` is the
   only move from intake to serving and the only code that sets `verified` and the patient id,
@@ -268,14 +271,15 @@ them to the model.
   forbid unknown fields; the name is 2 to 40 lower-case letters and underscores.
 - The gate (`tools_for`): no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
   `ended`; a tool only in its declared phases; an office-hours tool only while the office is
-  open; a patient-data tool only for a verified caller, while the office is open, in `serving`
-  or `booking`.
+  open; a patient-data tool only for a verified caller, while the office is open. Since such a
+  tool can only be declared for `serving` and `booking`, it is never offered anywhere else.
 - `dispatch` is the only caller of a handler. It refuses an unknown name, a tool the gate does
   not allow and arguments that do not validate, without running the handler. Otherwise, in one
   transaction, the handler runs (it gets the patient id from the state, never from the
   arguments, and may not commit), the transition it asks for is applied, the audit event is
   appended, and it commits; any failure rolls all of it back. Every dispatch leaves exactly
-  one audit event: `tool_refused` or `tool_failed` events have resource type `tool` and the
+  one audit event: `tool_refused` (outcome `refused`) or `tool_failed` (outcome `failure`)
+  events have resource type `tool` and the
   tool's name as id (none for a name that is not a registered tool) and are written in their
   own transaction. The model gets fixed text for a refusal or a failure, never an exception or
   an argument value. A failure counts toward `tool_errors`; from two on, every outcome asks

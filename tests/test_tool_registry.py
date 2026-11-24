@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+import anyio
 import pytest
 from conftest import TEST_AUDIT_KEY
 from pydantic import (
@@ -197,7 +198,7 @@ def refused_event(state: CallState, name: str | None) -> tuple[Any, ...]:
 
 
 def failed_event(state: CallState, name: str) -> tuple[Any, ...]:
-    return ("tool_failed", "tool", name, "failed", state.call_id)
+    return ("tool_failed", "tool", name, "failure", state.call_id)
 
 
 @pytest.fixture
@@ -220,9 +221,8 @@ async def test_no_phi_tools_before_verification(deps: Deps, owner_engine: Engine
     )
 
     unverified = [state for state in every_combination() if not state.verified]
-    # And the unverified states a call reaches: intake, a new patient's booking and serving.
-    new_patient = move(intake(), BOOKING)
-    unverified += [intake(), new_patient, move(new_patient, SERVING)]
+    # And the unverified states a call reaches: intake and a new patient's booking.
+    unverified += [intake(), move(intake(), BOOKING)]
     for state in unverified:
         assert "read_chart" not in names(registry, state), state.phase
         after, outcome = await registry.dispatch(state, "read_chart", {}, deps)
@@ -769,6 +769,21 @@ def gate_violations(registry: Registry) -> list[str]:
 def test_application_registry_obeys_the_gate() -> None:
     assert gate_violations(REGISTRY) == []
 
+    # The gate offers a tool only in its declared phases, and a patient-data tool cannot be
+    # declared for any phase but serving and booking: so no registry, whatever it holds, can
+    # offer one anywhere else.
+    for phase in set(Phase) - PHI_PHASES:
+        with pytest.raises(DeclarationError, match="phi"):
+            Registry().register(
+                declared(
+                    "read_chart",
+                    noop,
+                    phi=True,
+                    phases=frozenset({SERVING, phase}),
+                    resource_type=ResourceType.PATIENT,
+                )
+            )
+
     # The check finds what it looks for: it passes the test tools, and fails a registry that
     # offers every tool everywhere.
     tools = [
@@ -860,6 +875,33 @@ async def test_held_audit_lock_fails_generically(
     # The failure's own event could not be written either: nothing at all committed.
     assert patients(owner_engine) == []
     assert events(owner_engine) == []
+
+
+# The outside bound on a dispatch against a database that does not answer: two connection
+# attempts (the handler's transaction, then the failure's event) at the 5-second connect
+# timeout, with room to spare; the driver's own default would be 130 seconds each.
+SILENT_DATABASE_BOUND_SECONDS = 30
+
+
+async def test_unanswering_database_fails_within_a_bound(
+    server_settings: StartupSettings, silent_server: int
+) -> None:
+    engine = create_database_engine(
+        server_settings.model_copy(update={"postgres_port": silent_server})
+    )
+    try:
+        silent = Deps(
+            sessions=create_session_factory(engine),
+            audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
+            now=lambda: T0,
+        )
+        calls: Calls = []
+        registry = registry_of(declared("look_up", recording(calls), arguments=Topic))
+        with anyio.fail_after(SILENT_DATABASE_BOUND_SECONDS):
+            state, outcome = await registry.dispatch(intake(), "look_up", {"topic": "x"}, silent)
+        assert (state.tool_errors, outcome) == (1, FAILED)
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture

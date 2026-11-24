@@ -1,8 +1,10 @@
+import threading
 import traceback
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, date, datetime
 from typing import Any
 
+import anyio
 import pytest
 from psycopg import errors
 from sqlalchemy import (
@@ -230,6 +232,50 @@ def test_every_engine_withholds_row_values_from_errors() -> None:
         create_owner_sync_engine(OFFLINE),
     ):
         assert event.contains(engine, "handle_error", withhold_row_values)
+
+
+# How long a test waits, from outside, for an engine to give up on a server that does not
+# answer. Well above the 5-second connect timeout, well below the driver's own 130 seconds.
+GIVE_UP_WITHIN_SECONDS = 15
+
+
+async def test_every_engine_gives_up_on_a_server_that_does_not_answer(
+    silent_server: int,
+) -> None:
+    settings = OFFLINE.model_copy(
+        update={"postgres_host": "127.0.0.1", "postgres_port": silent_server}
+    )
+    for make in (create_database_engine, create_owner_engine):
+        async_engine = make(settings)
+        try:
+            with anyio.fail_after(GIVE_UP_WITHIN_SECONDS):
+                with pytest.raises(OperationalError) as excinfo:
+                    async with async_engine.connect():
+                        pass
+            assert isinstance(excinfo.value.orig, errors.ConnectionTimeout)
+        finally:
+            await async_engine.dispose()
+
+    # The synchronous engine, in a thread the test can leave behind if it hangs.
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
+    failures: list[BaseException] = []
+
+    def connect() -> None:
+        try:
+            with engine.connect():
+                pass
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    thread.join(GIVE_UP_WITHIN_SECONDS)
+    assert not thread.is_alive(), "the synchronous engine is still waiting"
+    engine.dispose()
+    assert [type(failure) for failure in failures] == [OperationalError]
+    failure = failures[0]
+    assert isinstance(failure, OperationalError)
+    assert isinstance(failure.orig, errors.ConnectionTimeout)
 
 
 class RefusesValues(TypeDecorator[str]):

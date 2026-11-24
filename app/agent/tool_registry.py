@@ -202,7 +202,8 @@ def _available(tool: Tool, state: CallState) -> bool:
         return False
     if tool.office_open_only and not state.office_open:
         return False
-    if tool.phi and not (state.verified and state.office_open and state.phase in PHI_PHASES):
+    # A phi tool's phases are serving or booking only: registration refuses any other.
+    if tool.phi and not (state.verified and state.office_open):
         return False
     return True
 
@@ -298,7 +299,7 @@ class Registry:
                 type(error).__name__,
                 failed.tool_errors,
             )
-            await self._record(failed, Action.TOOL_FAILED, Outcome.FAILED, name, deps)
+            await self._record(failed, Action.TOOL_FAILED, Outcome.FAILURE, name, deps)
             return failed, _outcome(Status.FAILED, failed)
         logger.info("tool_called tool=%s call_id=%s", name, state.call_id)
         return after, _outcome(Status.DONE, after, result.data)

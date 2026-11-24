@@ -84,11 +84,13 @@ def _refuse(state: CallState, to: Phase, why: str = "not a legal move") -> Illeg
 
 def move(state: CallState, to: Phase) -> CallState:
     """Every legal move except intake -> serving. Hand-off needs the office open; intake ->
-    booking is a new patient's booking."""
+    booking is a new patient's booking, and booking -> serving needs a verified caller."""
     if to not in _MOVES[state.phase]:
         raise _refuse(state, to)
     if to is Phase.HANDOFF and not state.office_open:
         raise _refuse(state, to, "refused while the office is closed")
+    if to is Phase.SERVING and not state.verified:
+        raise _refuse(state, to, "refused for a caller who is not verified")
     if state.phase is Phase.INTAKE and to is Phase.BOOKING:
         return state.model_copy(update={"phase": to, "is_new_patient": True})
     return state.model_copy(update={"phase": to})

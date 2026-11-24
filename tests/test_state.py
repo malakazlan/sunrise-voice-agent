@@ -44,20 +44,28 @@ def verified_serving() -> CallState:
     return verify(move(start(), INTAKE), patient_id="P001", first_name="Sarah")
 
 
-# Each phase reached through legal transitions only.
-def reached(office_open: bool) -> dict[Phase, CallState]:
+# Each phase reached through legal transitions only, with booking both for a verified caller
+# and for a new patient. With the office closed nobody is verified, so serving and hand-off
+# are out of reach.
+def reached(office_open: bool) -> list[tuple[Phase, CallState]]:
     greeting = start(office_open)
     intake = move(greeting, INTAKE)
-    states = {GREETING: greeting, INTAKE: intake, EMERGENCY: move(intake, EMERGENCY)}
-    states[CLOSING] = move(intake, CLOSING)
-    states[ENDED] = move(states[CLOSING], ENDED)
+    closing = move(intake, CLOSING)
+    states = [
+        (GREETING, greeting),
+        (INTAKE, intake),
+        (EMERGENCY, move(intake, EMERGENCY)),
+        (CLOSING, closing),
+        (ENDED, move(closing, ENDED)),
+        (BOOKING, move(intake, BOOKING)),
+    ]
     if office_open:
-        states[SERVING] = verify(intake, patient_id="P001", first_name="Sarah")
-        states[BOOKING] = move(states[SERVING], BOOKING)
-        states[HANDOFF] = move(intake, HANDOFF)
-    else:
-        states[BOOKING] = move(intake, BOOKING)
-        states[SERVING] = move(states[BOOKING], SERVING)
+        serving = verify(intake, patient_id="P001", first_name="Sarah")
+        states += [
+            (SERVING, serving),
+            (BOOKING, move(serving, BOOKING)),
+            (HANDOFF, move(intake, HANDOFF)),
+        ]
     return states
 
 
@@ -80,13 +88,14 @@ def test_phases_are_the_documented_ones() -> None:
 #   x  legal
 #   o  legal only while the office is open
 #   v  only through the verification transition, and only while the office is open
+#   a  only for a verified caller (a new patient's booking never reaches serving)
 #   .  refused
 MATRIX = """
             greeting intake serving booking emergency handoff closing ended
 greeting       .       x      .       .        x        .       .      .
 intake         .       .      v       x        x        o       x      .
 serving        .       .      .       x        x        o       x      .
-booking        .       .      x       .        x        o       x      .
+booking        .       .      a       .        x        o       x      .
 emergency      .       .      .       .        x        .       .      x
 handoff        .       .      .       .        x        .       .      x
 closing        .       .      .       .        x        .       .      x
@@ -110,10 +119,12 @@ def parse_matrix() -> dict[tuple[Phase, Phase], str]:
 def test_illegal_moves_are_refused() -> None:
     cells = parse_matrix()
     for office_open in (True, False):
-        for source, state in reached(office_open).items():
+        for source, state in reached(office_open):
             for target in Phase:
                 mark = cells[(source, target)]
-                legal = mark == "x" or (mark == "o" and office_open)
+                legal = (
+                    mark == "x" or (mark == "o" and office_open) or (mark == "a" and state.verified)
+                )
                 if legal:
                     assert move(state, target).phase is target, (source, target)
                 else:
@@ -132,8 +143,18 @@ def test_illegal_moves_are_refused() -> None:
         move(intake, ENDED)
     assert intake.phase is INTAKE
 
+    # Every phase, and both kinds of booking, were tried.
+    assert {phase for phase, _ in reached(True)} == set(Phase)
+    bookings = [state for phase, state in reached(True) if phase is BOOKING]
+    assert sorted(state.verified for state in bookings) == [False, True]
+
+    # A new patient's booking ends some other way than serving.
+    new_patient = move(move(start(), INTAKE), BOOKING)
+    with pytest.raises(IllegalTransitionError, match="booking -> serving"):
+        move(new_patient, SERVING)
+
     # Ended is final: nothing leaves it.
-    ended = reached(True)[ENDED]
+    ended = dict(reached(True))[ENDED]
     for target in Phase:
         with pytest.raises(IllegalTransitionError):
             move(ended, target)
@@ -185,8 +206,9 @@ def every_reachable_state(office_open: bool) -> set[CallState]:
 def test_verified_only_through_the_transition() -> None:
     for office_open in (True, False):
         states = every_reachable_state(office_open)
-        assert {state.phase for state in states} >= set(Phase) - (
-            set() if office_open else {HANDOFF}
+        # With the office closed nobody is verified, so serving and hand-off are out of reach.
+        assert {state.phase for state in states} == set(Phase) - (
+            set() if office_open else {SERVING, HANDOFF}
         )
         for state in states:
             # Every move but the verification one keeps the verification as it was.
@@ -264,7 +286,7 @@ def test_state_is_immutable() -> None:
 
 def test_emergency_from_any_live_phase() -> None:
     for office_open in (True, False):
-        for phase, state in reached(office_open).items():
+        for phase, state in reached(office_open):
             if phase is ENDED:
                 with pytest.raises(IllegalTransitionError):
                     move(state, EMERGENCY)

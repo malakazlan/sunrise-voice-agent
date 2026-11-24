@@ -1376,7 +1376,7 @@ def test_only_registry_members_are_accepted() -> None:
         "slot",
         "tool",
     }
-    assert {member.value for member in Outcome} == {"success", "failure", "refused", "failed"}
+    assert {member.value for member in Outcome} == {"success", "failure", "refused"}
     assert {member.value for member in Reason} == {"caller_hung_up"}
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:
