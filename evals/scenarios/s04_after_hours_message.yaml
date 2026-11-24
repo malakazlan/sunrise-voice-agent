@@ -1,0 +1,65 @@
+# Tuesday at 9 PM the office is closed: the closed line, a message read back and confirmed,
+# then the after-hours goodbye. Only the message, the emergency line and the goodbye are ever
+# offered to the model.
+now: "2026-11-24T21:00:00-05:00"  # Tuesday, 9 PM at the clinic
+turns:
+  - caller: >-
+      Hi, this is Maria Garcia. I need to move my appointment. Please call me back at
+      555 443 9081.
+    model:
+      - call: take_message
+        args:
+          name: "Maria Garcia"
+          callback_number: "555 443 9081"
+          reason_short: "Wants to move her appointment"
+          confirmed: false
+      - say: >-
+          I have Maria Garcia, at 555 443 9081, who wants to move her appointment. Is that
+          right?
+    expect:
+      tools:
+        - call: take_message
+          args: {confirmed: false}
+          returns:
+            status: needs_confirmation
+            name: "Maria Garcia"
+            callback_number: "5554439081"
+            reason_short: "Wants to move her appointment"
+  - caller: "Yes, that's right."
+    model:
+      - call: take_message
+        args:
+          name: "Maria Garcia"
+          callback_number: "555 443 9081"
+          reason_short: "Wants to move her appointment"
+          confirmed: true
+    expect:
+      said: [after_hours_close]
+      phase: closing
+expect:
+  said: [closed, after_hours_close]
+  offered: [take_message, report_emergency, close_call]
+  tools:
+    - call: take_message
+      args: {confirmed: false}
+    - call: take_message
+      args: {confirmed: true}
+  phase: closing
+  verified: false
+  rows:
+    - table: messages
+      where:
+        kind: callback
+        name: "Maria Garcia"
+        callback_number: "5554439081"
+        body: "Wants to move her appointment"
+        after_hours: true
+      count: 1
+    - table: messages
+      count: 1
+    - table: requests
+      where: {type: callback, summary: "Wants to move her appointment"}
+      count: 1
+    - table: requests
+      count: 1
+  audit: [call_started, message_previewed, message_taken, call_ended]

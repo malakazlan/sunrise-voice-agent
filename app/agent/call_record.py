@@ -5,9 +5,9 @@ patient, why the call ended, how many turns the caller took, and the transcript.
 The transcript is the history CallAgent keeps for the record (CallAgent.history in
 app/agent/turn.py), one line a message: each caller turn as the input guard passed it to the
 model, the fixed SWALLOWED_TURN or EMERGENCY_TURN marker where the model was given nothing of a
-turn, and each line the agent said. The opening message code gives the model, the tool calls
-with any text the model wrote beside them (never said, never through the output guard) and the
-tool results are not in it.
+turn, and each line the agent said, as far as the caller heard it. The tool calls with any
+text the model wrote beside them (never said, never through the output guard) and the tool
+results are not in it.
 
 It is masked three times before it is stored. First by `mask` (SSNs, dates, phone numbers,
 email addresses). Then every name the call itself knows is replaced by <PERSON>, as whole words
@@ -47,7 +47,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.endings import END_PHASES
 from app.agent.state import CallState, Phase
 from app.agent.tool_registry import Deps
-from app.agent.turn import CALL_CONNECTED
 from app.audit.log import Reason
 from app.db.models import MAX_TRANSCRIPT, CallSession, Patient
 from app.guard.logging import quiet_presidio
@@ -200,7 +199,7 @@ def _transcript(history: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
     for message in history:
         content = message["content"]
         if message["role"] == "user":
-            if isinstance(content, str) and content != CALL_CONNECTED:
+            if isinstance(content, str):
                 lines.append(f"caller: {' '.join(content.splitlines())}")
                 turns += 1
             continue

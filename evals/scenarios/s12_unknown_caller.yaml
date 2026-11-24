@@ -1,0 +1,24 @@
+# A caller the clinic has no record of gets the same line as a caller who gave the wrong digits
+# (s02): verify_fail, which says nothing about whether the name is known.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Robert Smith, S M I T H, born June 2, 1980."
+    model:
+      - call: verify_identity
+        args: {full_name: "Robert Smith", dob: "1980-06-02"}
+    expect:
+      said: [ssn_ask]
+  - caller: "one two three four"
+    expect:
+      said: [verify_fail]
+      reaches_model: false
+expect:
+  said: [greeting, ssn_ask, verify_fail]
+  phase: intake
+  verified: false
+  rows:
+    - table: verification_attempts
+      where: {success: false}
+      count: 1
+  audit: [call_started, identity_claimed, identity_refused, call_ended]
+  never: ["no record", "not a patient", "not found", "don't have"]

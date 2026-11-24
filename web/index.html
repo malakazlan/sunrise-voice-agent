@@ -21,8 +21,8 @@
 </head>
 <body>
   <h1>Voice agent test</h1>
-  <p>Test page, synthetic data only. Speak after the opening line; the agent's replies appear
-    here as text. Nothing is spoken back.</p>
+  <p>Test page, synthetic data only. The agent speaks; what it says also appears here as text.
+    Speak after the opening line. Timings start when you stopped speaking.</p>
 
   <label>Access token
     <input id="token" type="password" autocomplete="off">
@@ -35,6 +35,8 @@
     <dt>Connection state</dt><dd id="state">idle</dd>
     <dt>Candidate type in use</dt><dd id="candidate">none</dd>
   </dl>
+
+  <audio id="voice" autoplay></audio>
 
   <h2>Turns</h2>
   <ol id="turns"></ol>
@@ -99,10 +101,21 @@
 
     const ms = (value) => (typeof value === "number" ? `${value} ms` : "-");
 
+    // Each turn's item, by turn number, for the time to its first audio, which comes later.
+    const turnItems = new Map();
+
+    const addNote = (text) => {
+      const item = document.createElement("li");
+      item.append(line("hidden", text));
+      el("turns").append(item);
+    };
+
     const addTurn = (message) => {
       const item = document.createElement("li");
       if (message.type === "opening") {
         item.append(line("given", "Opening line (said by the system)"));
+      } else if (message.type === "said") {
+        item.append(line("given", "Said by the system"));
       } else {
         const given = typeof message.shown === "string"
           ? line("given", `Given to the assistant: ${message.shown}`)
@@ -118,12 +131,19 @@
       if (message.type === "turn") {
         const t = message.timings || {};
         item.append(line("timings",
-          `speech end to transcript ${ms(t.stt_ms)} | to first token ${ms(t.first_token_ms)}`
-          + ` | to last token ${ms(t.last_token_ms)} | tool rounds ${t.tool_rounds ?? "-"}`
-          + ` | total ${ms(t.total_ms)}`));
+          `silence wait ${ms(t.vad_ms)} | then transcript ${ms(t.stt_ms)}`
+          + ` | then first token ${ms(t.first_token_ms)} | last token ${ms(t.last_token_ms)}`
+          + ` | tool rounds ${t.tool_rounds ?? "-"} | turn done ${ms(t.total_ms)}`
+          + " after you stopped speaking"));
         if (message.hand_off === true) item.append(line("handoff", "Hand-off requested"));
+        turnItems.set(message.turn, item);
       }
       el("turns").append(item);
+    };
+
+    const showFirstAudio = (message) => {
+      const item = turnItems.get(message.turn);
+      if (item) item.append(line("timings", `first audio ${ms(message.first_audio_ms)} after you stopped speaking`));
     };
 
     const hangUp = () => {
@@ -133,6 +153,8 @@
       pc = null;
       if (mic) mic.getTracks().forEach((track) => track.stop());
       mic = null;
+      el("voice").srcObject = null;
+      turnItems.clear();
       el("call").disabled = false;
       el("hangup").disabled = true;
     };
@@ -156,12 +178,20 @@
           iceTransportPolicy: el("relay").checked ? "relay" : "all",
         });
         pc.addTransceiver(mic.getAudioTracks()[0], { direction: "sendrecv" });
+        // The agent's voice: the server's audio track, played as it arrives.
+        pc.ontrack = (event) => {
+          el("voice").srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        };
         // The server sends each turn's result on this channel, as JSON.
         const channel = pc.createDataChannel("messages");
         channel.onmessage = (event) => {
           let message;
           try { message = JSON.parse(event.data); } catch { return; }
-          if (message && (message.type === "opening" || message.type === "turn")) addTurn(message);
+          if (!message) return;
+          if (["opening", "turn", "said"].includes(message.type)) addTurn(message);
+          if (message.type === "first_audio") showFirstAudio(message);
+          if (message.type === "interrupted") addNote("(you interrupted the agent)");
+          if (message.type === "ended") addNote(`(the call ended: ${message.reason})`);
         };
         pc.onconnectionstatechange = () => {
           if (!pc) return;

@@ -1,0 +1,23 @@
+# Sarah gives her name, date of birth and last four digits all in her first turn. The digits
+# never reach the model; the SSN step still asks for them, and she says them again.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: >-
+      Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985, and my social ends in
+      three three four four.
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+    expect:
+      said: [ssn_ask]
+      reaches_model: true
+  - caller: "three three four four"
+    expect:
+      said: [verified]
+      reaches_model: false
+expect:
+  said: [greeting, ssn_ask, verified]
+  phase: serving
+  verified: true
+  audit: [call_started, identity_claimed, identity_verified, call_ended]
+  never: ["three three four four"]

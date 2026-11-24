@@ -4,11 +4,10 @@ network. Expected lines and tool results are written by hand from the scripts, t
 (app/db/seed_data.json) and the spec."""
 
 import asyncio
-import copy
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, date, datetime
 from typing import Any, cast
 
@@ -19,6 +18,7 @@ from pydantic import SecretStr
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.agent.call_record import drain_call_records
 from app.agent.claims import ClaimKeys
 from app.agent.endings import drain_call_events
 from app.agent.model import (
@@ -32,12 +32,13 @@ from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry
 from app.agent.tools import register_tools
 from app.agent.turn import CALL_CONNECTED, CallAgent, drain_guard_audits, start_call
-from app.audit.log import CHAIN_LOCK, AuditLog
+from app.audit.log import CHAIN_LOCK, AuditLog, Reason
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
 from app.main import create_app
 from app.voice.calls import CallRegistry
+from evals.scripted import ScriptedModel, Step, calls, says
 
 pytestmark = pytest.mark.anyio
 
@@ -63,6 +64,7 @@ EMERGENCY = (
     " nearest emergency room right away."
 )
 FALLBACK = "I'm sorry, I can't help with that. I can take a message for our staff instead."
+TRANSFER = "I'm transferring you to our staff now. Please hold."
 ADVICE_REFUSAL = "I'm not able to give medical advice. I can send a message to your doctor instead."
 
 CLAIM_TURN = "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
@@ -97,35 +99,19 @@ SERVING_TOOLS = [
 # With the office closed: the message, the emergency line and the goodbye, nothing else.
 CLOSED_TOOLS = ["take_message", "report_emergency", "close_call"]
 
-EVENTS = text("SELECT action, resource_type, resource_id, outcome FROM audit_events ORDER BY seq")
+# The events of what happens in a call; the call's start (call_started, written by start_call
+# in the background) is app/agent/endings.py's, tested there.
+EVENTS = text(
+    "SELECT action, resource_type, resource_id, outcome FROM audit_events"
+    " WHERE action != 'call_started' ORDER BY seq"
+)
 EVENTS_WITH_REASONS = text(
-    "SELECT action, resource_type, resource_id, outcome, reason FROM audit_events ORDER BY seq"
+    "SELECT action, resource_type, resource_id, outcome, reason FROM audit_events"
+    " WHERE action != 'call_started' ORDER BY seq"
 )
 
 
-# --- the scripted model -----------------------------------------------------------------
-
-
-def says(words: str) -> ModelReply:
-    return ModelReply(
-        stop_reason="end_turn",
-        content=[{"type": "text", "text": words}],
-        text=words,
-        tool_calls=[],
-    )
-
-
-def calls(*tools: tuple[str, object], words: str = "") -> ModelReply:
-    """A reply that asks for tools, each with an id of its own."""
-    tool_calls = [
-        ToolCall(id=f"toolu_{index}", name=n, arguments=a) for index, (n, a) in enumerate(tools)
-    ]
-    content: list[dict[str, Any]] = [{"type": "text", "text": words}] if words else []
-    content += [
-        {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
-        for call in tool_calls
-    ]
-    return ModelReply(stop_reason="tool_use", content=content, text=words, tool_calls=tool_calls)
+# --- the scripted model's failures ------------------------------------------------------
 
 
 def refuses() -> ModelReply:
@@ -150,9 +136,6 @@ def cut_off() -> ModelReply:
     )
 
 
-Step = ModelReply | Callable[[asyncio.Event], Awaitable[ModelReply]]
-
-
 async def api_error(first_token: asyncio.Event) -> ModelReply:
     raise RuntimeError("the API answered 529")
 
@@ -166,26 +149,6 @@ async def stalls(first_token: asyncio.Event) -> ModelReply:
     first_token.set()
     await asyncio.sleep(5)
     raise AssertionError("a reply that stalls is not waited for")
-
-
-class ScriptedModel:
-    """Answers each request with the next step and keeps a copy of every request."""
-
-    def __init__(self, *steps: Step) -> None:
-        self.steps = list(steps)
-        self.requests: list[ModelRequest] = []
-
-    async def reply(self, request: ModelRequest, first_token: asyncio.Event) -> ModelReply:
-        self.requests.append(copy.deepcopy(request))
-        assert self.steps, "the model was asked more often than the test expected"
-        step = self.steps.pop(0)
-        if isinstance(step, ModelReply):
-            first_token.set()
-            return step
-        return await step(first_token)
-
-    def then(self, *steps: Step) -> None:
-        self.steps.extend(steps)
 
 
 def tool_names(request: ModelRequest) -> list[str]:
@@ -249,8 +212,10 @@ async def seeded(owner_session: AsyncSession) -> None:
 
 
 @pytest.fixture
-def deps(runtime: AsyncEngine, seeded: None) -> Deps:
-    return deps_on(runtime)
+async def deps(runtime: AsyncEngine, seeded: None) -> AsyncIterator[Deps]:
+    yield deps_on(runtime)
+    # The call events a test's calls started writing have ended before the engine goes.
+    await drain_call_events()
 
 
 @pytest.fixture
@@ -260,8 +225,10 @@ async def offline_deps() -> AsyncIterator[Deps]:
     try:
         yield deps_on(engine)
     finally:
-        # A call event a turn started writing (an emergency) has ended before the engine goes.
+        # A call event a turn started writing (an emergency), and the record of a call the test
+        # ended, have ended before the engine goes.
         await drain_call_events()
+        await drain_call_records()
         await engine.dispose()
 
 
@@ -270,7 +237,9 @@ def rows(engine: Engine) -> list[tuple[Any, ...]]:
         return [tuple(row) for row in connection.execute(EVENTS)]
 
 
-EVENT_REASONS = text("SELECT action, call_id, reason FROM audit_events ORDER BY seq")
+EVENT_REASONS = text(
+    "SELECT action, call_id, reason FROM audit_events WHERE action != 'call_started' ORDER BY seq"
+)
 
 
 def reasons(engine: Engine) -> list[tuple[Any, ...]]:
@@ -286,13 +255,15 @@ def new_call_id() -> str:
 
 # A call id of the registry's shape that holds none of the text the log test looks for.
 FIXED_CALL_ID = "0f1e2d3c4b5a46978a1b2c3d4e5f6a7b"
+# Another, for a second test that starts a call: a call id starts once per process.
+BLOCKED_CALL_ID = "7a6f5e4d3c2b41a09f8e7d6c5b4a3f2e"
 
 
-def agent_for(
+async def agent_for(
     model: ScriptedModel, deps: Deps, registry: Registry, call_id: str | None = None, **options: Any
 ) -> CallAgent:
-    agent, opening = start_call(call_id or new_call_id(), deps, model, registry, **options)
-    assert opening == GREETING
+    agent, opening = await start_call(call_id or new_call_id(), deps, model, registry, **options)
+    assert opening.text == GREETING
     return agent
 
 
@@ -315,8 +286,8 @@ async def test_verify_then_next_appointment(
         calls(("get_next_appointment", {})),
         says(APPOINTMENT_REPLY),
     )
-    agent, opening = start_call(new_call_id(), deps, model, registry)
-    assert opening == GREETING
+    agent, opening = await start_call(new_call_id(), deps, model, registry)
+    assert opening.text == GREETING
     assert agent.state.phase is Phase.INTAKE
 
     claimed = await agent.handle(CLAIM_TURN)
@@ -370,7 +341,7 @@ async def test_swallowed_turns_never_reach_the_model(
     deps: Deps, registry: Registry, said: list[str]
 ) -> None:
     model = ScriptedModel(calls(("verify_identity", SARAH_CLAIM)))
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
     await agent.handle(CLAIM_TURN)
     asked_before = len(model.requests)
 
@@ -409,7 +380,7 @@ async def test_model_gets_only_the_gated_tools(
         calls(("get_balance", {})),
         says("I need to verify you first. What is your full name and date of birth?"),
     )
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
 
     refused = await agent.handle("What do I owe?")
 
@@ -472,11 +443,11 @@ async def test_a_closed_office_offers_only_the_message_flow(
         claim_keys=offline_deps.claim_keys,
     )
     model = ScriptedModel(says("We open at nine tomorrow morning."))
-    agent, opening = start_call(new_call_id(), closed, model, registry)
+    agent, opening = await start_call(new_call_id(), closed, model, registry)
 
     await agent.handle("Can I check my balance?")
 
-    assert opening == CLOSED
+    assert opening.text == CLOSED
     assert agent.state.office_open is False
     assert [tool_names(request) for request in model.requests] == [CLOSED_TOOLS]
 
@@ -507,7 +478,7 @@ async def test_emergency_skips_the_model(
 async def test_guard_emergency_is_written_in_the_background(
     deps: Deps, registry: Registry, runtime: AsyncEngine, owner_engine: Engine
 ) -> None:
-    agent = agent_for(ScriptedModel(), deps, registry)
+    agent = await agent_for(ScriptedModel(), deps, registry)
     # The audit chain's lock is held elsewhere: the line does not wait for it.
     async with create_session_factory(runtime)() as holder:
         await holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
@@ -527,7 +498,7 @@ async def test_reported_emergency_ends_the_turn(
     # Whatever the model sends with it, the report gives the 911 line and the model is not asked
     # again in that turn.
     model = ScriptedModel(calls(("report_emergency", arguments)))
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
 
     result = await agent.handle("My husband collapsed and isn't waking up")
 
@@ -556,7 +527,7 @@ async def test_scripts_are_spoken_verbatim(
         ),
         says("Of course."),
     )
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
 
     result = await agent.handle(CLAIM_TURN)
 
@@ -637,7 +608,12 @@ REASONS = {
     ],
 )
 async def test_model_failures_fall_back(
-    deps: Deps, registry: Registry, caplog: pytest.LogCaptureFixture, first: str, second: str
+    deps: Deps,
+    registry: Registry,
+    owner_engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    first: str,
+    second: str,
 ) -> None:
     caplog.set_level(logging.INFO)
     model = ScriptedModel(*FAILURES[first]())
@@ -658,19 +634,16 @@ async def test_model_failures_fall_back(
     model.then(*FAILURES[second]())
     twice = await agent.handle("Hello?")
 
-    assert twice.lines == (FALLBACK,)
+    # The second failure raises the hand-off, and with the office open it acts: code hands the
+    # call to the staff (hand_off_to_staff), its transfer line in place of the fallback, and the
+    # call ends with it.
+    assert twice.lines == (TRANSFER,)
     assert twice.hand_off is True
-
-    # The call goes on, and the conversation is still one the API takes.
-    model.then(says("I'm here."))
-    after = await agent.handle("Are you there?")
-    assert after.lines == ("I'm here.",)
-    assert after.hand_off is True
-    assert_well_formed(model.requests[-1].messages)
-    fallbacks = [
-        m for m in model.requests[-1].messages if m == {"role": "assistant", "content": FALLBACK}
-    ]
-    assert len(fallbacks) == 2
+    assert agent.state.phase is Phase.HANDOFF
+    assert agent.ending is Reason.TRANSFERRED
+    assert ("transfer_requested", "call", agent.state.call_id, "success", "other") in (
+        rows_with_reasons(owner_engine)
+    )
     call_id = agent.state.call_id
     assert [
         r.getMessage() for r in caplog.records if r.getMessage().startswith("model_fallback")
@@ -682,7 +655,7 @@ async def test_model_failures_fall_back(
 
 async def test_four_tool_rounds_are_allowed(deps: Deps, registry: Registry) -> None:
     model = ScriptedModel(*[calls(("get_balance", {})) for _ in range(4)], says("Done."))
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
 
     result = await agent.handle("Can you help me?")
 
@@ -700,7 +673,7 @@ async def test_turn_logs_carry_no_text(
     caplog.set_level(logging.DEBUG)
     marker = "marker-model-words"
     model = ScriptedModel()
-    agent = agent_for(model, deps, registry, FIXED_CALL_ID, first_token_seconds=0.05)
+    agent = await agent_for(model, deps, registry, FIXED_CALL_ID, first_token_seconds=0.05)
 
     await verified(agent, model)
     model.then(
@@ -767,7 +740,7 @@ async def test_prompt_is_static(deps: Deps, registry: Registry) -> None:
 
     # The same prompt in every request, before verification and after.
     model = ScriptedModel(says("Hello."))
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
     await agent.handle("Hello.")
     await verified(agent, model)
     model.then(calls(("get_balance", {})), says("You owe forty-five dollars."))
@@ -795,7 +768,7 @@ async def test_blocked_text_goes_nowhere(
     caplog.set_level(logging.DEBUG)
     marker = "marker-blocked-words"
     model = ScriptedModel()
-    agent = agent_for(model, deps, registry, FIXED_CALL_ID)
+    agent = await agent_for(model, deps, registry, BLOCKED_CALL_ID)
     await verified(agent, model)
     model.then(
         says(f"Let me see. You should stop taking {marker} today. Then call us back."),
@@ -824,13 +797,13 @@ async def test_blocked_text_goes_nowhere(
     assert_well_formed(model.requests[-1].messages)
     # The log has the rule's name, the call id and the count, never the text.
     assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
-        f"guard_block call_id={FIXED_CALL_ID} rule=medical_advice blocks=1 hand_off=False"
+        f"guard_block call_id={BLOCKED_CALL_ID} rule=medical_advice blocks=1 hand_off=False"
     ]
     for blocked in (marker, "stop taking", "Then call us back", "Let me see"):
         assert blocked not in caplog.text, blocked
     # One audit event, the rule its reason; no text in it.
     events = rows_with_reasons(owner_engine)
-    assert events[-1] == ("guard_block", "call", FIXED_CALL_ID, "refused", "medical_advice")
+    assert events[-1] == ("guard_block", "call", BLOCKED_CALL_ID, "refused", "medical_advice")
     assert [event[0] for event in events].count("guard_block") == 1
     assert marker not in json.dumps([[str(value) for value in event] for event in events])
 
@@ -844,13 +817,12 @@ async def test_two_blocks_hand_off(
         says("Our staff can help with that."),
         says("You should skip your next dose."),
         says("That's nothing to worry about."),
-        says("I can take a message."),
     )
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
 
     turns = [
         await agent.handle(caller)
-        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?", "Okay.")
+        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?")
     ]
 
     assert [(turn.lines, turn.withheld, turn.hand_off) for turn in turns] == [
@@ -858,11 +830,12 @@ async def test_two_blocks_hand_off(
         # An allowed reply in between: the count starts again.
         (("Our staff can help with that.",), None, False),
         ((ADVICE_REFUSAL,), "medical_advice", False),
-        # Two blocks in a row.
-        ((ADVICE_REFUSAL,), "medical_advice", True),
-        # The hand-off, once asked for, stays asked for.
-        (("I can take a message.",), None, True),
+        # Two blocks in a row: with the office open the call is handed to the staff, the
+        # transfer line in place of the block's, and it ends with it.
+        ((TRANSFER,), "medical_advice", True),
     ]
+    assert agent.state.phase is Phase.HANDOFF
+    assert agent.ending is Reason.TRANSFERRED
     call_id = agent.state.call_id
     assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
         f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
@@ -870,10 +843,49 @@ async def test_two_blocks_hand_off(
         f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
     ]
     await drain_guard_audits()
-    assert (
-        rows_with_reasons(owner_engine)
-        == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
+    events = rows_with_reasons(owner_engine)
+    assert [e for e in events if e[0] == "guard_block"] == [
+        ("guard_block", "call", call_id, "refused", "medical_advice")
+    ] * 3
+    assert [e for e in events if e[0] == "transfer_requested"] == [
+        ("transfer_requested", "call", call_id, "success", "other")
+    ]
+
+
+@pytest.mark.parametrize("signal", ["model_failures", "guard_blocks"])
+async def test_the_hand_off_with_the_office_closed(
+    offline_deps: Deps, registry: Registry, signal: str
+) -> None:
+    # No one to transfer to: the turn that raises the hand-off offers the caller a message
+    # (the fallback line), once; the call goes on in intake, and later turns are as before.
+    closed = Deps(
+        sessions=offline_deps.sessions,
+        audit=offline_deps.audit,
+        now=lambda: EVENING,
+        claim_keys=offline_deps.claim_keys,
     )
+    state = move(
+        new_call(call_id=new_call_id(), started_at=EVENING, office_open=False), Phase.INTAKE
+    )
+    advice = "You should skip your next dose."
+    steps: list[Step] = (
+        [api_error, api_error, api_error]
+        if signal == "model_failures"
+        else [says(advice), says(advice), says(advice)]
+    )
+    agent = CallAgent(state, closed, ScriptedModel(*steps), registry)
+
+    turns = [await agent.handle(caller) for caller in ("Hello.", "Hello?", "Are you there?")]
+
+    usual = FALLBACK if signal == "model_failures" else ADVICE_REFUSAL
+    assert [(turn.lines, turn.hand_off) for turn in turns] == [
+        ((usual,), False),
+        ((FALLBACK,), True),
+        ((usual,), True),
+    ]
+    assert agent.state.phase is Phase.INTAKE
+    assert agent.ending is None
+    await drain_guard_audits()
 
 
 QUESTION = "Should I stop taking my Lisinopril because of the headaches?"
@@ -881,7 +893,7 @@ QUESTION = "Should I stop taking my Lisinopril because of the headaches?"
 
 async def test_a_message_read_back_is_said(deps: Deps, registry: Registry) -> None:
     model = ScriptedModel()
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
     await verified(agent, model)
     read_back = f"Your message to Dr. Patel reads: {QUESTION} Shall I send it?"
     model.then(
@@ -906,7 +918,7 @@ async def test_a_message_read_back_is_said(deps: Deps, registry: Registry) -> No
 
 async def test_a_callback_reason_read_back_is_said(deps: Deps, registry: Registry) -> None:
     model = ScriptedModel()
-    agent = agent_for(model, deps, registry)
+    agent = await agent_for(model, deps, registry)
     await verified(agent, model)
     arguments = {
         "name": "Sarah Johnson",
@@ -928,7 +940,7 @@ async def test_a_first_sentence_over_the_bound_falls_back(
 ) -> None:
     caplog.set_level(logging.INFO)
     model = ScriptedModel(says("A" * 600 + ". Short one."))
-    agent = agent_for(model, offline_deps, registry)
+    agent = await agent_for(model, offline_deps, registry)
 
     result = await agent.handle("Hello.")
 

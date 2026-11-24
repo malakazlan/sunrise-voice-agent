@@ -95,6 +95,11 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      TTS_MODEL: ${TTS_MODEL:-}
+      VAD_STOP_SECONDS: ${VAD_STOP_SECONDS:-}
+      IDLE_SECONDS: ${IDLE_SECONDS:-}
     depends_on:
       startup:
         condition: service_completed_successfully

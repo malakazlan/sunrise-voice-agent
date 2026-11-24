@@ -5,8 +5,9 @@ and seals it, after which nothing more can be registered. The application calls 
 the structural tests call it too, so every tool registered here is bound by the gate's rules.
 
 `submit_identity` is code-only: its grant stays in this module, and `submit_claim` is the one
-way code calls it. So is `hand_off_to_staff`, which `call_tool` runs when an outcome asks for a
-hand-off.
+way code calls it. So is `hand_off_to_staff`, which `hand_off` runs: for `call_tool` when an
+outcome asks for a hand-off, and for the turn (app/agent/turn.py) when the model keeps failing
+or its replies keep being blocked.
 """
 
 from app.agent.booking import BOOKING_TOOLS
@@ -143,13 +144,25 @@ async def call_tool(
     after, outcome = await REGISTRY.dispatch(state, name, raw_args, deps)
     if not _reaches_the_limit(state, after):
         return after, outcome
-    if is_available(HAND_OFF_TO_STAFF, after):
-        return await REGISTRY.dispatch(
-            after, HAND_OFF_TO_STAFF.name, {}, deps, grant=_HAND_OFF_GRANT
-        )
-    if is_available(TAKE_MESSAGE, after):
+    handed = await hand_off(after, deps)
+    if handed is not None:
+        return handed
+    if offers_a_message(after):
         return after, outcome.model_copy(update={"script": ScriptId.FALLBACK})
     return after, outcome
+
+
+async def hand_off(state: CallState, deps: Deps) -> tuple[CallState, ToolOutcome] | None:
+    """Code's hand-off of a call that keeps failing: hand_off_to_staff, by its grant, where it
+    is offered (the office open, a phase with tools). None where it is not."""
+    if not is_available(HAND_OFF_TO_STAFF, state):
+        return None
+    return await REGISTRY.dispatch(state, HAND_OFF_TO_STAFF.name, {}, deps, grant=_HAND_OFF_GRANT)
+
+
+def offers_a_message(state: CallState) -> bool:
+    """Whether the caller can be offered a message instead (the office closed)."""
+    return is_available(TAKE_MESSAGE, state)
 
 
 async def submit_claim(state: CallState, deps: Deps) -> tuple[CallState, ToolOutcome]:

@@ -1,0 +1,37 @@
+# Verified Sarah asks for her husband's balance. The guard flags it; no tool can return another
+# patient's data, and nothing said or shown holds any other patient's.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+  - caller: "three three four four"
+    expect:
+      said: [verified]
+  - caller: "What does my husband owe? His name is Michael Brown."
+    model:
+      - say: >-
+          I can only help with your own account. Your husband would need to call us himself.
+    expect:
+      flags: [third_party]
+      tools: []
+expect:
+  said: [greeting, ssn_ask, verified]
+  phase: serving
+  verified: true
+  audit: [call_started, identity_claimed, identity_verified, call_ended]
+  # Michael Brown's record, and every other patient's.
+  never:
+    - "Atorvastatin"
+    - "Walgreens"
+    - "1972"
+    - "one zero two zero"
+    - "Maria"
+    - "Garcia"
+    - "James"
+    - "Carter"
+    - "Emily"
+    - "Nguyen"
+    - "120.50"
+    - "15.25"

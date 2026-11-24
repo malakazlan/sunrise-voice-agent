@@ -2,7 +2,8 @@
 # its networking changes. app and coturn join a network whose addresses lie outside every
 # range coturn denies, so no peer has to be allowed and every deny rule is exercised. The
 # app's vendor hosts resolve to its own loopback, where nothing listens: the probe's calls
-# start speech-to-text, which must fail there and never reach the vendor with CI's fake keys.
+# start speech-to-text and speech out, which must fail there and never reach a vendor with CI's
+# fake keys. A line that cannot be spoken still reaches the page, and the call goes on.
 #   TURN_HOST=203.0.113.10 docker compose --env-file .env -f deploy/docker-compose.yml \
 #     -f deploy/docker-compose.relay-test.yml up -d
 services:
@@ -10,6 +11,7 @@ services:
     extra_hosts:
       - "api.deepgram.com:127.0.0.1"
       - "api.anthropic.com:127.0.0.1"
+      - "api.elevenlabs.io:127.0.0.1"
     networks:
       default: {}
       relay-test: {}

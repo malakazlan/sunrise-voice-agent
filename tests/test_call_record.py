@@ -17,6 +17,8 @@ from typing import Any
 
 import pytest
 from conftest import OFFLINE_DB_ENV, REPO_ROOT, offline_settings
+from pipecat.frames.frames import InterruptionFrame, VADUserStartedSpeakingFrame
+from speech_fakes import CallPipeline, FakeTime, FakeVoice, agent_call, caller_says, until
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from test_admin_api import admin_settings
@@ -30,22 +32,20 @@ from test_turn import (
     SEED_DAY,
     SSN_ASK,
     T0,
-    ScriptedModel,
     agent_for,
-    calls,
     deps_on,
     everything_sent,
     new_call_id,
-    says,
 )
 
+import app.agent.turn
 from app.agent import call_record
 from app.agent.call_record import drain_call_records, record_call
 from app.agent.endings import END_PHASES, drain_call_events, end_call
+from app.agent.model import ModelReply
 from app.agent.state import CallState, Phase, move, new_call
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import CALL_CONNECTED
 from app.audit.log import Reason
 from app.db.models import CALL_END_REASONS, MAX_TRANSCRIPT
 from app.db.seed import load_seed_data, seed
@@ -53,6 +53,7 @@ from app.db.session import create_database_engine
 from app.guard.input import GuardAction
 from app.guard.mask import mask
 from app.main import create_app
+from evals.scripted import ScriptedModel, calls, says
 
 pytestmark = pytest.mark.anyio
 
@@ -108,17 +109,29 @@ def plain_presidio(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(call_record, "_scrub", lambda text: text)
 
 
-def turn_path_uses(source: str) -> list[str]:
+def _is_record_call(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Name) and node.id == "record_call") or (
+        isinstance(node, ast.Attribute) and node.attr == "record_call"
+    )
+
+
+def record_uses(source: str) -> list[str]:
+    """Where a module names the call record: its imports, each function that calls record_call,
+    and each function that awaits it."""
     uses = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.ImportFrom) and "call_record" in (node.module or ""):
-            uses.append(f"from {node.module}")
-        elif isinstance(node, ast.ImportFrom | ast.Import):
+            uses.append(f"from {node.module} import {', '.join(a.name for a in node.names)}")
+        elif isinstance(node, ast.Import):
             uses += [f"import {a.name}" for a in node.names if "call_record" in a.name]
-        elif isinstance(node, ast.Name) and node.id in ("record_call", "call_record"):
-            uses.append(node.id)
-        elif isinstance(node, ast.Attribute) and node.attr in ("record_call", "call_record"):
-            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and _is_record_call(inner.func):
+                    uses.append(f"call in {node.name}")
+                elif isinstance(inner, ast.Await) and any(
+                    _is_record_call(part) for part in ast.walk(inner)
+                ):
+                    uses.append(f"await in {node.name}")
     return uses
 
 
@@ -130,7 +143,7 @@ async def test_transcript_is_masked_and_late(
 ) -> None:
     caplog.set_level(logging.DEBUG)
     model = ScriptedModel(calls(("verify_identity", SARAH_CLAIM)), says(CONTACT_REPLY))
-    agent = agent_for(model, deps, register_tools())
+    agent = await agent_for(model, deps, register_tools())
     await agent.handle(CLAIM)
     assert (await agent.handle(DIGITS_IN_WORDS)).action is GuardAction.SWALLOW
     await agent.handle(CONTACT)
@@ -212,18 +225,25 @@ async def test_transcript_is_masked_and_late(
     for raw in ("Sarah", "Johnson", PHONE, EMAIL, SSN_DIGITS, DIGITS_IN_WORDS, CONTACT_REPLY):
         assert raw not in caplog.text, raw
 
-    # Never on the turn path: the turn module neither imports the record nor calls it.
-    assert turn_path_uses("from app.agent.call_record import record_call\n")
-    assert turn_path_uses("from app.agent import call_record\ncall_record.record_call(s)\n")
-    assert turn_path_uses("import app.agent.call_record\n")
-    assert turn_path_uses(TURN_MODULE.read_text(encoding="utf-8")) == []
+    # Never on the turn path: the turn module calls the record in `end` alone, and does not
+    # await it.
+    assert record_uses("async def _handle(s):\n    record_call(s)\n") == ["call in _handle"]
+    assert record_uses("async def end(s):\n    await call_record.record_call(s)\n") == [
+        "await in end",
+        "call in end",
+    ]
+    assert record_uses("import app.agent.call_record\n") == ["import app.agent.call_record"]
+    assert record_uses(TURN_MODULE.read_text(encoding="utf-8")) == [
+        "from app.agent.call_record import record_call",
+        "call in end",
+    ]
 
 
 async def test_each_swallowed_turn_leaves_one_marker(
     deps: Deps, owner_engine: Engine, plain_presidio: None
 ) -> None:
     model = ScriptedModel(calls(("verify_identity", SARAH_CLAIM)))
-    agent = agent_for(model, deps, register_tools())
+    agent = await agent_for(model, deps, register_tools())
     await agent.handle(CLAIM)
     # The last four in two turns, both swallowed; the second submits them.
     words = DIGITS_IN_WORDS.split()
@@ -342,7 +362,7 @@ async def verified_emily(deps: Deps) -> tuple[CallState, tuple[dict[str, Any], .
     emily = next(p for p in load_seed_data()["patients"] if p["id"] == "P005")
     claim = {"full_name": f"{emily['first_name']} {emily['last_name']}", "dob": emily["dob"]}
     model = ScriptedModel(calls(("verify_identity", claim)))
-    agent = agent_for(model, deps, register_tools())
+    agent = await agent_for(model, deps, register_tools())
     await agent.handle("hi, this is emily nguyen")
     last_four = " ".join(DIGIT_WORDS[int(digit)] for digit in emily["ssn_last4"])
     assert (await agent.handle(last_four)).lines == (VERIFIED_EMILY,)
@@ -420,7 +440,7 @@ async def test_an_emergency_turn_leaves_its_marker(
     deps: Deps, owner_engine: Engine, plain_presidio: None
 ) -> None:
     model = ScriptedModel()
-    agent = agent_for(model, deps, register_tools())
+    agent = await agent_for(model, deps, register_tools())
     assert (await agent.handle(HEART_ATTACK)).action is GuardAction.EMERGENCY
     ended = await end_call(agent.state, Reason.EMERGENCY, deps)
     record_call(ended, agent.history, Reason.EMERGENCY, deps)
@@ -476,7 +496,6 @@ async def test_presidio_failure_is_survivable(
 
     monkeypatch.setattr(call_record, "_scrub", broken)
     history: list[dict[str, Any]] = [
-        {"role": "user", "content": CALL_CONNECTED},
         {"role": "assistant", "content": "How can I help?"},
         {"role": "user", "content": f"I'm Jane Roe, born 1985-03-14, call {PHONE}."},
         {
@@ -651,3 +670,144 @@ async def test_shutdown_waits_for_call_records(
         record_call(state, [{"role": "user", "content": "Hi."}], Reason.COMPLETED, app.state.deps)
         await asyncio.sleep(0)
     assert [row[0] for row in stored(owner_engine)] == [state.call_id]
+
+
+# --- the live call ----------------------------------------------------------------------
+
+GOODBYE = "Thank you for calling Sunrise Family Clinic. Goodbye."
+# Each way a live call ends here: what the caller says (nothing: they hang up), what the model
+# does with it, the reason the record gives and the transcript kept, written by hand.
+LIVE_ENDINGS: dict[str, tuple[str | None, list[ModelReply], str, str]] = {
+    "goodbye": (
+        "No, that's all. Thanks.",
+        [calls(("close_call", {}))],
+        "completed",
+        f"agent: {GREETING}\ncaller: No, that's all. Thanks.\nagent: {GOODBYE}",
+    ),
+    "hang_up": (None, [], "caller_hung_up", f"agent: {GREETING}"),
+    "emergency": (
+        HEART_ATTACK,
+        [],
+        "emergency",
+        f"agent: {GREETING}\n{EMERGENCY_LINE}\nagent: {EMERGENCY}",
+    ),
+}
+
+
+@pytest.mark.parametrize("ending", list(LIVE_ENDINGS))
+async def test_the_live_call_is_recorded_once(
+    ending: str, runtime: AsyncEngine, owner_engine: Engine, plain_presidio: None
+) -> None:
+    caller, steps, reason, transcript = LIVE_ENDINGS[ending]
+    time = FakeTime()
+    call_id = new_call_id()
+    processor, playback = agent_call(call_id, deps_on(runtime), ScriptedModel(*steps), time)
+    voice = FakeVoice()
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: len(voice.spoken) == 1, "the opening line")
+        await until(lambda: time.waiting == 2, "the timers")
+        if caller is None:
+            await processor.hang_up()
+        else:
+            await call.send(*caller_says(caller))
+            await until(lambda: call.ended, "the call to end")
+    # A second ending changes nothing: the call ended, and was recorded, once.
+    await processor.hang_up()
+    await drain_call_records()
+    await drain_call_events()
+
+    assert [(row[0], row[6], row[8]) for row in stored(owner_engine)] == [
+        (call_id, reason, transcript)
+    ]
+
+
+REPLY = "We are open Monday to Friday, from nine to five."
+
+
+async def test_an_interrupted_reply_is_recorded_as_heard(
+    runtime: AsyncEngine, owner_engine: Engine, plain_presidio: None
+) -> None:
+    model = ScriptedModel(says(REPLY), says("Sure, what is it?"))
+    time = FakeTime()
+    processor, playback = agent_call(new_call_id(), deps_on(runtime), model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the greeting")
+        await voice.play_all()
+        await call.send(*caller_says("When are you open?"))
+        await until(lambda: voice.waiting == 1, "the reply")
+        # Four words in, the caller speaks.
+        await voice.start(4)
+        await call.send(VADUserStartedSpeakingFrame())
+        await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
+        await call.send(*caller_says("Actually, I have a question.")[1:])
+        await until(lambda: voice.waiting == 1, "the next reply")
+        await voice.play_all()
+        await processor.hang_up()
+    await drain_call_records()
+
+    assert [row[8] for row in stored(owner_engine)] == [
+        f"agent: {GREETING}\n"
+        "caller: When are you open?\n"
+        "agent: We are open Monday\n"
+        "caller: Actually, I have a question.\n"
+        "agent: Sure, what is it?"
+    ]
+
+
+async def test_the_end_does_not_wait_for_the_record(
+    runtime: AsyncEngine,
+    owner_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    released = threading.Event()
+
+    def held(text: str) -> str:
+        released.wait(timeout=10)
+        return text
+
+    monkeypatch.setattr(call_record, "_scrub", held)
+    agent = await agent_for(ScriptedModel(), deps_on(runtime), register_tools())
+    try:
+        # The end returns while the record is still being masked.
+        await asyncio.wait_for(agent.end(Reason.CALLER_HUNG_UP), timeout=5)
+        assert agent.state.phase is Phase.ENDED
+        assert stored(owner_engine) == []
+    finally:
+        released.set()
+    await drain_call_records()
+    assert [row[0] for row in stored(owner_engine)] == [agent.state.call_id]
+
+    # A second end of the ended call starts no second record.
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    await agent.end(Reason.CALLER_HUNG_UP)
+    await drain_call_records()
+    assert [r.getMessage() for r in caplog.records if r.name == "app.agent.call_record"] == []
+
+
+async def test_a_record_that_cannot_start_never_reaches_the_call(
+    runtime: AsyncEngine,
+    owner_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken(*_args: object) -> None:
+        raise RuntimeError("no loop for the record")
+
+    monkeypatch.setattr(app.agent.turn, "record_call", broken)
+    caplog.set_level(logging.INFO)
+    agent = await agent_for(ScriptedModel(), deps_on(runtime), register_tools())
+    await agent.end(Reason.CALLER_HUNG_UP)
+    await drain_call_events()
+
+    assert agent.state.phase is Phase.ENDED
+    assert [r.getMessage() for r in caplog.records if r.name == "app.agent.turn"] == [
+        f"call_record_not_started call_id={agent.state.call_id} error=RuntimeError"
+    ]
+    assert "no loop" not in caplog.text

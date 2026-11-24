@@ -1,0 +1,104 @@
+# A first-time caller gives their details, is offered at most three open slots, hears the one
+# they chose read back, and books it. The seed is loaded for Tuesday 24 November, so the
+# earliest open slots are Wednesday's generated ones: Dr. Patel at 9:30 (slot 8), Dr. Lee at
+# 10:00 (slot 11) and Dr. Patel at 11:00 (slot 9). The seven task slots take ids 1 to 7; each
+# day's generated rows go in Dr. Patel's three times first, then Dr. Lee's two.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, I'd like to book an appointment. It's my first visit."
+    model:
+      - call: start_new_patient
+      - say: "Welcome. What is your full name and date of birth?"
+    expect:
+      tools: [{call: start_new_patient}]
+      phase: booking
+  - caller: >-
+      I'm Ann Example, born May 5, 1990. My phone is 555 010 2030 and my email is ann at
+      example dot com. I'll pay myself, and it's for a checkup.
+    model:
+      - call: collect_new_patient
+        args:
+          full_name: "Ann Example"
+          dob: "1990-05-05"
+          phone: "555 010 2030"
+          email: "ann@example.com"
+          self_pay: true
+          reason_short: "Checkup"
+      - call: find_slots
+      - say: >-
+          I have Wednesday, November 25 at 9:30 AM with Dr. Patel, 10:00 AM with Dr. Lee,
+          or 11:00 AM with Dr. Patel. Which would you like?
+    expect:
+      tools:
+        - call: collect_new_patient
+          returns: {email_spelled: "A N N at E X A M P L E dot C O M"}
+        - call: find_slots
+          returns:
+            slots:
+              - {slot_id: 8, doctor: "Dr. Patel", date: "Wednesday, November 25", time: "9:30 AM"}
+              - {slot_id: 11, doctor: "Dr. Lee", date: "Wednesday, November 25", time: "10:00 AM"}
+              - {slot_id: 9, doctor: "Dr. Patel", date: "Wednesday, November 25", time: "11:00 AM"}
+  - caller: "The first one, please."
+    model:
+      - call: book_new_patient
+        args: {slot_id: 8, confirmed: false}
+      - say: "That's Wednesday, November 25 at 9:30 AM with Dr. Patel. Shall I book it?"
+    expect:
+      tools:
+        - call: book_new_patient
+          args: {slot_id: 8, confirmed: false}
+          returns:
+            status: needs_confirmation
+            doctor: "Dr. Patel"
+            date: "Wednesday, November 25"
+            time: "9:30 AM"
+  - caller: "Yes, book it."
+    model:
+      - call: book_new_patient
+        args: {slot_id: 8, confirmed: true}
+    expect:
+      said: [booking_instructions]
+      phase: closing
+expect:
+  said: [greeting, booking_instructions]
+  tools:
+    - call: start_new_patient
+    - call: collect_new_patient
+    - call: find_slots
+    - call: book_new_patient
+      args: {confirmed: false}
+    - call: book_new_patient
+      args: {confirmed: true}
+  phase: closing
+  verified: false
+  rows:
+    - table: patients
+      where: {first_name: Ann, last_name: Example, is_new: true, possible_duplicate: false}
+      count: 1
+    - table: patients
+      count: 1
+    - table: appointments
+      where: {slot_id: 8, doctor: "Dr. Patel", status: scheduled}
+      count: 1
+    - table: appointments
+      count: 1
+    - table: available_slots
+      where: {id: 8, is_available: false}
+      count: 1
+    - table: available_slots
+      count: 1
+    - table: requests
+      where:
+        type: booking
+        summary: "Dr. Patel on Wednesday, November 25, 2026 at 9:30 AM; confirm by email"
+      count: 1
+    - table: requests
+      count: 1
+  audit:
+    - call_started
+    - new_patient_started
+    - new_patient_details_collected
+    - slots_offered
+    - booking_previewed
+    - new_patient_booked
+    - call_ended

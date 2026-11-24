@@ -590,7 +590,7 @@ def every_line_said_to_the_model(first_name: str) -> list[str]:
         SCRIPTS[script].text.format(**{key: values[key] for key in placeholders(script)})
         for script in ScriptId
     ]
-    assert len(lines) == 15
+    assert len(lines) == 17
     return [*lines, REFUSED_MESSAGE, FAILED_MESSAGE]
 
 

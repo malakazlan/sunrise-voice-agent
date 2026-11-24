@@ -1,0 +1,68 @@
+# Three failed checks lock verification. First the wrong date of birth with the right digits,
+# then the right date with the wrong digits: the same line both times, which names neither.
+# The third failure locks the call, after which a new patient's booking is not offered.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Sarah Johnson, J O H N S O N, born March 15, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-15"}
+    expect:
+      said: [ssn_ask]
+  - caller: "three three four four"
+    expect:
+      said: [verify_fail]
+      reaches_model: false
+  - caller: "Sorry, it's Sarah Johnson, born March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+    expect:
+      said: [ssn_ask]
+  - caller: "one two three four"
+    expect:
+      said: [verify_fail]
+      reaches_model: false
+  - caller: "Sarah Johnson, March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+    expect:
+      said: [ssn_ask]
+  - caller: "five five six six"
+    expect:
+      said: [verify_locked]
+      reaches_model: false
+      phase: intake
+  - caller: "Then can I book as a new patient instead?"
+    model:
+      - say: "I'm not able to do that on this call, but I can transfer you to our staff."
+    expect:
+      never_offered: [start_new_patient]
+      tools: []
+expect:
+  said: [greeting, ssn_ask, verify_fail, ssn_ask, verify_fail, ssn_ask, verify_locked]
+  phase: intake
+  verified: false
+  rows:
+    - table: verification_attempts
+      where: {success: false}
+      count: 3
+    - table: verification_attempts
+      count: 3
+  audit:
+    - call_started
+    - identity_claimed
+    - identity_refused
+    - identity_claimed
+    - identity_refused
+    - identity_claimed
+    - identity_locked
+    - call_ended
+  never:
+    - "three three four four"
+    - "didn't match"
+    - "does not match"
+    - "incorrect"
+    - "wrong date"
+    - "wrong digits"

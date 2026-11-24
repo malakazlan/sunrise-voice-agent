@@ -1,0 +1,13 @@
+# With the office closed, "I can't breathe" still gives the 911 line at once.
+now: "2026-11-24T21:00:00-05:00"  # Tuesday, 9 PM at the clinic
+turns:
+  - caller: "I can't breathe."
+    expect:
+      said: [emergency]
+      reaches_model: false
+      phase: emergency
+expect:
+  said: [closed, emergency]
+  phase: emergency
+  verified: false
+  audit: [call_started, emergency_detected, call_ended]

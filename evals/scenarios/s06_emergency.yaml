@@ -1,0 +1,32 @@
+# Mid-call, a verified caller says "chest pain": the input guard gives the 911 line at once and
+# the call moves to emergency. The model is not asked that turn, and no tool is offered after.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+  - caller: "three three four four"
+    expect:
+      said: [verified]
+  - caller: "Actually, I have chest pain right now."
+    expect:
+      said: [emergency]
+      reaches_model: false
+      phase: emergency
+  - caller: "Hello? Are you still there?"
+    model:
+      - say: "Please hang up and call 911 now."
+    expect:
+      offered: []
+      tools: []
+      said: []
+expect:
+  said: [greeting, ssn_ask, verified, emergency]
+  phase: emergency
+  audit: [call_started, identity_claimed, identity_verified, emergency_detected, call_ended]
+  # The stored record: the swallowed digits and the emergency turn as their markers, and her
+  # name hidden.
+  record:
+    withheld: [swallowed, emergency]
+    never: ["Sarah", "Johnson", "three three four four", "chest pain"]

@@ -32,6 +32,11 @@ TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
 # LLM_MODEL: a Claude model id as Anthropic writes them, such as claude-haiku-5-5.
 CLAUDE_MODEL_ID = r"^claude-[a-z0-9][a-z0-9.-]{0,59}$"
+# ELEVENLABS_VOICE_ID and TTS_MODEL go into the ElevenLabs WebSocket URL: letters and digits
+# only for the voice; for the model, ElevenLabs' Flash models, the lowest-latency ones its
+# multi-stream endpoint serves (it serves no v3 or v4 model).
+ELEVENLABS_VOICE_ID = r"^[A-Za-z0-9]{1,64}$"
+LOW_LATENCY_TTS_MODEL = r"^eleven_flash_v2(_5)?$"
 # The APP_DB_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_APP_DB_PASSWORD = "change-me-to-another-long-random-value"  # noqa: S105 (a published placeholder)
 # The runtime role's name goes into role set-up statements (app/db/roles.py), always quoted.
@@ -248,8 +253,20 @@ class Settings(DatabaseSettings):
     anthropic_api_key: SecretStr | None = Field(default=None, validate_default=True)
     deepgram_api_key: SecretStr | None = Field(default=None, validate_default=True)
     llm_model: str = Field(default="claude-haiku-5-5", pattern=CLAUDE_MODEL_ID)
+    # Speech out (app/voice/speech.py): ElevenLabs' key and the voice. No voice is guessed:
+    # without both, a call is refused at set-up, and outside dev the app does not start.
+    elevenlabs_api_key: SecretStr | None = Field(default=None, validate_default=True)
+    elevenlabs_voice_id: str | None = Field(
+        default=None, validate_default=True, pattern=ELEVENLABS_VOICE_ID
+    )
+    tts_model: str = Field(default="eleven_flash_v2_5", pattern=LOW_LATENCY_TTS_MODEL)
+    # The silence that ends a caller's turn (app/voice/pipeline.py).
+    vad_stop_seconds: float = Field(default=0.5, ge=0.2, le=2.0)
+    # Silence from the caller before the agent asks whether they are still there, and again
+    # before it says goodbye.
+    idle_seconds: int = Field(default=30, ge=5, le=300)
 
-    @field_validator("anthropic_api_key", "deepgram_api_key")
+    @field_validator("anthropic_api_key", "deepgram_api_key", "elevenlabs_api_key")
     @classmethod
     def _vendor_key_outside_dev(
         cls, value: SecretStr | None, info: ValidationInfo
@@ -260,6 +277,13 @@ class Settings(DatabaseSettings):
                 raise ValueError(f"{name} is required unless app_env is dev")
             return None
         _check_strong_secret(name, value, info)
+        return value
+
+    @field_validator("elevenlabs_voice_id")
+    @classmethod
+    def _voice_outside_dev(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None and _outside_dev(info):
+            raise ValueError("elevenlabs_voice_id is required unless app_env is dev")
         return value
 
     @field_validator("audit_hmac_key", "identity_hash_key")
