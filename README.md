@@ -339,7 +339,14 @@ same rules as the app and stops at start-up, naming the variable, if `TURN_HOST`
 `TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty
 `MAX_CONCURRENT_CALLS` means 3, as in the app. So the whole stack needs the TURN values set. coturn uses host networking, which needs a
 Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49359. The app is
-published on `127.0.0.1:8000` only.
+published on `127.0.0.1` only, port 8000 by default; on a server it is reached through the
+HTTPS proxy.
+
+When port 8000 is taken on the host, as on a server whose own dashboard uses it, set
+`APP_HOST_PORT` in the shell: `APP_HOST_PORT=8100 docker compose --env-file .env -f
+deploy/docker-compose.yml up --build` publishes the app on `127.0.0.1:8100`. It is a Compose
+variable only, not an application setting, and no container receives it, so it does not go in
+`.env`, whose unknown keys the app refuses.
 
 ## Run locally with uv
 

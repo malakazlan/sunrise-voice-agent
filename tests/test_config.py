@@ -179,6 +179,10 @@ def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
     # The app waits for the start-up service to have exited with 0; a failure keeps it down.
     depends = app[app.index("depends_on:") :]
     assert depends[:3] == ["depends_on:", "startup:", "condition: service_completed_successfully"]
+    # Published on loopback only, whatever the host port; APP_HOST_PORT picks it, default 8000.
+    published = app[app.index("ports:") + 1 :]
+    entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
+    assert entries == ['- "127.0.0.1:${APP_HOST_PORT:-8000}:8000"']
 
 
 def compose_service_lines(name: str) -> list[str]:
@@ -247,6 +251,10 @@ def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
     assert compose_environment("app") == {name.upper() for name in Settings.model_fields}
     assert compose_environment("startup") == {name.upper() for name in StartupSettings.model_fields}
     assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+    # The app's host port is Compose's alone: in no container and no settings class.
+    for service in ("db", "startup", "app", "coturn"):
+        assert "APP_HOST_PORT" not in compose_environment(service), service
+    assert "APP_HOST_PORT" not in every_variable()
 
     # No other route either: no env_file anywhere in the app service, and the owner's names
     # nowhere in its text (not even inside another variable's value).
