@@ -200,7 +200,8 @@ All data used by this project is synthetic. No real customer or personal data is
     - The role can end its own sessions (`pg_terminate_backend` on a backend of the same role).
     - A rotated password does not end sessions opened with the old one.
     - A hostile session of the runtime role can make start-up fail, by holding the role
-      set-up's advisory lock or a lock on a table it may write, until that session ends.
+      set-up's advisory lock, a lock on a table it may write, or an uncommitted row the seed
+      also inserts (a patient with a seed id), until that session ends.
       Restarting the database ends it.
     - Use a dedicated database server. Do not point `POSTGRES_*` at a server that hosts other
       applications: set-up takes `PUBLIC`'s privileges away on every other database on that

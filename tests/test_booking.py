@@ -412,7 +412,9 @@ async def test_only_an_open_offered_future_slot_books(
     # A new patient is held to the same rule.
     newcomer, _ = await done(registry, deps, await new_patient(registry, deps), FIND)
     assert newcomer.offered_slots == (second, third, never_offered)
-    for when, slot in [(deps, first), (deps, 999_999), (later, second)]:
+    # Open and in the future, but never offered to this call.
+    open_elsewhere = slot_id(owner_engine, "Dr. Patel", at(11, 25, 15))
+    for when, slot in [(deps, first), (deps, open_elsewhere), (deps, 999_999), (later, second)]:
         for confirmed in (None, True):
             outcome = (
                 await run(registry, when, newcomer, BOOK_NEW, booking_args(slot, confirmed))
@@ -425,7 +427,7 @@ async def test_only_an_open_offered_future_slot_books(
     ]
     assert [row[2] for row in rows(owner_engine, REQUESTS)] == ["booking"]
     assert rows(owner_engine, PATIENT_COUNT) == [(5,)]
-    for slot in (second, third, never_offered):
+    for slot in (second, third, never_offered, open_elsewhere):
         assert is_open(owner_engine, slot)
 
     # And an open, offered, future slot books.
@@ -770,6 +772,9 @@ async def test_new_patient_details_are_bounded(
                 "1990-2-3",
                 "02/03/1990",
                 "1990-02-03T00:00:00",
+                # ISO 8601 forms other than YYYY-MM-DD, which Python's own parser accepts.
+                "19900203",
+                "1990-W05-6",
                 19900203,
                 "1990-13-01",
                 "2026-11-25",
