@@ -272,10 +272,19 @@ async def attempt(engine: AsyncEngine, statement: str) -> DBAPIError | None:
     return None
 
 
+def refused_by_privileges(error: DBAPIError) -> bool:
+    """Whether a privilege check refused the statement. audit_events' triggers refuse with the
+    same SQLSTATE but name their table; Postgres's privilege checks name none."""
+    return (
+        isinstance(error.orig, errors.InsufficientPrivilege) and error.orig.diag.table_name is None
+    )
+
+
 async def assert_refused_by_privileges(engine: AsyncEngine, statement: str) -> DBAPIError:
     error = await attempt(engine, statement)
     assert error is not None, statement
     assert type(error.orig) is errors.InsufficientPrivilege, (statement, type(error.orig))
+    assert refused_by_privileges(error), f"refused by a trigger, not by privileges: {statement}"
     return error
 
 
@@ -315,11 +324,8 @@ async def test_runtime_role_cannot_change_audit_events(
     )
 
     for statement in statements:
-        error = await assert_refused_by_privileges(runtime, statement)
-        # The triggers refuse with the same SQLSTATE but name the table; the privilege check,
-        # which comes first, names none.
-        assert isinstance(error.orig, errors.Error)
-        assert error.orig.diag.table_name is None, statement
+        # The privilege check comes first: the error is not the triggers' (which name the table).
+        await assert_refused_by_privileges(runtime, statement)
 
     # Without the triggers, the privileges alone still refuse.
     with owner.begin() as connection:
@@ -435,6 +441,9 @@ async def test_runtime_role_is_refused_what_is_not_declared(runtime: AsyncEngine
                 allowed[table].add(privilege)
             else:
                 assert type(error.orig) is errors.InsufficientPrivilege, (table, privilege)
+                # Past the privilege check, a trigger refused it: the role holds the privilege.
+                if not refused_by_privileges(error):
+                    allowed[table].add(privilege)
     assert allowed == EXPECTED_TABLES
 
     sequences: dict[str, set[str]] = {}
