@@ -1276,6 +1276,18 @@ def test_identifiers_must_fit_their_declared_pattern(monkeypatch: pytest.MonkeyP
         with pytest.raises(ValueError, match="actor"):
             replace(base, actor=actor)
 
+    # A tool's id is its registered name: lower-case letters and underscores, 2 to 40.
+    tool = {"resource_type": log.ResourceType.TOOL}
+    for name in ("ab", "get_balance", "x" * 40, "__"):
+        assert changed(base, **tool, resource_id=name).resource_id == name
+    for name in ("a", "x" * 41, "Get_balance", "get balance", "get-balance", "tool2", "", "P001"):
+        with pytest.raises(ValueError, match="resource_id"):
+            changed(base, **tool, resource_id=name)
+    for value in NOT_IDENTIFIERS:
+        if value != "mary_ann_lee":
+            with pytest.raises(ValueError, match="resource_id"):
+                changed(base, **tool, resource_id=value)
+
     # A resource type without a declared pattern cannot be used.
     patterns = dict(log.ID_PATTERNS)
     del patterns[log.ResourceType.SLOT]
@@ -1348,16 +1360,23 @@ def test_only_registry_members_are_accepted() -> None:
     assert replace(base, reason=Reason.CALLER_HUNG_UP).reason is Reason.CALLER_HUNG_UP
     assert replace(base, reason=None).reason is None
 
-    # This slice's members, each a valid stored value.
-    assert {member.value for member in Action} == {"call_started", "call_ended"}
+    # Every member so far, each a valid stored value.
+    assert {member.value for member in Action} == {
+        "call_started",
+        "call_ended",
+        "tool_called",
+        "tool_refused",
+        "tool_failed",
+    }
     assert {member.value for member in ResourceType} == {
         "call",
         "patient",
         "appointment",
         "medication",
         "slot",
+        "tool",
     }
-    assert {member.value for member in Outcome} == {"success", "failure"}
+    assert {member.value for member in Outcome} == {"success", "failure", "refused", "failed"}
     assert {member.value for member in Reason} == {"caller_hung_up"}
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:

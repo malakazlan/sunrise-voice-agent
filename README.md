@@ -55,7 +55,7 @@ All data used by this project is synthetic. No real customer or personal data is
     Zero or two matches is no match. Filler words (`my albuterol`) are not removed.
 
 - An audit log, `app/audit/log.py`, the only code that writes or verifies the
-  `audit_events` table (nothing calls it yet; later slices add their events):
+  `audit_events` table (tool dispatch, below, is its first caller):
   - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
     transaction and does not commit, so the event and the action it records commit or roll
     back together. Any failure, a cancelled task included, rolls back the caller's whole
@@ -74,7 +74,8 @@ All data used by this project is synthetic. No real customer or personal data is
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
     variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
-    slot id is its row number (up to 8 digits), and the actor is `agent` or `admin:` and a
+    slot id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
+    lower-case letters and underscores), and the actor is `agent` or `admin:` and a
     user name of letters and underscores. The database's own CHECKs are the outer bound: at
     most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
   - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
@@ -242,6 +243,43 @@ Friday, strictly after today in clinic time, no holiday calendar) have slots for
 9:30 AM, 11:00 AM and 3:00 PM and for Dr. Lee at 10:00 AM and 1:30 PM, America/New_York time.
 These rows have `source = 'generated'`; the slots from the task data have `source = 'task'`.
 A generated slot never replaces an existing slot at the same doctor and time.
+
+### Call state and the tool gate
+
+Nothing calls these yet, and no real tool is registered; later slices add the tools and wire
+them to the model.
+
+- `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
+  `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A state changes
+  only through transition functions, which refuse illegal moves (`IllegalTransitionError`):
+  greeting to intake; intake to booking (a new patient); serving and booking either way;
+  intake, serving or booking to closing, or to handoff while the office is open; any phase but
+  ended to emergency; emergency, handoff or closing to ended. Ended is final. `verify` is the
+  only move from intake to serving and the only code that sets `verified` and the patient id,
+  and it refuses while the office is closed. A call starts unverified, with a call id from the
+  call registry.
+- `app/agent/tool_registry.py`: a tool is declared once (name, argument model, handler,
+  whether it touches patient data, its phases, whether it needs the office open, whether it
+  writes, its audit action and resource type). Registration refuses a declaration that breaks
+  a rule: every field given and of the right kind, the audit action from the audit registry;
+  no argument naming a patient or a record owner (`patient`, `patient_id`, `ssn`, `dob` and
+  the like, nested models and aliases included); a patient-data tool only in `serving` and
+  `booking`; a writing tool's arguments have `confirmed: bool = False`; argument models
+  forbid unknown fields; the name is 2 to 40 lower-case letters and underscores.
+- The gate (`tools_for`): no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
+  `ended`; a tool only in its declared phases; an office-hours tool only while the office is
+  open; a patient-data tool only for a verified caller, while the office is open, in `serving`
+  or `booking`.
+- `dispatch` is the only caller of a handler. It refuses an unknown name, a tool the gate does
+  not allow and arguments that do not validate, without running the handler. Otherwise, in one
+  transaction, the handler runs (it gets the patient id from the state, never from the
+  arguments, and may not commit), the transition it asks for is applied, the audit event is
+  appended, and it commits; any failure rolls all of it back. Every dispatch leaves exactly
+  one audit event: `tool_refused` or `tool_failed` events have resource type `tool` and the
+  tool's name as id (none for a name that is not a registered tool) and are written in their
+  own transaction. The model gets fixed text for a refusal or a failure, never an exception or
+  an argument value. A failure counts toward `tool_errors`; from two on, every outcome asks
+  for a hand-off. Tool calls of one call run one at a time.
 
 ## Configuration
 

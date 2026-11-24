@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from app.agent.tool_registry import REGISTRY
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Three digits, two digits, four digits, not part of a longer run of digits. Matched on raw
@@ -374,6 +376,76 @@ def test_owner_engine_only_in_startup_modules() -> None:
     # Every start-up step reaches the owner through these names, so the scan sees them.
     assert users >= STARTUP_MODULES
     assert users <= OWNER_ALLOWED, users - OWNER_ALLOWED
+
+
+# A tool's handler runs only inside Registry.dispatch, after the gate and the argument check,
+# inside the transaction its audit event commits with. So no `.handler(...)` call may appear
+# anywhere else, and no handler of the application registry may be called by its name. Like
+# the scans above, a lint against accidents: a handler reached under another name is not seen.
+DISPATCH_MODULE = "app/agent/tool_registry.py"
+
+
+def handler_calls(source: str, handler_names: set[str], *, in_dispatch_module: bool) -> list[str]:
+    tree = ast.parse(source)
+    allowed: set[int] = set()
+    if in_dispatch_module:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "Registry":
+                for item in node.body:
+                    if isinstance(item, ast.AsyncFunctionDef) and item.name == "dispatch":
+                        allowed |= {id(inner) for inner in ast.walk(item)}
+    uses = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or id(node) in allowed:
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "handler":
+            uses.append(".handler()")
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name in handler_names:
+            uses.append(f"{name}()")
+    return uses
+
+
+def test_handlers_are_called_only_by_dispatch() -> None:
+    in_dispatch = (
+        "class Registry:\n"
+        "    async def dispatch(self, state, name, raw_args, deps):\n"
+        "        return await tool.handler(session, state, arguments)\n"
+    )
+    elsewhere = in_dispatch.replace("dispatch", "run_directly")
+    for sample in (
+        "await tool.handler(session, state, arguments)\n",
+        "registry.tools[0].handler(session, state, arguments)\n",
+        "await get_balance(session, state, arguments)\n",
+        "await tools.get_balance(session, state, arguments)\n",
+        in_dispatch,
+    ):
+        assert handler_calls(sample, {"get_balance"}, in_dispatch_module=False), sample
+    assert handler_calls(elsewhere, set(), in_dispatch_module=True)
+    assert not handler_calls(in_dispatch, set(), in_dispatch_module=True)
+    assert not handler_calls(
+        "registry.register(Tool(name='get_balance', handler=get_balance))\n"
+        "await registry.dispatch(state, 'get_balance', {}, deps)\n",
+        {"get_balance"},
+        in_dispatch_module=False,
+    )
+
+    names = {getattr(item.handler, "__name__", "") for item in REGISTRY.tools}
+    sources = {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in tracked_files()
+        if path.suffix == ".py"
+    }
+    # dispatch is where the one call is, and the scan sees it.
+    dispatch_source = sources[DISPATCH_MODULE]
+    assert handler_calls(dispatch_source, set(), in_dispatch_module=False) == [".handler()"]
+
+    offenders = {
+        name: found
+        for name, source in sources.items()
+        if (found := handler_calls(source, names, in_dispatch_module=name == DISPATCH_MODULE))
+    }
+    assert offenders == {}
 
 
 # app/domain/ decides office hours and identity from its arguments alone: no database, no
