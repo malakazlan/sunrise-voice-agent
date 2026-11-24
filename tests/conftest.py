@@ -9,8 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from psycopg import errors
+from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings, StartupSettings
@@ -344,6 +347,80 @@ async def owner_session(database: StartupSettings) -> AsyncIterator[AsyncSession
             yield session
     finally:
         await engine.dispose()
+
+
+@pytest.fixture
+async def runtime(database: StartupSettings) -> AsyncIterator[AsyncEngine]:
+    """The application's engine: the runtime role."""
+    engine = create_database_engine(database)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+def fresh_role(
+    server_settings: StartupSettings, database: StartupSettings
+) -> Iterator[StartupSettings]:
+    """The test database with a runtime role of its own that does not exist yet. Afterwards
+    the database goes first, with every grant in it, whoever made them; then the role."""
+    settings = database.model_copy(
+        update={
+            "app_db_user": new_role_name("fresh"),
+            "app_db_password": SecretStr(secrets.token_urlsafe(24)),
+        }
+    )
+    try:
+        yield settings
+    finally:
+        drop_database(server_settings, database.postgres_db)
+        drop_role(server_settings, settings.app_db_user)
+
+
+async def attempt(engine: AsyncEngine, statement: str) -> DBAPIError | None:
+    """Run one statement in its own transaction, rolled back; the error, if it failed."""
+    async with engine.connect() as connection:
+        try:
+            await connection.execute(text(statement))
+        except DBAPIError as error:
+            return error
+        finally:
+            await connection.rollback()
+    return None
+
+
+def refused_by_privileges(error: DBAPIError) -> bool:
+    """Whether a privilege check refused the statement. audit_events' triggers refuse with the
+    same SQLSTATE but name their table; Postgres's privilege checks name none."""
+    return (
+        isinstance(error.orig, errors.InsufficientPrivilege) and error.orig.diag.table_name is None
+    )
+
+
+async def assert_refused_by_privileges(engine: AsyncEngine, statement: str) -> DBAPIError:
+    error = await attempt(engine, statement)
+    assert error is not None, statement
+    assert type(error.orig) is errors.InsufficientPrivilege, (statement, type(error.orig))
+    assert refused_by_privileges(error), f"refused by a trigger, not by privileges: {statement}"
+    return error
+
+
+async def connects(settings: StartupSettings) -> bool:
+    """Whether the runtime role logs in to the settings' database with their password. A
+    refusal must be the password's or the database's, never anything else."""
+    engine = create_database_engine(settings)
+    try:
+        async with engine.connect() as connection:
+            user = await connection.scalar(text("SELECT current_user"))
+    except OperationalError as error:
+        refusals = ("password authentication failed", "permission denied for database")
+        assert any(refusal in str(error) for refusal in refusals), "not a login refusal"
+        return False
+    finally:
+        await engine.dispose()
+    assert user == settings.app_db_user
+    return True
 
 
 # Tests reach the driver connection under an engine only through these two fixtures; the

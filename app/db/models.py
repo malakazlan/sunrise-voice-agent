@@ -162,9 +162,12 @@ class AuditEvent(Base):
 
 # audit_events is append-only for every role, the owner and superusers included: a statement
 # that would update, delete or truncate is refused before it touches a row, even when it
-# matches none. The migrations create the same functions and triggers.
+# matches none. The migrations create the same functions and triggers. Both functions pin
+# their search path and name the table with its schema, so nothing created later, ahead of
+# them on a session's search path, can stand in for what they use.
 AUDIT_PROTECTION = (
-    "CREATE FUNCTION audit_events_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+    "CREATE FUNCTION audit_events_refuse_change() RETURNS trigger LANGUAGE plpgsql"
+    " SET search_path = pg_catalog, pg_temp AS $$\n"
     "BEGIN\n"
     "  RAISE EXCEPTION 'audit_events is append-only'\n"
     "    USING ERRCODE = 'insufficient_privilege', TABLE = TG_TABLE_NAME;\n"
@@ -183,12 +186,14 @@ AUDIT_PROTECTION = (
         # position can both pass this check when neither sees the other's uncommitted row;
         # the primary key on seq then refuses the second once the first commits. append
         # serialises its own writes with the chain's advisory lock, so they never meet here.
-        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql"
+        " SET search_path = pg_catalog, pg_temp AS $$\n"
         "DECLARE\n"
         "  head_seq bigint;\n"
         "  head_mac char(64);\n"
         "BEGIN\n"
-        "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
+        "  SELECT seq, mac INTO head_seq, head_mac FROM public.audit_events\n"
+        "    ORDER BY seq DESC LIMIT 1;\n"
         "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
         "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
         "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME, COLUMN = 'seq';\n"

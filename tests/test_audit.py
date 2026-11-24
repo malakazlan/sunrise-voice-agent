@@ -616,6 +616,35 @@ async def test_database_refuses_out_of_position_insert(
     assert await append_all(audit, session, [call_started(cid(3))]) == [4]
 
 
+def test_position_trigger_cannot_be_shadowed(owner_engine: Engine) -> None:
+    # Objects created later, ahead of public and pg_catalog on a session's search path, do not
+    # change what the position trigger reads: public.audit_events, and pg_catalog's functions.
+    with owner_engine.begin() as connection:
+        connection.execute(text("CREATE SCHEMA shadow"))
+        connection.execute(text("CREATE TABLE shadow.audit_events (seq bigint, mac char(64))"))
+        connection.execute(text("INSERT INTO shadow.audit_events VALUES (41, repeat('f', 64))"))
+        connection.execute(
+            text(
+                "CREATE FUNCTION shadow.repeat(text, integer) RETURNS text LANGUAGE sql"
+                " AS $$ SELECT pg_catalog.repeat('f', $2) $$"
+            )
+        )
+
+    def insert(seq: int, prev_mac: str) -> None:
+        with owner_engine.begin() as connection:
+            connection.execute(text("SET LOCAL search_path = shadow, pg_catalog, public"))
+            connection.execute(
+                text(INSERT_ROW.text.replace("INTO audit_events", "INTO public.audit_events")),
+                forged_row(seq, prev_mac),
+            )
+
+    # The real table is empty: seq 1 after 64 zeros, whatever the shadows say.
+    insert(1, ZERO_MAC)
+    with pytest.raises(IntegrityError) as shadowed:
+        insert(42, "f" * 64)
+    assert position_refusal(shadowed.value) == "seq"
+
+
 async def test_verify_reports_every_break(
     audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:

@@ -24,7 +24,13 @@ REFUSE_CHANGE_BODY = (
     "    USING ERRCODE = 'insufficient_privilege', TABLE = TG_TABLE_NAME;\n"
     "END\n"
 )
-POSITION_CHECKS = (
+CHECK_POSITION_BODY = (
+    "DECLARE\n"
+    "  head_seq bigint;\n"
+    "  head_mac char(64);\n"
+    "BEGIN\n"
+    "  SELECT seq, mac INTO head_seq, head_mac FROM public.audit_events\n"
+    "    ORDER BY seq DESC LIMIT 1;\n"
     "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
     "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
     "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME, COLUMN = 'seq';\n"
@@ -37,17 +43,24 @@ POSITION_CHECKS = (
     "  RETURN NEW;\n"
     "END\n"
 )
-DECLARATIONS = "DECLARE\n  head_seq bigint;\n  head_mac char(64);\nBEGIN\n"
-CHECK_POSITION_BODY = (
-    DECLARATIONS
-    + "  SELECT seq, mac INTO head_seq, head_mac FROM public.audit_events\n"
-    + "    ORDER BY seq DESC LIMIT 1;\n"
-    + POSITION_CHECKS
-)
+# The body revision 5eaa0e7deda7 created, for the downgrade.
 PREVIOUS_CHECK_POSITION_BODY = (
-    DECLARATIONS
-    + "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
-    + POSITION_CHECKS
+    "DECLARE\n"
+    "  head_seq bigint;\n"
+    "  head_mac char(64);\n"
+    "BEGIN\n"
+    "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
+    "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
+    "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+    "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME, COLUMN = 'seq';\n"
+    "  END IF;\n"
+    "  IF NEW.prev_mac IS DISTINCT FROM coalesce(head_mac, repeat('0', 64)) THEN\n"
+    "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+    "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME,\n"
+    "      COLUMN = 'prev_mac';\n"
+    "  END IF;\n"
+    "  RETURN NEW;\n"
+    "END\n"
 )
 PINNED = " SET search_path = pg_catalog, pg_temp"
 

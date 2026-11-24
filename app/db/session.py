@@ -186,6 +186,14 @@ _BASE64 = "[A-Za-z0-9+/]+={0,2}"
 SCRAM_VERIFIER = re.compile(rf"SCRAM-SHA-256\$[1-9][0-9]*:{_BASE64}\${_BASE64}:{_BASE64}")
 
 
+def _scram_verifier(pgconn: Any, role: str, password: SecretStr) -> str:
+    """libpq's SCRAM-SHA-256 verifier of `password` for `role`, computed on this side."""
+    verifier: str = pgconn.encrypt_password(
+        password.get_secret_value().encode("utf-8"), role.encode("utf-8"), b"scram-sha-256"
+    ).decode("ascii")
+    return verifier
+
+
 def set_role_password(connection: Connection, role: str, password: SecretStr) -> None:
     """Set `role`'s password inside the connection's transaction, without sending the password.
 
@@ -202,9 +210,8 @@ def set_role_password(connection: Connection, role: str, password: SecretStr) ->
     driver = connection.connection.driver_connection
     if driver is None:
         raise RuntimeError("the connection has no driver connection")
-    verifier = driver.pgconn.encrypt_password(
-        password.get_secret_value().encode("utf-8"), role.encode("utf-8"), b"scram-sha-256"
-    ).decode("ascii")
+    verifier = _scram_verifier(driver.pgconn, role, password)
+    # Anything else (an md5 hash, a quote, a second statement) is refused before it is sent.
     if not SCRAM_VERIFIER.fullmatch(verifier):
         raise RuntimeError("the driver did not return a SCRAM-SHA-256 verifier")
     statement = sql.SQL("ALTER ROLE {} PASSWORD {}").format(

@@ -154,6 +154,16 @@ def test_migration_matches_models(
         "audit_events_check_position",
     }
     assert migrated_functions == definitions(from_models, FUNCTION_DEFINITIONS)
+    # Their search path is pinned, so nothing created later can shadow what they use, and the
+    # table they read is named with its schema.
+    for name, definition in migrated_functions:
+        assert " SET search_path TO 'pg_catalog', 'pg_temp'\n" in str(definition), name
+    check_position = [
+        definition
+        for name, definition in migrated_functions
+        if name == "audit_events_check_position"
+    ]
+    assert "FROM public.audit_events" in str(check_position)
     assert (
         "available_slots",
         "id",
