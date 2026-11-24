@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import anyio
 import pytest
+from conftest import TEST_AUDIT_KEY
 from psycopg import errors
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, event, text
@@ -35,7 +36,7 @@ from app.audit.log import (
     Verification,
     canonical_form,
 )
-from app.config import Settings
+from app.config import StartupSettings
 from app.db import session as session_module
 from app.db.session import create_database_engine, create_owner_sync_engine, create_session_factory
 
@@ -114,12 +115,12 @@ THREE = [call_started(cid(1)), call_ended(cid(1)), call_started(cid(2))]
 
 
 @pytest.fixture
-def audit(database: Settings) -> AuditLog:
-    return AuditLog(database.audit_hmac_key)
+def audit(database: StartupSettings) -> AuditLog:
+    return AuditLog(SecretStr(TEST_AUDIT_KEY))
 
 
 @pytest.fixture
-async def factory(database: Settings) -> AsyncIterator[Callable[[], AsyncSession]]:
+async def factory(database: StartupSettings) -> AsyncIterator[Callable[[], AsyncSession]]:
     """Sessions on one engine, each with its own connection."""
     engine = create_database_engine(database)
     try:
@@ -269,7 +270,7 @@ async def test_writer_waits_for_an_uncommitted_append(
 
 
 async def test_killed_writer_releases_the_lock(
-    audit: AuditLog, database: Settings, factory: Callable[[], AsyncSession]
+    audit: AuditLog, database: StartupSettings, factory: Callable[[], AsyncSession]
 ) -> None:
     admin = create_owner_sync_engine(database, isolation_level="AUTOCOMMIT", poolclass=NullPool)
     second_seq: list[int] = []
@@ -299,7 +300,7 @@ async def test_killed_writer_releases_the_lock(
 
 async def test_verify_reads_in_batches(
     audit: AuditLog,
-    database: Settings,
+    database: StartupSettings,
     owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     monkeypatch: pytest.MonkeyPatch,
@@ -792,7 +793,7 @@ async def test_event_rolls_back_with_the_action(audit: AuditLog, session: AsyncS
 
 
 async def test_append_refuses_a_session_outside_a_transaction(
-    audit: AuditLog, database: Settings, owner_engine: Engine
+    audit: AuditLog, database: StartupSettings, owner_engine: Engine
 ) -> None:
     # In autocommit every statement commits on its own: the lock would end at once and the
     # event could not roll back with its action. Set on the engine and on one connection.
@@ -1070,7 +1071,7 @@ async def test_append_gives_up_when_the_lock_is_held(
 
 
 async def test_idle_transaction_is_ended_by_the_server(
-    database: Settings, monkeypatch: pytest.MonkeyPatch
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     show = text("SHOW idle_in_transaction_session_timeout")
     engine = create_database_engine(database)

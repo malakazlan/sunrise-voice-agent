@@ -18,7 +18,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import StartupSettings
 from app.db.seed import ensure_generated_slots, load_seed_data, main, seed
 from app.db.session import (
     create_database_engine,
@@ -435,7 +435,7 @@ async def test_clinic_times_respect_dst(session: AsyncSession) -> None:
     }
 
 
-async def test_concurrent_seeds_do_not_duplicate_rows(database: Settings) -> None:
+async def test_concurrent_seeds_do_not_duplicate_rows(database: StartupSettings) -> None:
     engine = create_owner_engine(database)
     sessions = create_session_factory(engine)
 
@@ -454,7 +454,7 @@ async def test_concurrent_seeds_do_not_duplicate_rows(database: Settings) -> Non
 
 
 def test_seed_module_runs_twice_against_database(
-    database: Settings, run_module: Callable[..., subprocess.CompletedProcess[str]]
+    database: StartupSettings, run_module: Callable[..., subprocess.CompletedProcess[str]]
 ) -> None:
     first = run_module(database, "app.db.seed")
     assert first.returncode == 0, first.stderr
@@ -465,7 +465,7 @@ def test_seed_module_runs_twice_against_database(
 
 
 async def test_runtime_role_reads_what_the_seed_wrote(
-    database: Settings, session: AsyncSession
+    database: StartupSettings, session: AsyncSession
 ) -> None:
     await run_seed(session)
     owner_view = await snapshot(session)
@@ -606,7 +606,7 @@ GENERATED_DAYS = text("SELECT starts_at FROM available_slots WHERE source = 'gen
     ids=["winter", "summer"],
 )
 def test_entry_point_uses_clinic_local_today(
-    database: Settings,
+    database: StartupSettings,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     instant: datetime,
@@ -622,7 +622,6 @@ def test_entry_point_uses_clinic_local_today(
     monkeypatch.setenv("POSTGRES_PASSWORD", database.postgres_password.get_secret_value())
     monkeypatch.setenv("APP_DB_USER", database.app_db_user)
     monkeypatch.setenv("APP_DB_PASSWORD", database.app_db_password.get_secret_value())
-    monkeypatch.setenv("AUDIT_HMAC_KEY", database.audit_hmac_key.get_secret_value())
 
     main(clock=lambda: instant)
 

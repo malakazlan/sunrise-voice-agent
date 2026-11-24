@@ -9,7 +9,7 @@ from alembic.migration import MigrationContext
 from sqlalchemy import TextClause, inspect, text
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import StartupSettings
 from app.db.models import Base
 from app.db.session import create_owner_sync_engine
 
@@ -37,7 +37,7 @@ CONSTRAINT_DEFINITIONS = text(
 )
 
 
-def table_names(settings: Settings) -> set[str]:
+def table_names(settings: StartupSettings) -> set[str]:
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
@@ -56,7 +56,7 @@ COLUMN_DEFINITIONS = text(
 )
 
 
-def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
+def column_definitions(settings: StartupSettings) -> set[tuple[object, ...]]:
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
@@ -65,7 +65,7 @@ def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
         engine.dispose()
 
 
-def constraint_definitions(settings: Settings) -> set[tuple[str, str, str]]:
+def constraint_definitions(settings: StartupSettings) -> set[tuple[str, str, str]]:
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
@@ -86,7 +86,7 @@ FUNCTION_DEFINITIONS = text(
 )
 
 
-def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]]:
+def definitions(settings: StartupSettings, query: TextClause) -> set[tuple[object, ...]]:
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
@@ -96,7 +96,7 @@ def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]
 
 
 def test_migration_matches_models(
-    new_database: Callable[[], Settings], run_alembic: Alembic
+    new_database: Callable[[], StartupSettings], run_alembic: Alembic
 ) -> None:
     migrated = new_database()
     upgrade = run_alembic(migrated, "upgrade", "head")
@@ -168,7 +168,7 @@ def test_migration_matches_models(
 
 
 def test_upgrade_on_migrated_database_is_a_no_op(
-    empty_database: Settings, run_alembic: Alembic
+    empty_database: StartupSettings, run_alembic: Alembic
 ) -> None:
     first = run_alembic(empty_database, "upgrade", "head")
     assert first.returncode == 0, first.stderr
@@ -183,7 +183,9 @@ def test_upgrade_on_migrated_database_is_a_no_op(
     assert "(head)" in current.stdout
 
 
-def test_downgrade_removes_the_tables(empty_database: Settings, run_alembic: Alembic) -> None:
+def test_downgrade_removes_the_tables(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
     assert run_alembic(empty_database, "upgrade", "head").returncode == 0
 
     downgrade = run_alembic(empty_database, "downgrade", "base")

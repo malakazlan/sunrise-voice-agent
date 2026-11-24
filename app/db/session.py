@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from psycopg import Error as DriverError
+from psycopg import sql
 from psycopg.pq import DiagnosticField, TransactionStatus
 from pydantic import SecretStr
 from sqlalchemy import URL, Connection, Engine, create_engine, event
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.config import Settings
+from app.config import DatabaseSettings, StartupSettings
 
 # Statement parameters are row values (names, last four digits). With this option an error
 # shows the SQL but not the values bound to it.
@@ -156,7 +157,7 @@ def _create_async_engine(url: URL) -> AsyncEngine:
     return engine
 
 
-def create_database_engine(settings: Settings) -> AsyncEngine:
+def create_database_engine(settings: DatabaseSettings) -> AsyncEngine:
     """The application's engine: it connects as the runtime role (app/db/roles.py)."""
     return _create_async_engine(settings.runtime_database_url)
 
@@ -165,12 +166,12 @@ def create_database_engine(settings: Settings) -> AsyncEngine:
 # (a repo hygiene test keeps them there).
 
 
-def create_owner_engine(settings: Settings) -> AsyncEngine:
+def create_owner_engine(settings: StartupSettings) -> AsyncEngine:
     """The owner, asynchronous: for the seed."""
     return _create_async_engine(settings.owner_database_url)
 
 
-def create_owner_sync_engine(settings: Settings, **options: Any) -> Engine:
+def create_owner_sync_engine(settings: StartupSettings, **options: Any) -> Engine:
     """The owner, synchronous: for Alembic, role set-up and test set-up."""
     engine = create_engine(
         settings.owner_database_url, connect_args=_connect_args(), **options, **SAFE_ENGINE_OPTIONS
@@ -185,26 +186,35 @@ _BASE64 = "[A-Za-z0-9+/]+={0,2}"
 SCRAM_VERIFIER = re.compile(rf"SCRAM-SHA-256\$[1-9][0-9]*:{_BASE64}\${_BASE64}:{_BASE64}")
 
 
-def password_verifier(connection: Connection, role: str, password: SecretStr) -> str:
-    """The SCRAM-SHA-256 verifier of `password` for `role`, the form in which Postgres stores
-    a password, made on this side of the connection, so the password itself is never sent.
+def set_role_password(connection: Connection, role: str, password: SecretStr) -> None:
+    """Set `role`'s password inside the connection's transaction, without sending the password.
 
-    psycopg's `PGconn.encrypt_password` calls libpq's PQencryptPasswordConn. With the algorithm
-    named it computes the verifier locally (a fresh random salt each time, the iteration count
-    the server reported) and sends nothing; without one it would ask the server for its
-    `password_encryption` setting, which may be md5. Postgres stores a string in this form as
-    it is. The verifier cannot be used to log in, but it allows guessing the password offline,
-    so it is still not something to show anywhere it is not needed.
+    The statement carries the password's SCRAM-SHA-256 verifier, the form in which Postgres
+    stores a password and which it stores as given. psycopg's `PGconn.encrypt_password` calls
+    libpq's PQencryptPasswordConn: with the algorithm named it computes the verifier on this
+    side (a fresh random salt each time, the iteration count the server reported) and sends
+    nothing; without one it would ask the server for its `password_encryption` setting, which
+    may be md5. A verifier cannot be used to log in, but it allows guessing the password
+    offline, so the statement goes straight to the driver connection, past SQLAlchemy: its
+    statement log, events and error messages never see it, psycopg logs no statements, and a
+    driver error does not quote the statement. The error is scrubbed like the engines' errors.
     """
     driver = connection.connection.driver_connection
     if driver is None:
         raise RuntimeError("the connection has no driver connection")
-    verifier: str = driver.pgconn.encrypt_password(
+    verifier = driver.pgconn.encrypt_password(
         password.get_secret_value().encode("utf-8"), role.encode("utf-8"), b"scram-sha-256"
     ).decode("ascii")
     if not SCRAM_VERIFIER.fullmatch(verifier):
         raise RuntimeError("the driver did not return a SCRAM-SHA-256 verifier")
-    return verifier
+    statement = sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+        sql.Identifier(role), sql.Literal(verifier)
+    )
+    try:
+        driver.execute(statement)
+    except DriverError as error:
+        _withhold_driver_error(error, None)
+        raise
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

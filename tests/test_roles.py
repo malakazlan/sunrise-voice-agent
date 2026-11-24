@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import psycopg
 import pytest
-from conftest import drop_role, new_role_name, set_up_roles
-from psycopg import errors
+from conftest import TEST_AUDIT_KEY, drop_role, new_role_name, set_up_roles
+from psycopg import errors, sql
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, event, text
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.pool import NullPool
 
 from app.audit.log import Action, AuditLog, Event, Outcome, ResourceType
-from app.config import Settings
+from app.config import StartupSettings
 from app.db import grants
 from app.db.models import Base
 from app.db.roles import set_up_runtime_role
@@ -48,6 +49,12 @@ EXPECTED_SEQUENCES = {
     "available_slots_id_seq": set(),
     "medications_id_seq": set(),
 }
+# The trigger functions of audit_events run as triggers whoever may call them; nobody needs
+# EXECUTE, which Postgres gives everyone by default.
+EXPECTED_FUNCTIONS: dict[str, set[str]] = {
+    "audit_events_check_position": set(),
+    "audit_events_refuse_change": set(),
+}
 EXPECTED_SCHEMAS = {"public": {"USAGE"}}
 EXPECTED_DATABASE = {"CONNECT"}
 
@@ -55,6 +62,7 @@ EXPECTED_DATABASE = {"CONNECT"}
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
 COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
 SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")
+FUNCTION_PRIVILEGES = ("EXECUTE",)
 SCHEMA_PRIVILEGES = ("USAGE", "CREATE")
 DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
 
@@ -68,6 +76,13 @@ RELATIONS = text(
     "   CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::\"char\", c.relowner))) x ON true"
     " WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')"
     " AND n.nspname NOT IN ('pg_catalog', 'information_schema')"
+    " AND n.nspname !~ '^pg_(toast|temp_)'"
+)
+FUNCTIONS = text(
+    "SELECT p.oid, n.nspname, p.proname, x.grantee, x.privilege_type FROM pg_proc p"
+    " JOIN pg_namespace n ON n.oid = p.pronamespace"
+    " LEFT JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x ON true"
+    " WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')"
     " AND n.nspname !~ '^pg_(toast|temp_)'"
 )
 SCHEMAS = text(
@@ -127,6 +142,7 @@ class Privileges:
 
     tables: dict[str, set[str]]
     sequences: dict[str, set[str]]
+    functions: dict[str, set[str]]
     schemas: dict[str, set[str]]
     database: set[str]
 
@@ -135,6 +151,7 @@ def declared() -> Privileges:
     return Privileges(
         tables={name: set(held) for name, held in grants.TABLE_PRIVILEGES.items()},
         sequences={name: set(held) for name, held in grants.SEQUENCE_PRIVILEGES.items()},
+        functions={name: set(held) for name, held in grants.FUNCTION_PRIVILEGES.items()},
         schemas={grants.SCHEMA: set(grants.SCHEMA_PRIVILEGES)},
         database=set(grants.DATABASE_PRIVILEGES),
     )
@@ -152,9 +169,9 @@ class Catalog:
 
 
 def catalog(engine: Engine, role: str) -> Catalog:
-    granted = Privileges(tables={}, sequences={}, schemas={}, database=set())
-    public = Privileges(tables={}, sequences={}, schemas={}, database=set())
-    effective = Privileges(tables={}, sequences={}, schemas={}, database=set())
+    granted = Privileges(tables={}, sequences={}, functions={}, schemas={}, database=set())
+    public = Privileges(tables={}, sequences={}, functions={}, schemas={}, database=set())
+    effective = Privileges(tables={}, sequences={}, functions={}, schemas={}, database=set())
     with engine.connect() as connection:
         role_oid = connection.execute(ROLE_OID, {"name": role}).scalar_one()
 
@@ -189,6 +206,11 @@ def catalog(engine: Engine, role: str) -> Catalog:
                 can |= allowed("has_any_column_privilege", oid, COLUMN_PRIVILEGES)
             note(kinds, name, grantee, held)
             kinds[2][name] = can
+        for oid, schema, name, grantee, held in connection.execute(FUNCTIONS).all():
+            assert schema == grants.SCHEMA, (schema, name)
+            kinds = (granted.functions, public.functions, effective.functions)
+            note(kinds, name, grantee, held)
+            effective.functions[name] = allowed("has_function_privilege", oid, FUNCTION_PRIVILEGES)
         for oid, name, grantee, held in connection.execute(SCHEMAS).all():
             kinds = (granted.schemas, public.schemas, effective.schemas)
             note(kinds, name, grantee, held)
@@ -216,10 +238,12 @@ def assert_privileges_match_the_declaration(engine: Engine, role: str) -> None:
     assert found.granted == expected
     assert found.effective == expected
     # PUBLIC holds nothing beyond the declaration: Postgres 16 gives it USAGE on the public
-    # schema and CONNECT on the database; set-up takes TEMPORARY on the database away.
+    # schema and CONNECT on the database; set-up takes TEMPORARY on the database and
+    # EXECUTE on the schema's functions away.
     assert found.public == Privileges(
         tables={name: set() for name in expected.tables},
         sequences={name: set() for name in expected.sequences},
+        functions={name: set() for name in expected.functions},
         schemas={grants.SCHEMA: {"USAGE"}},
         database={"CONNECT"},
     )
@@ -227,7 +251,7 @@ def assert_privileges_match_the_declaration(engine: Engine, role: str) -> None:
 
 
 @pytest.fixture
-def owner(database: Settings) -> Iterator[Engine]:
+def owner(database: StartupSettings) -> Iterator[Engine]:
     engine = create_owner_sync_engine(database, poolclass=NullPool)
     try:
         yield engine
@@ -236,7 +260,7 @@ def owner(database: Settings) -> Iterator[Engine]:
 
 
 @pytest.fixture
-async def runtime(database: Settings) -> AsyncIterator[AsyncEngine]:
+async def runtime(database: StartupSettings) -> AsyncIterator[AsyncEngine]:
     """The application's engine: the runtime role."""
     engine = create_database_engine(database)
     try:
@@ -246,7 +270,7 @@ async def runtime(database: Settings) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture
-def fresh_role(database: Settings) -> Iterator[Settings]:
+def fresh_role(database: StartupSettings) -> Iterator[StartupSettings]:
     """The test database with a runtime role of its own that does not exist yet."""
     settings = database.model_copy(
         update={
@@ -312,9 +336,9 @@ async def stored_events(engine: AsyncEngine) -> list[tuple[Any, ...]]:
 
 
 async def test_runtime_role_cannot_change_audit_events(
-    database: Settings, runtime: AsyncEngine, owner: Engine
+    database: StartupSettings, runtime: AsyncEngine, owner: Engine
 ) -> None:
-    audit = AuditLog(database.audit_hmac_key)
+    audit = AuditLog(SecretStr(TEST_AUDIT_KEY))
     await append_one(audit, runtime)
     before = await stored_events(runtime)
     statements = (
@@ -340,7 +364,7 @@ async def test_runtime_role_cannot_change_audit_events(
 
 
 async def test_runtime_role_cannot_bypass_triggers(
-    database: Settings, runtime: AsyncEngine
+    database: StartupSettings, runtime: AsyncEngine
 ) -> None:
     for statement in (
         "SET session_replication_role = replica",
@@ -364,7 +388,7 @@ async def test_runtime_role_cannot_bypass_triggers(
 
 
 async def test_runtime_role_cannot_change_the_schema(
-    database: Settings, runtime: AsyncEngine
+    database: StartupSettings, runtime: AsyncEngine
 ) -> None:
     role = database.app_db_user
     owner = database.postgres_user
@@ -410,6 +434,33 @@ async def test_runtime_role_cannot_delete(runtime: AsyncEngine) -> None:
         # The names come from the models, not from input.
         await assert_refused_by_privileges(runtime, f"DELETE FROM {table}")  # noqa: S608
         await assert_refused_by_privileges(runtime, f"TRUNCATE {table}")
+
+
+async def test_audit_triggers_refusal_names_the_table(owner: Engine, runtime: AsyncEngine) -> None:
+    # The tests above tell a privilege refusal from the triggers' by the table name the
+    # triggers give. If the triggers stopped naming it, their refusal would pass for one by
+    # privileges; this pins it.
+    with pytest.raises(DBAPIError) as excinfo, owner.begin() as connection:
+        connection.execute(text("DELETE FROM audit_events"))
+    assert type(excinfo.value.orig) is errors.InsufficientPrivilege
+    assert excinfo.value.orig.diag.table_name == "audit_events"
+    assert not refused_by_privileges(excinfo.value)
+
+    # The position trigger still fires for the runtime role, which may not EXECUTE it.
+    out_of_position = await attempt(
+        runtime,
+        "INSERT INTO audit_events (seq, ts, actor, action, resource_type, outcome, prev_mac, mac)"
+        " VALUES (5, now(), 'agent', 'call_started', 'call', 'success',"
+        " repeat('0', 64), repeat('0', 64))",
+    )
+    assert out_of_position is not None
+    assert type(out_of_position.orig) is errors.IntegrityConstraintViolation
+    assert out_of_position.orig.diag.column_name == "seq"
+    async with runtime.connect() as connection:
+        may_execute = await connection.scalar(
+            text("SELECT has_function_privilege('audit_events_check_position()', 'EXECUTE')")
+        )
+    assert may_execute is False
 
 
 # The same table, tried statement by statement as the role. Each statement touches no row, so
@@ -459,11 +510,12 @@ async def test_runtime_role_is_refused_what_is_not_declared(runtime: AsyncEngine
 # --- R5, R6: what the catalogs say ----------------------------------------------------------
 
 
-def test_privileges_match_the_declaration(database: Settings, owner: Engine) -> None:
+def test_privileges_match_the_declaration(database: StartupSettings, owner: Engine) -> None:
     # The declaration is the spec's table, and covers every table the models define.
     assert declared() == Privileges(
         tables=EXPECTED_TABLES,
         sequences=EXPECTED_SEQUENCES,
+        functions=EXPECTED_FUNCTIONS,
         schemas=EXPECTED_SCHEMAS,
         database=EXPECTED_DATABASE,
     )
@@ -473,6 +525,7 @@ def test_privileges_match_the_declaration(database: Settings, owner: Engine) -> 
     found = catalog(owner, database.app_db_user)
     assert set(found.granted.tables) == set(EXPECTED_TABLES)
     assert set(found.granted.sequences) == set(EXPECTED_SEQUENCES)
+    assert set(found.granted.functions) == set(EXPECTED_FUNCTIONS)
     assert_privileges_match_the_declaration(owner, database.app_db_user)
 
 
@@ -505,7 +558,7 @@ def assert_role_holds_nothing_else(engine: Engine, role: str) -> None:
 
 
 async def test_runtime_role_attributes(
-    database: Settings, owner: Engine, runtime: AsyncEngine
+    database: StartupSettings, owner: Engine, runtime: AsyncEngine
 ) -> None:
     assert_role_holds_nothing_else(owner, database.app_db_user)
 
@@ -542,18 +595,36 @@ def chain(error: BaseException) -> Iterator[BaseException]:
 
 
 def test_role_password_is_never_in_sql_or_errors(
-    fresh_role: Settings, caplog: pytest.LogCaptureFixture
+    database: StartupSettings,
+    fresh_role: StartupSettings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     password = "-".join(["runtime", "password", "not", "for", "logs"])
     settings = fresh_role.model_copy(update={"app_db_password": SecretStr(password)})
+    # Every logger at its most verbose, SQLAlchemy's statement log included.
     caplog.set_level("DEBUG")
     caplog.set_level("DEBUG", logger="sqlalchemy")
 
-    sent: list[str] = []
+    # What psycopg was asked to send, whichever way it came: through SQLAlchemy, or straight
+    # through the driver connection. psycopg's Cursor.execute is Python in every build.
+    sent_to_driver: list[str] = []
+    parameters_sent: list[str] = []
+    execute = psycopg.Cursor.execute
+
+    def recording_execute(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(query, sql.Composable):
+            sent_to_driver.append(query.as_string(cursor))
+        else:
+            sent_to_driver.append(query.decode() if isinstance(query, bytes) else str(query))
+        parameters_sent.extend(repr(arg) for arg in (*args, *kwargs.values()))
+        return execute(cursor, query, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", recording_execute)
+    seen_by_sqlalchemy: list[str] = []
 
     def record(conn: Connection, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
-        sent.append(statement)
-        sent.append(repr(parameters))
+        seen_by_sqlalchemy.extend([statement, repr(parameters)])
 
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     event.listen(engine, "before_cursor_execute", record)
@@ -566,37 +637,47 @@ def test_role_password_is_never_in_sql_or_errors(
         engine.dispose()
 
     # The password went to the server once, as a SCRAM verifier, never as itself.
-    [statement] = password_statements(sent)
+    [statement] = password_statements(sent_to_driver)
     assert SCRAM_IN_STATEMENT.search(statement), "the password was not sent as a verifier"
-    assert all(password not in text_sent for text_sent in sent)
+    assert seen_by_sqlalchemy, "the capture saw the other statements"
+    everything_sent = [*sent_to_driver, *parameters_sent, *seen_by_sqlalchemy]
+    assert all(password not in text_sent for text_sent in everything_sent)
+    # It went past SQLAlchemy, so neither its events nor its statement log saw it.
+    assert password_statements(seen_by_sqlalchemy) == []
+    assert any(logged.name.startswith("sqlalchemy") for logged in caplog.records)
+    assert "SCRAM-SHA-256" not in caplog.text
+    assert password not in caplog.text
 
-    # Forced failure: the same set-up run by a role that may not alter roles (the runtime role
-    # itself). The statement that fails is the one carrying the verifier.
-    as_runtime = settings.model_copy(
-        update={"postgres_user": settings.app_db_user, "postgres_password": SecretStr(password)}
+    # Forced failure: a role that may log in but not alter other roles (this run's runtime
+    # role) runs the set-up for the fresh role, so the password statement is refused.
+    as_another_role = settings.model_copy(
+        update={
+            "postgres_user": database.app_db_user,
+            "postgres_password": database.app_db_password,
+        }
     )
-    failing = create_owner_sync_engine(as_runtime, poolclass=NullPool)
-    sent.clear()
-    event.listen(failing, "before_cursor_execute", record)
+    failing = create_owner_sync_engine(as_another_role, poolclass=NullPool)
+    sent_to_driver.clear()
     try:
-        with pytest.raises(DBAPIError) as excinfo, failing.begin() as connection:
+        with pytest.raises(errors.InsufficientPrivilege) as excinfo, failing.begin() as connection:
             set_up_runtime_role(connection, settings)
     finally:
         failing.dispose()
 
-    assert type(excinfo.value.orig) is errors.InsufficientPrivilege
-    assert SCRAM_IN_STATEMENT.search(str(excinfo.value)), "the failing statement is not shown"
+    assert password_statements(sent_to_driver[-1:]), "the password statement is the one refused"
+    assert "SQLSTATE 42501" in str(excinfo.value)
     rendered = [str(excinfo.value), repr(excinfo.value)]
     rendered.append("".join(traceback.format_exception(excinfo.value)))
     rendered += [
         text_of for linked in chain(excinfo.value) for text_of in (str(linked), repr(linked))
     ]
-    for text_of in [*rendered, *sent, caplog.text, repr(settings), repr(failing.url)]:
+    rendered += [str(excinfo.value.diag.message_detail), str(excinfo.value.diag.message_hint)]
+    for text_of in [*rendered, caplog.text, repr(settings), repr(failing.url)]:
         assert password not in text_of
-    assert any(logged.name.startswith("sqlalchemy") for logged in caplog.records)
+        assert "SCRAM-SHA-256" not in text_of
 
 
-async def test_application_engine_uses_the_runtime_role(database: Settings) -> None:
+async def test_application_engine_uses_the_runtime_role(database: StartupSettings) -> None:
     engine = create_database_engine(database)
     try:
         async with engine.connect() as connection:
@@ -608,7 +689,7 @@ async def test_application_engine_uses_the_runtime_role(database: Settings) -> N
     assert tuple(users) == (database.app_db_user, database.app_db_user)
 
 
-async def connects(settings: Settings) -> bool:
+async def connects(settings: StartupSettings) -> bool:
     engine = create_database_engine(settings)
     try:
         async with engine.connect() as connection:
@@ -622,7 +703,7 @@ async def connects(settings: Settings) -> bool:
     return True
 
 
-async def test_password_rotation(fresh_role: Settings) -> None:
+async def test_password_rotation(fresh_role: StartupSettings) -> None:
     old = fresh_role
     new = old.model_copy(update={"app_db_password": SecretStr(secrets.token_urlsafe(24))})
     set_up_roles(old)
@@ -668,7 +749,7 @@ def snapshot(engine: Engine, role: str) -> list[list[tuple[Any, ...]]]:
         ]
 
 
-async def test_setup_twice_changes_nothing(fresh_role: Settings, owner: Engine) -> None:
+async def test_setup_twice_changes_nothing(fresh_role: StartupSettings, owner: Engine) -> None:
     set_up_roles(fresh_role)
     first = snapshot(owner, fresh_role.app_db_user)
     assert first[0], "the role was created"
@@ -680,7 +761,7 @@ async def test_setup_twice_changes_nothing(fresh_role: Settings, owner: Engine) 
     assert_privileges_match_the_declaration(owner, fresh_role.app_db_user)
 
 
-async def test_undeclared_privilege_is_revoked(fresh_role: Settings, owner: Engine) -> None:
+async def test_undeclared_privilege_is_revoked(fresh_role: StartupSettings, owner: Engine) -> None:
     set_up_roles(fresh_role)
     role = f'"{fresh_role.app_db_user}"'
     owner_role = f'"{fresh_role.postgres_user}"'
@@ -725,7 +806,9 @@ async def test_undeclared_privilege_is_revoked(fresh_role: Settings, owner: Engi
     assert mode == "origin"
 
 
-def test_setup_stops_when_the_role_owns_something(fresh_role: Settings, owner: Engine) -> None:
+def test_setup_stops_when_the_role_owns_something(
+    fresh_role: StartupSettings, owner: Engine
+) -> None:
     set_up_roles(fresh_role)
     role = f'"{fresh_role.app_db_user}"'
     with owner.begin() as connection:
@@ -750,7 +833,7 @@ def test_setup_stops_when_the_role_owns_something(fresh_role: Settings, owner: E
 
 
 async def test_startup_steps_on_an_empty_database(
-    new_database: Callable[[], Settings],
+    new_database: Callable[[], StartupSettings],
     run_module: Module,
     run_alembic: Module,
 ) -> None:

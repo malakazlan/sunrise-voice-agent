@@ -24,6 +24,8 @@ USER 10001:10001
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --start-interval=2s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
-# As the owner: migrate, set up the runtime role, seed. Then serve, as the runtime role. A
-# failure in any step stops the container.
-CMD ["sh", "-c", "alembic upgrade head && python -m app.db.roles && python -m app.db.seed && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-access-log"]
+# Check every setting; then, as the owner, migrate, set up the runtime role and seed. A failure
+# in any step stops the container. Then serve as the runtime role: env removes the owner's
+# variables, so the application process never has them, and exec makes uvicorn replace the
+# shell (env replaces itself too), so it is PID 1 and receives the container's signals.
+CMD ["sh", "-c", "python -m app.config && alembic upgrade head && python -m app.db.roles && python -m app.db.seed && exec env -u POSTGRES_USER -u POSTGRES_PASSWORD uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-access-log"]

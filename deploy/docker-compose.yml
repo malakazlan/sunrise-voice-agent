@@ -4,7 +4,8 @@ name: sunrise-voice-agent
 #
 # Every value is interpolated from --env-file .env (or the shell), and each container receives
 # only the variables it needs: db its three credentials (the owner), app its settings (the
-# owner, for the start-up steps, and the runtime role it serves as), coturn its own. Compose
+# owner, for the start-up steps, and the runtime role it serves as; the application process
+# itself is started without the owner's, see the Dockerfile), coturn its own. Compose
 # refuses to start without the owner's credentials or APP_ENV. The app and coturn check the
 # rest themselves and stop when a value they need is missing; an empty value counts
 # as unset, so the app's own defaults apply.
@@ -44,7 +45,8 @@ services:
     # Loopback only: on a server the app is reached through the HTTPS proxy, not this port.
     ports:
       - "127.0.0.1:8000:8000"
-    # Exactly the settings fields; CI checks that this list matches app/config.py.
+    # Exactly the fields of both settings classes in app/config.py (CI checks it): the start-up
+    # steps' (with the owner) and the application's (without).
     environment:
       <<: *database-credentials
       # Inside Compose the app always reaches the database as db:5432.

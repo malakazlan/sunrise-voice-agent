@@ -308,13 +308,19 @@ def test_trigger_bypass_only_in_the_tamper_fixture() -> None:
     assert set(files_matching(TRIGGER_BYPASS)) == {"tests/conftest.py", "tests/test_roles.py"}
 
 
-# The owner's engines and URL. Outside the tests only the session module (which builds them)
-# and the start-up steps (migrations, role set-up, seed) may name them; the application runs as
-# the runtime role. Like the scans above, a lint against accidents: the runtime role's
-# privileges are the control.
-OWNER_NAMES = {"create_owner_engine", "create_owner_sync_engine", "owner_database_url"}
+# The owner's settings class, engines and URL. Outside the tests only the modules that define
+# them (settings, session) and the start-up steps (migrations, role set-up, seed) may name them;
+# the application runs as the runtime role, and its process does not have the owner's
+# variables (the Dockerfile's start command). Like the scans above, a lint against accidents:
+# the runtime role's privileges are the control.
+OWNER_NAMES = {
+    "StartupSettings",
+    "create_owner_engine",
+    "create_owner_sync_engine",
+    "owner_database_url",
+}
 STARTUP_MODULES = {"app/db/migrations/env.py", "app/db/roles.py", "app/db/seed.py"}
-OWNER_ALLOWED = {ENGINE_MODULE, *STARTUP_MODULES}
+OWNER_ALLOWED = {"app/config.py", ENGINE_MODULE, *STARTUP_MODULES}
 
 
 def owner_engine_uses(source: str) -> list[str]:
@@ -337,9 +343,12 @@ def test_owner_engine_only_in_startup_modules() -> None:
         "engine = create_owner_engine(settings)\n",
         "url = settings.owner_database_url\n",
         "getter = create_owner_sync_engine\n",
+        "from app.config import StartupSettings\n",
+        "from app import config\nconfig.StartupSettings()\n",
     ):
         assert owner_engine_uses(sample), sample
     assert not owner_engine_uses(
+        "from app.config import Settings\n"
         "from app.db.session import create_database_engine\n"
         "engine = create_database_engine(settings)\n"
         "url = settings.runtime_database_url\n"

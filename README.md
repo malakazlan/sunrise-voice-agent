@@ -113,33 +113,55 @@ All data used by this project is synthetic. No real customer or personal data is
     database role below: the app connects as a role that neither owns the table nor is a
     superuser, and has no `UPDATE`, `DELETE` or `TRUNCATE` on it.
 
-- Two database identities. The owner (`POSTGRES_USER`, the superuser the Postgres image
-  creates) is used only by the start-up steps: migrations, role set-up and the seed. The
-  application connects as the runtime role (`APP_DB_USER`), which `python -m app.db.roles`
-  sets up as the owner on every start, in one transaction:
+- Two database identities, and who holds what:
+  - The owner (`POSTGRES_USER`, `POSTGRES_PASSWORD`, the superuser the Postgres image
+    creates) is used only by the start-up steps: migrations, role set-up and the seed. They
+    read `StartupSettings` (`app/config.py`), the only settings class with the owner's fields.
+  - The application reads `Settings`, which has no owner field at all: only the runtime role
+    (`APP_DB_USER`, `APP_DB_PASSWORD`) and where the database is (host, port, name). The
+    container starts the server with the owner's two variables removed from its environment
+    (`env -u` in the Dockerfile's start command), so the server process never has them. CI
+    checks the running process's environment, and that no value in it logs in as the owner.
+  - One `.env` file can hold both: each settings class takes its own keys from it and leaves
+    the other's, and any key that belongs to neither still stops start-up.
+  - `python -m app.db.roles` sets up the runtime role as the owner on every start, in one
+    transaction:
   - It is created if missing, with `LOGIN` and nothing else: not a superuser, cannot create
     roles or databases, no replication, no bypassing row security. It owns nothing; if it
     ever does, set-up stops.
   - Its password is set on every start, so a changed `APP_DB_PASSWORD` works after the next
     start and the old one stops working. The password is never sent to the server: libpq
     (through psycopg) turns it into a SCRAM-SHA-256 verifier on the app's side, and only that
-    goes into the `ALTER ROLE` statement, so a failing statement shows the verifier, never
-    the password. A verifier cannot be used to log in but allows guessing the password
-    offline, so the password rules below still matter.
+    goes into the `ALTER ROLE` statement. The statement is sent straight through the driver,
+    so no log line, SQLAlchemy event or error message contains it, at any log level.
   - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`,
     `UPDATE` on `patients` and `appointments`; `SELECT` on `medications`; `SELECT`, `UPDATE`
     on `available_slots`; `SELECT`, `INSERT` on `audit_events`; nothing on `alembic_version`;
-    `USAGE` on the appointment id sequence only; `USAGE` on the schema; `CONNECT` on the
+    `USAGE` on the appointment id sequence only; no `EXECUTE` on the trigger functions (a
+    trigger runs its function whoever may call it); `USAGE` on the schema; `CONNECT` on the
     database. No table allows it `DELETE` or `TRUNCATE`, and it may create no table,
     temporary ones included, function, trigger, role or schema.
   - Anything else it holds is taken away: other grants in this database and on the database
     itself, membership in other roles, settings attached to the role, parameter and default
-    privileges. `PUBLIC` loses every privilege on the tables and sequences, `CREATE` on the
-    schema and `CREATE` and `TEMPORARY` on the database, so nothing reaches the role that way.
-    Grants it may hold in other databases on the same server are left alone.
-  - Limits: the app's container receives both identities, so the running app process still
-    has the owner's password in its environment and settings; the trigger functions keep
-    Postgres's default `EXECUTE` for everyone (they can only run as triggers).
+    privileges. `PUBLIC` loses every privilege on the tables and sequences, `EXECUTE` on the
+    functions, `CREATE` on the schema and `CREATE` and `TEMPORARY` on the database, so nothing
+    reaches the role that way. Grants it holds on objects inside other databases on the same
+    server are left alone.
+  - What remains:
+    - The container's configuration still contains the owner's password: the start-up steps
+      need it. Whoever controls the Docker host (`docker inspect`, `docker compose config`,
+      `docker exec`) can read it, as they can the `.env` file. Only the server process is
+      started without it.
+    - The verifier is in the text of the `ALTER ROLE` statement the server receives. Postgres
+      would log it if `log_statement` were set to `ddl` or `all` (Compose keeps statement
+      logging off). A verifier cannot be used to log in, but it allows guessing the password
+      offline, so the password rules below still matter.
+    - Anyone who can read the server process's environment gets the runtime password, which
+      allows exactly the privileges above and nothing more.
+    - `DROP OWNED` takes away the role's grants on shared objects, which belong to the whole
+      server, such as `CONNECT` on every database. Use one runtime role name per server: a
+      second application database sharing the name would lose its grant at each start of the
+      other.
 
 ### Voice echo call
 
@@ -205,10 +227,12 @@ an empty value counts as unset. Environment variables take precedence over `.env
 `POSTGRES_*` values configure the database container in Compose, so there is one set of
 database credentials.
 
-Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` must be at least 16
-characters and must not be a placeholder from `.env.example`; startup stops otherwise. In
-every environment `APP_DB_PASSWORD` must not be empty and must differ from
-`POSTGRES_PASSWORD`, and `APP_DB_USER` must differ from `POSTGRES_USER`.
+`POSTGRES_PASSWORD` and `APP_DB_PASSWORD` follow the same rules: never empty, and unless
+`APP_ENV=dev` at least 16 characters and not a placeholder from `.env.example`; startup stops
+otherwise. In every environment the start-up steps refuse a `POSTGRES_PASSWORD` equal to
+`APP_DB_PASSWORD` and a `POSTGRES_USER` equal to `APP_DB_USER`. The container checks the
+settings of both the start-up steps and the application before it touches the database
+(`python -m app.config`).
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`) must also not start or end with whitespace and must
@@ -242,14 +266,15 @@ docker compose --env-file .env -f deploy/docker-compose.yml up --build
 curl http://127.0.0.1:8000/health
 ```
 
-The app container runs, as the owner, `alembic upgrade head`, the role set-up
-(`python -m app.db.roles`) and the seed, then the server, which connects as the runtime role.
-A failure in any step stops the container. The database is not published to the host.
+The app container checks its settings (`python -m app.config`), then runs, as the owner,
+`alembic upgrade head`, the role set-up (`python -m app.db.roles`) and the seed, then the
+server, which runs without the owner's variables and connects as the runtime role. A failure
+in any step stops the container. The database is not published to the host.
 
 `--env-file .env` is required: Compose takes every value from it and refuses to start, naming
 the variable, if `APP_ENV` or a database credential is missing. Each container receives only
-its own variables: the database its three credentials (the owner), the app its settings
-(both identities), coturn
+its own variables: the database its three credentials (the owner), the app container its
+settings (both identities, of which the server process keeps only the runtime role's), coturn
 `TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn checks those three by the
 same rules as the app and stops at start-up, naming the variable, if `TURN_HOST` or
 `TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty

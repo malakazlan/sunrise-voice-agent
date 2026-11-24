@@ -205,6 +205,62 @@ jobs:
           echo "DELETE as the runtime role -> exit $code: $refused"
           test "$code" = "1"
           echo "$refused" | grep -q 'permission denied for table audit_events'
+      - name: The application process holds the runtime identity and not the owner's
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # Inside the app container, as its non-root user, which uvicorn (PID 1) runs as too:
+          # the names in PID 1's environment, never the values. Then every value in it is tried
+          # as the owner's password and must be refused, while the owner's real password, from
+          # the container's configuration that this exec sees, must work: the attempt is real.
+          bounded 120 "the application process check" $compose exec -T app python -c '
+          import os
+          import subprocess
+          import psycopg
+          from app.config import Settings, StartupSettings
+          def variables(settings_class):
+              return {name.upper() for name in settings_class.model_fields}
+          with open("/proc/1/cmdline", "rb") as file:
+              command = [part.decode() for part in file.read().split(b"\0") if part]
+          assert any(part.endswith("/uvicorn") for part in command), "PID 1 is not uvicorn"
+          print("PID 1 runs uvicorn")
+          with open("/proc/1/environ", "rb") as file:
+              entries = [entry.decode() for entry in file.read().split(b"\0") if entry]
+          process = dict(entry.split("=", 1) for entry in entries)
+          names = set(process)
+          known = variables(Settings) | variables(StartupSettings)
+          print("application process variables:", " ".join(sorted(names & known)))
+          # The read is real: what the process must have is there.
+          assert {"PATH", "APP_DB_USER", "APP_DB_PASSWORD", "POSTGRES_HOST"} <= names
+          assert names & known == variables(Settings), sorted((names & known) ^ variables(Settings))
+          assert not names & {"POSTGRES_USER", "POSTGRES_PASSWORD"}
+          owner = os.environ["POSTGRES_USER"]
+          def owner_login(password):
+              try:
+                  psycopg.connect(
+                      host=process["POSTGRES_HOST"], port=process["POSTGRES_PORT"],
+                      dbname=process["POSTGRES_DB"], user=owner, password=password,
+                      connect_timeout=10,
+                  ).close()
+              except psycopg.OperationalError as error:
+                  refused = ("password authentication failed", "no password supplied")
+                  assert any(reason in str(error) for reason in refused), "not a login refusal"
+                  return False
+              return True
+          assert owner_login(os.environ["POSTGRES_PASSWORD"]), "the owner login itself fails"
+          accepted = sum(owner_login(value) for value in process.values())
+          print(f"owner logins with each of the {len(process)} values the process holds: {accepted}")
+          assert accepted == 0
+          # Nor can a start-up step run from what the application process holds.
+          setup = subprocess.run(
+              ["python", "-m", "app.db.roles"], env=process, capture_output=True, text=True,
+              timeout=60,
+          )
+          assert setup.returncode != 0
+          assert "postgres_user" in setup.stderr and "postgres_password" in setup.stderr
+          print("role set-up with the application process environment: refused, no owner")
+          '
       - name: A restart runs the set-up again and changes no role or privilege
         run: |
           . .github/ci-wait.sh
@@ -264,17 +320,22 @@ jobs:
         run: |
           set -o pipefail
           . .github/ci-wait.sh
-          # Compose's resolved configuration, read by the app's own Settings class inside the
-          # image. Names only; values are never printed.
+          # Compose's resolved configuration, read by the app's own settings classes inside the
+          # image. Names only; values are never printed. The container receives the variables
+          # of both classes: the start-up steps need the owner. The application process gets
+          # only its own class's (the step above checks the running process).
           timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
             | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
               --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
-          from app.config import Settings
+          from app.config import Settings, StartupSettings
           received = set(json.load(sys.stdin)["services"]["app"]["environment"])
-          fields = {name.upper() for name in Settings.model_fields}
+          application = {name.upper() for name in Settings.model_fields}
+          startup = {name.upper() for name in StartupSettings.model_fields}
+          fields = application | startup
           print("app environment names:", " ".join(sorted(received)))
-          if received != fields:
+          print("of which only the start-up steps get:", " ".join(sorted(startup - application)))
+          if received != fields or startup - application != {"POSTGRES_USER", "POSTGRES_PASSWORD"}:
               print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
               sys.exit(1)
           '
@@ -429,8 +490,12 @@ jobs:
           echo "$output" | tail -n 5
           echo "exit code: $code"
           test "$code" = "1"
-          echo "$output" | grep -q "1 validation error for Settings"
-          echo "$output" | grep -q "app_db_user must differ from postgres_user"
+          echo "$output" | grep -q "1 validation error for StartupSettings"
+          echo "$output" | grep -q "postgres_user must differ from app_db_user"
+          if echo "$output" | grep -Eq "validation errors? for Settings"; then
+            echo "the application settings were refused too; only the start-up rule should be"
+            exit 1
+          fi
       - name: Compose logs
         if: always()
         run: timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml logs || true

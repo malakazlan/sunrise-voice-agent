@@ -13,7 +13,7 @@ from sqlalchemy import Connection, Engine, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import Settings, StartupSettings
 from app.db.roles import set_up_runtime_role
 from app.db.session import (
     create_database_engine,
@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # short pieces so that no file holds a key-shaped literal.
 TEST_AUDIT_KEY = "-".join(["test", "audit", "key"] * 4)
 
-# Required values for tests that only build Settings and never connect.
+# Required values for tests that only build StartupSettings and never connect.
 OFFLINE_DB_ENV = {
     "POSTGRES_HOST": "db.invalid",
     "POSTGRES_DB": "sunrise_offline",
@@ -102,7 +102,11 @@ def db_env(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def offline_settings(**overrides: Any) -> Settings:
     """Demo settings with every required value, for app tests that never connect."""
-    values: dict[str, Any] = {key.lower(): value for key, value in OFFLINE_DB_ENV.items()}
+    values: dict[str, Any] = {
+        key.lower(): value
+        for key, value in OFFLINE_DB_ENV.items()
+        if key.lower() in Settings.model_fields
+    }
     values.update({key.lower(): value for key, value in VOICE_SECRETS.items()})
     values["app_env"] = "demo"
     values.update(overrides)
@@ -128,7 +132,7 @@ def new_role_name(kind: str) -> str:
     return f"sva_test_{uuid4().hex[:12]}_{kind}"
 
 
-def drop_role(settings: Settings, name: str) -> None:
+def drop_role(settings: StartupSettings, name: str) -> None:
     """Drop a runtime role, after revoking what it holds in this database and on shared
     objects. Grants it still has in another database make the drop fail, so a leak shows."""
     engine = admin_engine(settings)
@@ -146,14 +150,14 @@ def drop_role(settings: Settings, name: str) -> None:
 
 
 @pytest.fixture(scope="session")
-def server_settings() -> Iterator[Settings]:
-    """The database server the tests run against: the owner from the POSTGRES_* variables,
-    and a runtime role of this test run's own, with a random password. The role is created in
-    each test database by the `database` fixture and dropped when the run ends."""
-    settings = Settings(
+def server_settings() -> Iterator[StartupSettings]:
+    """The database server the tests run against, as the start-up steps see it: the owner
+    from the POSTGRES_* variables, and a runtime role of this test run's own, with a random
+    password. The role is created in each test database by the `database` fixture and dropped
+    when the run ends."""
+    settings = StartupSettings(
         _env_file=None,
         app_env="dev",
-        audit_hmac_key=TEST_AUDIT_KEY,
         app_db_user=new_role_name("app"),
         app_db_password=secrets.token_urlsafe(24),
     )
@@ -163,15 +167,15 @@ def server_settings() -> Iterator[Settings]:
         drop_role(settings, settings.app_db_user)
 
 
-def with_database(settings: Settings, name: str) -> Settings:
+def with_database(settings: StartupSettings, name: str) -> StartupSettings:
     return settings.model_copy(update={"postgres_db": name})
 
 
-def admin_engine(settings: Settings) -> Engine:
+def admin_engine(settings: StartupSettings) -> Engine:
     return create_owner_sync_engine(settings, isolation_level="AUTOCOMMIT", poolclass=NullPool)
 
 
-def set_up_roles(settings: Settings) -> None:
+def set_up_roles(settings: StartupSettings) -> None:
     """The start-up role set-up, run as the owner in the settings' database."""
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
@@ -181,7 +185,7 @@ def set_up_roles(settings: Settings) -> None:
         engine.dispose()
 
 
-def create_database(settings: Settings, name: str, template: str | None = None) -> None:
+def create_database(settings: StartupSettings, name: str, template: str | None = None) -> None:
     engine = admin_engine(settings)
     quote = engine.dialect.identifier_preparer.quote
     statement = f"CREATE DATABASE {quote(name)}"
@@ -191,14 +195,14 @@ def create_database(settings: Settings, name: str, template: str | None = None) 
         connection.execute(text(statement))
 
 
-def drop_database(settings: Settings, name: str) -> None:
+def drop_database(settings: StartupSettings, name: str) -> None:
     engine = admin_engine(settings)
     quote = engine.dialect.identifier_preparer.quote
     with engine.connect() as connection:
         connection.execute(text(f"DROP DATABASE IF EXISTS {quote(name)} WITH (FORCE)"))
 
 
-def database_env(settings: Settings) -> dict[str, str]:
+def database_env(settings: StartupSettings) -> dict[str, str]:
     """Process environment that points the app's settings at the given database."""
     return {
         **os.environ,
@@ -211,11 +215,13 @@ def database_env(settings: Settings) -> dict[str, str]:
         "POSTGRES_PASSWORD": settings.postgres_password.get_secret_value(),
         "APP_DB_USER": settings.app_db_user,
         "APP_DB_PASSWORD": settings.app_db_password.get_secret_value(),
-        "AUDIT_HMAC_KEY": settings.audit_hmac_key.get_secret_value(),
+        "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
     }
 
 
-def python_module(settings: Settings, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def python_module(
+    settings: StartupSettings, cwd: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
     """Run `python -m <args>` against the given database, from a directory without a .env."""
     return subprocess.run(
         [sys.executable, "-m", *args],
@@ -227,7 +233,7 @@ def python_module(settings: Settings, cwd: Path, *args: str) -> subprocess.Compl
     )
 
 
-def alembic(settings: Settings, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def alembic(settings: StartupSettings, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return python_module(settings, cwd, "alembic", "-c", str(REPO_ROOT / "alembic.ini"), *args)
 
 
@@ -235,7 +241,7 @@ def alembic(settings: Settings, cwd: Path, *args: str) -> subprocess.CompletedPr
 def run_module(tmp_path: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
     """`run_module(settings, "pkg.module", *args)`: run a module against a database."""
 
-    def run(settings: Settings, *args: str) -> subprocess.CompletedProcess[str]:
+    def run(settings: StartupSettings, *args: str) -> subprocess.CompletedProcess[str]:
         return python_module(settings, tmp_path, *args)
 
     return run
@@ -245,18 +251,18 @@ def run_module(tmp_path: Path) -> Callable[..., subprocess.CompletedProcess[str]
 def run_alembic(tmp_path: Path) -> Callable[..., subprocess.CompletedProcess[str]]:
     """`run_alembic(settings, *args)`: run the Alembic command line against a database."""
 
-    def run(settings: Settings, *args: str) -> subprocess.CompletedProcess[str]:
+    def run(settings: StartupSettings, *args: str) -> subprocess.CompletedProcess[str]:
         return alembic(settings, tmp_path, *args)
 
     return run
 
 
 @pytest.fixture
-def new_database(server_settings: Settings) -> Iterator[Callable[[], Settings]]:
+def new_database(server_settings: StartupSettings) -> Iterator[Callable[[], StartupSettings]]:
     """`new_database()`: create an empty database; all are dropped after the test."""
     created: list[str] = []
 
-    def create() -> Settings:
+    def create() -> StartupSettings:
         name = f"sva_test_{uuid4().hex[:12]}"
         create_database(server_settings, name)
         created.append(name)
@@ -270,13 +276,13 @@ def new_database(server_settings: Settings) -> Iterator[Callable[[], Settings]]:
 
 
 @pytest.fixture
-def empty_database(new_database: Callable[[], Settings]) -> Settings:
+def empty_database(new_database: Callable[[], StartupSettings]) -> StartupSettings:
     return new_database()
 
 
 @pytest.fixture(scope="session")
 def migrated_template(
-    server_settings: Settings, tmp_path_factory: pytest.TempPathFactory
+    server_settings: StartupSettings, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[str]:
     name = f"sva_test_{uuid4().hex[:12]}_template"
     create_database(server_settings, name)
@@ -294,7 +300,7 @@ def migrated_template(
 
 
 @pytest.fixture
-def database(server_settings: Settings, migrated_template: str) -> Iterator[Settings]:
+def database(server_settings: StartupSettings, migrated_template: str) -> Iterator[StartupSettings]:
     """A fresh database migrated to head with the runtime role set up in it, as the container
     starts it; dropped after the test. Database-level privileges are not copied from a
     template, so the set-up runs for each database."""
@@ -309,7 +315,7 @@ def database(server_settings: Settings, migrated_template: str) -> Iterator[Sett
 
 
 @pytest.fixture
-def owner_engine(database: Settings) -> Iterator[Engine]:
+def owner_engine(database: StartupSettings) -> Iterator[Engine]:
     """The owner, for set-up, schema checks and reading what the application committed."""
     engine = create_owner_sync_engine(database, poolclass=NullPool)
     try:
@@ -319,7 +325,7 @@ def owner_engine(database: Settings) -> Iterator[Engine]:
 
 
 @pytest.fixture
-async def session(database: Settings) -> AsyncIterator[AsyncSession]:
+async def session(database: StartupSettings) -> AsyncIterator[AsyncSession]:
     """A session as the application has it: the runtime role."""
     engine = create_database_engine(database)
     try:
@@ -330,7 +336,7 @@ async def session(database: Settings) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
-async def owner_session(database: Settings) -> AsyncIterator[AsyncSession]:
+async def owner_session(database: StartupSettings) -> AsyncIterator[AsyncSession]:
     """A session as the start-up seed has it: the owner."""
     engine = create_owner_engine(database)
     try:

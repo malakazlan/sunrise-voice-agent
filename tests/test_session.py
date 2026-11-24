@@ -20,7 +20,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, Stateme
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import StartupSettings
 from app.db.session import (
     create_database_engine,
     create_owner_engine,
@@ -30,7 +30,7 @@ from app.db.session import (
 
 pytestmark = pytest.mark.anyio
 
-OFFLINE = Settings(
+OFFLINE = StartupSettings(
     _env_file=None,
     app_env="dev",
     postgres_host="db.invalid",
@@ -39,7 +39,6 @@ OFFLINE = Settings(
     postgres_password="offline-test-password",
     app_db_user="sunrise_offline_app",
     app_db_password="offline-test-app-password",
-    audit_hmac_key="offline-audit-key",
 )
 
 # A synthetic patient with values that occur nowhere else, so any copy of them in an error
@@ -90,7 +89,7 @@ VIOLATIONS = {
 SECRET_VALUES = (*ROW_VALUES, MEDICATION, "1999-09-09", "Quackenbush Pharmacy")
 
 
-def raised_by_sync(settings: Settings, violation: str) -> DBAPIError:
+def raised_by_sync(settings: StartupSettings, violation: str) -> DBAPIError:
     setup, statement, params = VIOLATIONS[violation]
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
@@ -104,7 +103,7 @@ def raised_by_sync(settings: Settings, violation: str) -> DBAPIError:
     return excinfo.value
 
 
-async def raised_by_async(settings: Settings, violation: str) -> DBAPIError:
+async def raised_by_async(settings: StartupSettings, violation: str) -> DBAPIError:
     setup, statement, params = VIOLATIONS[violation]
     engine = create_database_engine(settings)
     try:
@@ -119,7 +118,7 @@ async def raised_by_async(settings: Settings, violation: str) -> DBAPIError:
     return excinfo.value
 
 
-async def raised(settings: Settings, violation: str, kind: str) -> DBAPIError:
+async def raised(settings: StartupSettings, violation: str, kind: str) -> DBAPIError:
     if kind == "sync":
         return raised_by_sync(settings, violation)
     return await raised_by_async(settings, violation)
@@ -163,7 +162,9 @@ def assert_carries_no_row_values(error: DBAPIError) -> None:
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-async def test_check_violation_does_not_carry_row_values(database: Settings, kind: str) -> None:
+async def test_check_violation_does_not_carry_row_values(
+    database: StartupSettings, kind: str
+) -> None:
     error = await raised(database, "check", kind)
 
     assert isinstance(error.orig, errors.CheckViolation)
@@ -171,7 +172,9 @@ async def test_check_violation_does_not_carry_row_values(database: Settings, kin
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-async def test_not_null_violation_does_not_carry_row_values(database: Settings, kind: str) -> None:
+async def test_not_null_violation_does_not_carry_row_values(
+    database: StartupSettings, kind: str
+) -> None:
     error = await raised(database, "not_null", kind)
 
     assert isinstance(error.orig, errors.NotNullViolation)
@@ -179,7 +182,9 @@ async def test_not_null_violation_does_not_carry_row_values(database: Settings, 
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-async def test_unique_violation_does_not_carry_row_values(database: Settings, kind: str) -> None:
+async def test_unique_violation_does_not_carry_row_values(
+    database: StartupSettings, kind: str
+) -> None:
     error = await raised(database, "unique", kind)
 
     assert isinstance(error.orig, errors.UniqueViolation)
@@ -188,7 +193,7 @@ async def test_unique_violation_does_not_carry_row_values(database: Settings, ki
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
 async def test_failure_still_reports_class_sqlstate_and_constraint(
-    database: Settings, kind: str
+    database: StartupSettings, kind: str
 ) -> None:
     expected = {
         "check": (errors.CheckViolation, "23514", "ck_patients_balance_due_not_negative", None),
@@ -241,7 +246,7 @@ BOUND_VALUE = "Zebulon Quackenbush 1933-03-03"
 REFUSED = select(literal(BOUND_VALUE, type_=RefusesValues()))
 
 
-async def non_driver_error(settings: Settings, kind: str) -> StatementError:
+async def non_driver_error(settings: StartupSettings, kind: str) -> StatementError:
     if kind == "sync":
         engine = create_owner_sync_engine(settings, poolclass=NullPool)
         try:
@@ -261,7 +266,7 @@ async def non_driver_error(settings: Settings, kind: str) -> StatementError:
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-async def test_non_driver_error_does_not_carry_values(database: Settings, kind: str) -> None:
+async def test_non_driver_error_does_not_carry_values(database: StartupSettings, kind: str) -> None:
     error = await non_driver_error(database, kind)
 
     assert type(error) is StatementError
@@ -276,7 +281,7 @@ async def test_non_driver_error_does_not_carry_values(database: Settings, kind: 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
 async def test_lost_connection_reason_passes_through(
-    database: Settings,
+    database: StartupSettings,
     kind: str,
     close_driver_connection: Callable[[Connection], None],
     close_async_driver_connection: Callable[[AsyncConnection], Awaitable[None]],
@@ -309,7 +314,9 @@ async def test_lost_connection_reason_passes_through(
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-async def test_administrator_kill_reports_class_and_sqlstate(database: Settings, kind: str) -> None:
+async def test_administrator_kill_reports_class_and_sqlstate(
+    database: StartupSettings, kind: str
+) -> None:
     admin = create_owner_sync_engine(database, isolation_level="AUTOCOMMIT", poolclass=NullPool)
 
     def kill(pid: int) -> None:

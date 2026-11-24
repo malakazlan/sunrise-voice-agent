@@ -10,19 +10,22 @@ database, and nothing else:
 - It is created if missing. Its attributes are set every time: LOGIN, not a superuser, cannot
   create roles or databases, no replication, no bypassing row security.
 - Its password is set every time, so a changed APP_DB_PASSWORD takes effect at the next start
-  and the old one stops working. It is sent as a SCRAM-SHA-256 verifier made by the driver
-  (app/db/session.py), never as the password itself.
+  and the old one stops working. It is sent as a SCRAM-SHA-256 verifier made by the driver,
+  never as the password itself, in a statement no log, event or error message sees
+  (app/db/session.py).
 - What it holds besides is taken away: membership in other roles, settings attached to it,
   and, through DROP OWNED, every privilege granted to it in this database and on shared objects
   (databases, parameters), default privileges included. If it owns anything, anywhere on the
   server, set-up stops instead: DROP OWNED would drop those objects, and the role must never
   own any.
 - PUBLIC loses what would otherwise reach the role through it: every privilege on the schema's
-  tables and sequences, CREATE on the schema, CREATE and TEMPORARY on the database.
+  tables and sequences, EXECUTE on its functions, CREATE on the schema, CREATE and TEMPORARY
+  on the database.
 - Then the declaration is granted.
 
 Privileges the role holds in other databases on the same server are not this database's to
-manage and are left alone.
+manage and are left alone, except grants on shared objects, which DROP OWNED takes away
+everywhere: one runtime role name per server.
 """
 
 import logging
@@ -30,9 +33,9 @@ import logging
 from sqlalchemy import Connection, text
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import DatabaseSettings, StartupSettings
 from app.db import grants
-from app.db.session import create_owner_sync_engine, password_verifier
+from app.db.session import create_owner_sync_engine, set_role_password
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ ROLE_SETTINGS = text(
 )
 
 
-def set_up_runtime_role(connection: Connection, settings: Settings) -> None:
+def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> None:
     """Set up the runtime role inside the caller's transaction, as the owner. The caller
     commits."""
     quote = connection.dialect.identifier_preparer.quote_identifier
@@ -69,11 +72,12 @@ def set_up_runtime_role(connection: Connection, settings: Settings) -> None:
     elif connection.execute(OWNED_ANYWHERE, {"role": oid}).scalar_one():
         raise RuntimeError("the runtime role owns database objects; it must own none")
 
-    verifier = password_verifier(connection, settings.app_db_user, settings.app_db_password)
-    # Driver SQL: the verifier's base64 can hold `=:`, which text() would read as a parameter.
-    connection.exec_driver_sql(
-        f"ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
-        f" NOBYPASSRLS PASSWORD '{verifier}'"
+    set_role_password(connection, settings.app_db_user, settings.app_db_password)
+    connection.execute(
+        text(
+            f"ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION"
+            " NOBYPASSRLS"
+        )
     )
 
     for granted, grantor in connection.execute(MEMBERSHIPS, {"role": oid}).all():
@@ -85,6 +89,7 @@ def set_up_runtime_role(connection: Connection, settings: Settings) -> None:
 
     connection.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC"))
     connection.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC"))
+    connection.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC"))
     connection.execute(text(f"REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"))
     connection.execute(text(f"REVOKE CREATE, TEMPORARY ON DATABASE {database} FROM PUBLIC"))
 
@@ -95,6 +100,7 @@ def set_up_runtime_role(connection: Connection, settings: Settings) -> None:
     for kind, declaration in (
         ("TABLE", grants.TABLE_PRIVILEGES),
         ("SEQUENCE", grants.SEQUENCE_PRIVILEGES),
+        ("FUNCTION", grants.FUNCTION_PRIVILEGES),
     ):
         for name, privileges in declaration.items():
             if privileges:
@@ -106,16 +112,17 @@ def set_up_runtime_role(connection: Connection, settings: Settings) -> None:
                 )
 
     logger.info(
-        "runtime_role_ready created=%s tables=%d sequences=%d",
+        "runtime_role_ready created=%s tables=%d sequences=%d functions=%d",
         created,
         len(grants.TABLE_PRIVILEGES),
         len(grants.SEQUENCE_PRIVILEGES),
+        len(grants.FUNCTION_PRIVILEGES),
     )
 
 
 def main() -> None:
     """Set up the runtime role from the environment's settings, as the owner."""
-    settings = Settings()
+    settings = StartupSettings()
     logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:

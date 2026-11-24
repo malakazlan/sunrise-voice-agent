@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
+from app.config import StartupSettings
 from app.db.models import Appointment, AvailableSlot, Medication, Patient
 from app.db.session import create_owner_engine, create_session_factory
 from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL, clinic_date
@@ -202,7 +202,7 @@ async def seed(session: AsyncSession, raw: dict[str, Any], today: date) -> None:
     )
 
 
-async def _run(settings: Settings, today: date) -> None:
+async def _run(settings: StartupSettings, today: date) -> None:
     engine = create_owner_engine(settings)
     try:
         async with create_session_factory(engine)() as session, session.begin():
@@ -219,7 +219,7 @@ def main(clock: Callable[[], datetime] = _utc_now) -> None:
     """Seed the database from the environment's settings. The slot window starts from
     today's date at the clinic, taken from `clock` (the real clock unless a test passes one).
     """
-    settings = Settings()
+    settings = StartupSettings()
     logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
     today = clinic_date(clock())
     # psycopg's async mode needs a selector event loop; Windows defaults to the proactor loop.

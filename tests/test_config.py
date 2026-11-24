@@ -1,5 +1,9 @@
 import json
 import logging
+import os
+import re
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -11,11 +15,165 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import Settings, StartupSettings
 from app.db.session import create_owner_sync_engine
 from app.main import create_app
 
-ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
+
+# The application's settings, written out by hand: the runtime role, where the database is,
+# and nothing of the owner.
+APPLICATION_FIELDS = {
+    "app_env",
+    "log_level",
+    "postgres_host",
+    "postgres_port",
+    "postgres_db",
+    "app_db_user",
+    "app_db_password",
+    "audit_hmac_key",
+    "simulated_now",
+    "max_concurrent_calls",
+    "max_call_seconds",
+    "turn_shared_secret",
+    "turn_host",
+    "demo_access_token",
+}
+# The start-up steps' settings: the same database, the runtime role they set up, the owner.
+STARTUP_FIELDS = {
+    "app_env",
+    "log_level",
+    "postgres_host",
+    "postgres_port",
+    "postgres_db",
+    "app_db_user",
+    "app_db_password",
+    "postgres_user",
+    "postgres_password",
+}
+OWNER_FIELDS = {"postgres_user", "postgres_password"}
+
+
+def every_variable() -> set[str]:
+    return {name.upper() for name in (*Settings.model_fields, *StartupSettings.model_fields)}
+
+
+def test_application_settings_hold_no_owner_identity() -> None:
+    assert set(Settings.model_fields) == APPLICATION_FIELDS
+    assert set(StartupSettings.model_fields) == STARTUP_FIELDS
+    assert not OWNER_FIELDS & set(Settings.model_fields)
+    assert not any("owner" in name for name in Settings.model_fields)
+    assert not hasattr(Settings, "owner_database_url")
+    assert OWNER_FIELDS <= set(StartupSettings.model_fields)
+
+
+@pytest.mark.usefixtures("offline_env")
+def test_one_env_file_serves_both_settings_classes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Each class reads its own keys from the shared .env and leaves the other's.
+    for name in (
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "AUDIT_HMAC_KEY",
+        "TURN_HOST",
+        "TURN_SHARED_SECRET",
+    ):
+        monkeypatch.delenv(name)
+    (tmp_path / ".env").write_text(
+        "APP_ENV=dev\nPOSTGRES_USER=owner_from_file\nPOSTGRES_PASSWORD=owner-file-password\n"
+        "AUDIT_HMAC_KEY=audit-key-from-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    application = Settings()
+    startup = StartupSettings()
+
+    assert application.audit_hmac_key.get_secret_value() == "audit-key-from-file"
+    assert not hasattr(application, "postgres_password")
+    assert "owner-file-password" not in repr(application.model_dump())
+    assert startup.postgres_user == "owner_from_file"
+    assert not hasattr(startup, "audit_hmac_key")
+
+    # A key that belongs to neither is still refused by both.
+    (tmp_path / ".env").write_text("APP_ENV=dev\nPOSTGRES_USERR=typo\n", encoding="utf-8")
+    for settings_class in (Settings, StartupSettings):
+        with pytest.raises(ValidationError) as excinfo:
+            settings_class()
+        assert [(error["type"], error["loc"]) for error in excinfo.value.errors()][-1] == (
+            "extra_forbidden",
+            ("postgres_userr",),
+        )
+
+    # Only the file is shared: the owner's identity passed to the application is refused.
+    with pytest.raises(ValidationError) as passed:
+        Settings(_env_file=None, postgres_password="owner-passed-directly")  # type: ignore[call-arg]
+    assert ("extra_forbidden", ("postgres_password",)) in [
+        (error["type"], error["loc"]) for error in passed.value.errors()
+    ]
+
+
+def test_settings_check_reports_both_classes(tmp_path: Path) -> None:
+    # `python -m app.config`, the container's first step. Only what the interpreter needs to
+    # start is kept from this environment.
+    base = {key: value for key, value in os.environ.items() if key in ("PATH", "SYSTEMROOT")}
+    base["PYTHONPATH"] = str(REPO_ROOT)
+
+    def check(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "app.config"],
+            cwd=tmp_path,
+            env={**base, **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    refused = check({"APP_ENV": "prod"})
+    assert refused.returncode == 1
+    for name in (
+        *sorted(STARTUP_FIELDS - {"app_env", "log_level", "postgres_port"}),
+        "audit_hmac_key",
+        "turn_shared_secret",
+        "turn_host",
+        "demo_access_token",
+    ):
+        assert name in refused.stderr, name
+    assert re.search(r"validation errors? for StartupSettings$", refused.stderr, re.MULTILINE)
+    assert re.search(r"validation errors? for Settings$", refused.stderr, re.MULTILINE)
+
+    accepted = check({**OFFLINE_DB_ENV, "APP_ENV": "dev"})
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stderr == ""
+
+
+# The container's start command: the start-up steps, then uvicorn without the owner's variables.
+START_COMMAND = re.compile(r'^CMD \["sh", "-c", "(?P<command>[^"]*)"\]$', re.MULTILINE)
+
+
+def test_container_start_drops_the_owner_identity() -> None:
+    match = START_COMMAND.search((REPO_ROOT / "Dockerfile").read_text(encoding="utf-8"))
+    assert match is not None
+    steps = match["command"].split(" && ")
+
+    assert steps[:4] == [
+        "python -m app.config",
+        "alembic upgrade head",
+        "python -m app.db.roles",
+        "python -m app.db.seed",
+    ]
+    [serve] = steps[4:]
+    words = serve.split()
+    # exec: uvicorn replaces the shell, so it is PID 1 and receives the container's signals.
+    assert words[:2] == ["exec", "env"]
+    removed = {words[index + 1] for index, word in enumerate(words) if word == "-u"}
+    assert removed == {name.upper() for name in OWNER_FIELDS}
+    assert removed == {name.upper() for name in StartupSettings.model_fields} - {
+        name.upper() for name in Settings.model_fields
+    }
+    assert words[2 + 2 * len(removed)] == "uvicorn"
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -111,18 +269,19 @@ def test_env_example_matches_settings() -> None:
         if line.strip() and not line.lstrip().startswith("#")
     }
 
-    assert keys == {name.upper() for name in Settings.model_fields}
+    assert keys == every_variable()
 
 
 @pytest.mark.usefixtures("clean_env")
 def test_env_example_loads_and_carries_defaults() -> None:
     assert ENV_EXAMPLE.is_file()
 
-    example = Settings(_env_file=ENV_EXAMPLE)
+    for settings_class in (Settings, StartupSettings):
+        example = settings_class(_env_file=ENV_EXAMPLE)
 
-    for name, field in Settings.model_fields.items():
-        if not field.is_required():
-            assert getattr(example, name) == field.default, name
+        for name, field in settings_class.model_fields.items():
+            if not field.is_required():
+                assert getattr(example, name) == field.default, name
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -155,6 +314,17 @@ def test_missing_database_settings_are_rejected(monkeypatch: pytest.MonkeyPatch)
         ("missing", ("audit_hmac_key",)),
         ("missing", ("postgres_db",)),
         ("missing", ("postgres_host",)),
+    ]
+
+    with pytest.raises(ValidationError) as startup:
+        StartupSettings(_env_file=None)
+
+    errors = sorted((error["type"], error["loc"]) for error in startup.value.errors())
+    assert errors == [
+        ("missing", ("app_db_password",)),
+        ("missing", ("app_db_user",)),
+        ("missing", ("postgres_db",)),
+        ("missing", ("postgres_host",)),
         ("missing", ("postgres_password",)),
         ("missing", ("postgres_user",)),
     ]
@@ -172,26 +342,27 @@ def test_database_url_is_built_from_the_parts(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("APP_DB_USER", "clinic_runtime")
     monkeypatch.setenv("APP_DB_PASSWORD", "r@ntime:word/long-enough-2")
 
-    settings = Settings(_env_file=None)
-    owner = settings.owner_database_url
-    runtime = settings.runtime_database_url
+    startup = StartupSettings(_env_file=None)
+    owner = startup.owner_database_url
+    runtime = Settings(_env_file=None).runtime_database_url
 
-    for url in (owner, runtime):
+    for url in (owner, runtime, startup.runtime_database_url):
         assert url.drivername == "postgresql+psycopg"
         assert (url.host, url.port, url.database) == ("db.example", 6543, "clinic")
     assert (owner.username, owner.password) == ("clinic_app", "p@ss:word/long-enough-1")
     assert (runtime.username, runtime.password) == ("clinic_runtime", "r@ntime:word/long-enough-2")
+    assert startup.runtime_database_url == runtime
 
 
 def test_database_password_is_hidden(
-    server_settings: Settings, caplog: pytest.LogCaptureFixture
+    server_settings: StartupSettings, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The real test server, reached with a password it does not accept. The environment is
     # kept as it is: libpq on Windows needs it to run the login handshake.
     password = "not-for-logs-db-password"
 
-    def build(port: object) -> Settings:
-        return Settings(
+    def build(port: object) -> StartupSettings:
+        return StartupSettings(
             _env_file=None,
             app_env="prod",
             postgres_host=server_settings.postgres_host,
@@ -201,10 +372,6 @@ def test_database_password_is_hidden(
             postgres_password=password,
             app_db_user=server_settings.app_db_user,
             app_db_password="-".join(["runtime", "password", "of", "this", "test"]),
-            audit_hmac_key=server_settings.audit_hmac_key,
-            demo_access_token=VOICE_SECRETS["DEMO_ACCESS_TOKEN"],
-            turn_host=VOICE_SECRETS["TURN_HOST"],
-            turn_shared_secret=VOICE_SECRETS["TURN_SHARED_SECRET"],
         )
 
     settings = build(server_settings.postgres_port)
@@ -275,7 +442,7 @@ def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPa
         monkeypatch.setenv("POSTGRES_PASSWORD", password)
 
         with pytest.raises(ValidationError) as excinfo:
-            Settings(_env_file=None)
+            StartupSettings(_env_file=None)
 
         assert [error["loc"] for error in excinfo.value.errors()] == [("postgres_password",)]
         assert password not in str(excinfo.value), (app_env, password)
@@ -289,7 +456,7 @@ def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPa
         monkeypatch.setenv("APP_ENV", app_env)
         monkeypatch.setenv("POSTGRES_PASSWORD", password)
 
-        settings = Settings(_env_file=None)
+        settings = StartupSettings(_env_file=None)
 
         assert settings.owner_database_url.password == password
 
@@ -566,17 +733,18 @@ TEN_DISTINCT = "abcdefghij" * 4
 
 @pytest.mark.usefixtures("offline_env")
 @pytest.mark.parametrize(
-    "name",
+    ("name", "settings_class"),
     [
-        "POSTGRES_PASSWORD",
-        "APP_DB_PASSWORD",
-        "DEMO_ACCESS_TOKEN",
-        "TURN_SHARED_SECRET",
-        "AUDIT_HMAC_KEY",
+        ("POSTGRES_PASSWORD", StartupSettings),
+        ("APP_DB_PASSWORD", Settings),
+        ("APP_DB_PASSWORD", StartupSettings),
+        ("DEMO_ACCESS_TOKEN", Settings),
+        ("TURN_SHARED_SECRET", Settings),
+        ("AUDIT_HMAC_KEY", Settings),
     ],
 )
 def test_secrets_need_ten_distinct_characters_outside_dev(
-    monkeypatch: pytest.MonkeyPatch, name: str
+    monkeypatch: pytest.MonkeyPatch, name: str, settings_class: type[Settings | StartupSettings]
 ) -> None:
     assert (len(set(NINE_DISTINCT)), len(set(TEN_DISTINCT))) == (9, 10)
     padded = [" " + TEN_DISTINCT, TEN_DISTINCT + " ", TEN_DISTINCT + "\n"]
@@ -587,18 +755,20 @@ def test_secrets_need_ten_distinct_characters_outside_dev(
             monkeypatch.setenv(name, value)
 
             with pytest.raises(ValidationError) as excinfo:
-                Settings(_env_file=None)
+                settings_class(_env_file=None)
 
             assert [error["loc"] for error in excinfo.value.errors()] == [(name.lower(),)], value
             assert value.strip() not in str(excinfo.value)
 
         monkeypatch.setenv(name, TEN_DISTINCT)
-        assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == TEN_DISTINCT
+        settings = settings_class(_env_file=None)
+        assert getattr(settings, name.lower()).get_secret_value() == TEN_DISTINCT
 
     # In dev the shared rule does not apply; each setting's own rules still do.
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv(name, NINE_DISTINCT)
-    assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == NINE_DISTINCT
+    settings = settings_class(_env_file=None)
+    assert getattr(settings, name.lower()).get_secret_value() == NINE_DISTINCT
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -608,86 +778,105 @@ def test_runtime_database_identity_rules(monkeypatch: pytest.MonkeyPatch) -> Non
     runtime_user = OFFLINE_DB_ENV["APP_DB_USER"]
     runtime_password = OFFLINE_DB_ENV["APP_DB_PASSWORD"]
     assert (runtime_user, runtime_password) != (owner_user, owner_password)
+    # The runtime identity's own rules hold in both classes; the rules that compare it with
+    # the owner's can only hold where the owner is known, the start-up settings.
+    both = (Settings, StartupSettings)
 
-    def errors_for(**values: str) -> list[tuple[str | int, ...]]:
+    def errors_for(
+        settings_class: type[Settings | StartupSettings], **values: str
+    ) -> list[tuple[str | int, ...]]:
         for name, value in values.items():
             monkeypatch.setenv(name, value)
         with pytest.raises(ValidationError) as excinfo:
-            Settings(_env_file=None)
+            settings_class(_env_file=None)
         for value in values.values():
             if len(value) >= 4:
                 assert value not in str(excinfo.value), value
         return [error["loc"] for error in excinfo.value.errors()]
 
     # Both are required in every environment; an empty password is no password.
-    for app_env in ("dev", "demo", "prod"):
-        monkeypatch.setenv("APP_ENV", app_env)
-        monkeypatch.delenv("APP_DB_USER")
-        monkeypatch.delenv("APP_DB_PASSWORD")
-        with pytest.raises(ValidationError) as missing:
-            Settings(_env_file=None)
-        assert sorted((error["type"], error["loc"]) for error in missing.value.errors()) == [
-            ("missing", ("app_db_password",)),
-            ("missing", ("app_db_user",)),
-        ]
-        monkeypatch.setenv("APP_DB_USER", runtime_user)
-        with pytest.raises(ValidationError, match="must not be empty") as empty:
-            Settings(_env_file=None, app_db_password="")
-        assert [error["loc"] for error in empty.value.errors()] == [("app_db_password",)]
-        monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
+    for settings_class in both:
+        for app_env in ("dev", "demo", "prod"):
+            monkeypatch.setenv("APP_ENV", app_env)
+            monkeypatch.delenv("APP_DB_USER")
+            monkeypatch.delenv("APP_DB_PASSWORD")
+            with pytest.raises(ValidationError) as missing:
+                settings_class(_env_file=None)
+            assert sorted((error["type"], error["loc"]) for error in missing.value.errors()) == [
+                ("missing", ("app_db_password",)),
+                ("missing", ("app_db_user",)),
+            ]
+            monkeypatch.setenv("APP_DB_USER", runtime_user)
+            with pytest.raises(ValidationError, match="must not be empty") as empty:
+                settings_class(_env_file=None, app_db_password="")
+            assert [error["loc"] for error in empty.value.errors()] == [("app_db_password",)]
+            monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
 
     # The user name: lower-case letters, digits and underscores, at most 63 (Postgres cuts
-    # longer names), not in Postgres's reserved pg_ prefix, and never the owner's name.
-    for app_env in ("dev", "demo", "prod"):
-        monkeypatch.setenv("APP_ENV", app_env)
-        for refused in (
-            "Sunrise_app",
-            "sunrise-app",
-            "sunrise app",
-            'sunrise_app"',
-            "sunrise_app;",
-            "sünrise_app",
-            "pg_sunrise",
-            "a" * 64,
-            owner_user,
-        ):
-            assert errors_for(APP_DB_USER=refused) == [("app_db_user",)], (app_env, refused)
-        for accepted in ("sunrise_app", "app2", "_app", "a" * 63):
-            monkeypatch.setenv("APP_DB_USER", accepted)
-            assert Settings(_env_file=None).app_db_user == accepted
-        monkeypatch.setenv("APP_DB_USER", runtime_user)
+    # longer names), not in Postgres's reserved pg_ prefix.
+    for settings_class in both:
+        for app_env in ("dev", "demo", "prod"):
+            monkeypatch.setenv("APP_ENV", app_env)
+            for refused in (
+                "Sunrise_app",
+                "sunrise-app",
+                "sunrise app",
+                'sunrise_app"',
+                "sunrise_app;",
+                "sünrise_app",
+                "pg_sunrise",
+                "a" * 64,
+            ):
+                assert errors_for(settings_class, APP_DB_USER=refused) == [("app_db_user",)], (
+                    app_env,
+                    refused,
+                )
+            for accepted in ("sunrise_app", "app2", "_app", "a" * 63):
+                monkeypatch.setenv("APP_DB_USER", accepted)
+                assert settings_class(_env_file=None).app_db_user == accepted
+            monkeypatch.setenv("APP_DB_USER", runtime_user)
 
-    # The password never equals the owner's, in any environment.
+    # The owner's name and password are never the runtime role's, in any environment. The
+    # start-up settings refuse them on the owner's fields, which they hold.
     for app_env in ("dev", "demo", "prod"):
         monkeypatch.setenv("APP_ENV", app_env)
-        assert errors_for(APP_DB_PASSWORD=owner_password) == [("app_db_password",)], app_env
-    monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
+        assert errors_for(StartupSettings, APP_DB_USER=owner_user) == [("postgres_user",)]
+        monkeypatch.setenv("APP_DB_USER", runtime_user)
+        assert errors_for(StartupSettings, APP_DB_PASSWORD=owner_password) == [
+            ("postgres_password",)
+        ]
+        monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
 
     # Outside dev it is as strong as the owner's: 16 characters, 10 different ones, no
     # surrounding whitespace, not a placeholder from .env.example.
-    for app_env in ("demo", "prod"):
-        monkeypatch.setenv("APP_ENV", app_env)
-        for refused in (
-            "fifteen-chars-x",
-            NINE_DISTINCT,
-            " " + TEN_DISTINCT,
-            example_value("APP_DB_PASSWORD"),
-            example_value("POSTGRES_PASSWORD"),
-        ):
-            assert errors_for(APP_DB_PASSWORD=refused) == [("app_db_password",)], refused
-        monkeypatch.setenv("APP_DB_PASSWORD", "sixteen-chars-xx")
-        assert Settings(_env_file=None).app_db_password.get_secret_value() == "sixteen-chars-xx"
-    monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setenv("APP_DB_PASSWORD", "short")
-    assert Settings(_env_file=None).app_db_password.get_secret_value() == "short"
+    for settings_class in both:
+        for app_env in ("demo", "prod"):
+            monkeypatch.setenv("APP_ENV", app_env)
+            for refused in (
+                "fifteen-chars-x",
+                NINE_DISTINCT,
+                " " + TEN_DISTINCT,
+                example_value("APP_DB_PASSWORD"),
+                example_value("POSTGRES_PASSWORD"),
+            ):
+                assert errors_for(settings_class, APP_DB_PASSWORD=refused) == [
+                    ("app_db_password",)
+                ], refused
+            monkeypatch.setenv("APP_DB_PASSWORD", "sixteen-chars-xx")
+            settings = settings_class(_env_file=None)
+            assert settings.app_db_password.get_secret_value() == "sixteen-chars-xx"
+        monkeypatch.setenv("APP_ENV", "dev")
+        monkeypatch.setenv("APP_DB_PASSWORD", "short")
+        assert settings_class(_env_file=None).app_db_password.get_secret_value() == "short"
+        monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
 
     # Neither the password nor the owner's is shown by the settings or their URLs.
     monkeypatch.setenv("APP_ENV", "prod")
-    monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
     monkeypatch.setenv("POSTGRES_PASSWORD", "owner-password-long-enough")
-    settings = Settings(_env_file=None)
-    runtime_url = settings.runtime_database_url
-    owner_url = settings.owner_database_url
+    startup = StartupSettings(_env_file=None)
+    application = Settings(_env_file=None)
+    runtime_url = application.runtime_database_url
+    owner_url = startup.owner_database_url
     assert (runtime_url.username, runtime_url.password) == (runtime_user, runtime_password)
     assert (owner_url.username, owner_url.password) == (owner_user, "owner-password-long-enough")
     for url in (runtime_url, owner_url):
@@ -698,9 +887,11 @@ def test_runtime_database_identity_rules(monkeypatch: pytest.MonkeyPatch) -> Non
             OFFLINE_DB_ENV["POSTGRES_DB"],
         )
     for rendered in (
-        repr(settings),
-        str(settings),
-        repr(settings.model_dump()),
+        repr(startup),
+        str(startup),
+        repr(startup.model_dump()),
+        repr(application),
+        repr(application.model_dump()),
         repr(runtime_url),
         str(runtime_url),
         repr(owner_url),
@@ -708,6 +899,9 @@ def test_runtime_database_identity_rules(monkeypatch: pytest.MonkeyPatch) -> Non
     ):
         assert runtime_password not in rendered
         assert "owner-password-long-enough" not in rendered
+    # The application's settings were built from the same environment and hold no owner.
+    assert "owner-password-long-enough" not in repr(application.model_dump())
+    assert not OWNER_FIELDS & set(application.model_dump())
 
 
 @pytest.mark.usefixtures("offline_env")
