@@ -439,7 +439,8 @@ tool's own action (`appointment_read`, `refill_requested`, `lab_status_read`, `b
 `doctor_message_sent`), resource type `patient` and the caller's patient id. No medication
 name, message text, balance or status reaches the audit log or the logs.
 
-- `get_next_appointment`: the caller's earliest `scheduled` appointment at or after now, as
+- `get_next_appointment`: the caller's earliest `scheduled` appointment at or after the moment
+  of the question on the call's clock, as
   `Thursday, December 3 at 10:30 AM with Dr. Patel` in clinic time, or none.
 - `request_refill(medication_name, confirmed)`: the name is matched with `match_medication`
   against the caller's own medications only. No match, or more than one: `not_found` and
@@ -469,9 +470,6 @@ name, message text, balance or status reaches the audit log or the logs.
     anything else in it are stored unmasked. The cue rule also masks an innocent number after
     such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
     four five six seven eight nine`) is not masked.
-  - "Now", for the next appointment, is when the call started (the clock reading office hours
-    are decided from), not the moment of the question: an appointment that starts during the
-    call is still told as next.
   - The audit action names the tool, not what came of it: a `request_refill` that ends in
     `needs_confirmation` or `not_found` is still recorded as `refill_requested`. The request
     row is the record of what was asked for.

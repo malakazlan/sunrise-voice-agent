@@ -8,8 +8,8 @@ transaction. A writing tool called without `confirmed=true` writes nothing and r
 database's unique constraints on `requests` and `messages` decide, and a repeat inserts
 nothing and answers as the first did.
 
-"Now", for the next appointment, is the call's clock reading (`started_at`, taken when the call
-started, as office hours are): the clock is injected there, and a handler has no other.
+"Now", for the next appointment, is the moment of the question on the call's clock (the
+handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
 import re
@@ -125,7 +125,7 @@ async def get_next_appointment(
             .where(
                 Appointment.patient_id == _patient_id(state),
                 Appointment.status == SCHEDULED,
-                Appointment.starts_at >= state.started_at,
+                Appointment.starts_at >= context.now,
             )
             .order_by(Appointment.starts_at)
             .limit(1)

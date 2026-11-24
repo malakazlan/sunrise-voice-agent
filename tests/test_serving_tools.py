@@ -134,6 +134,13 @@ def offered(registry: Registry, state: CallState) -> list[str]:
     return [item.name for item in registry.tools_for(state) if item.name in SERVING_TOOLS]
 
 
+def clocked(deps: Deps, now: datetime) -> Deps:
+    """The same dependencies with the call's clock reading `now`."""
+    return Deps(
+        sessions=deps.sessions, audit=deps.audit, now=lambda: now, claim_keys=deps.claim_keys
+    )
+
+
 def refill(spoken: str, confirmed: bool | None = None) -> dict[str, Any]:
     arguments: dict[str, Any] = {"medication_name": spoken}
     if confirmed is not None:
@@ -577,10 +584,21 @@ async def test_next_appointment_is_in_the_future(
         ),
         (datetime(2026, 12, 10, 14, 0, 1, tzinfo=UTC), None),
     ]
+    # "Now" is the moment of the question on the call's clock, not when the call started: one
+    # call, started before all of them, asks at each moment.
+    state = sarah(T0)
     for now, appointment in expected:
-        assert await data_of(registry, deps, sarah(now), APPOINTMENT) == {
+        asked_at = clocked(deps, now)
+        assert await data_of(registry, asked_at, state, APPOINTMENT) == {
             "appointment": appointment
         }, now
+
+    # A call that started before Sarah's appointment and asks after it began does not hear it.
+    started_before = sarah(at_appointment - timedelta(minutes=20))
+    during = clocked(deps, at_appointment + timedelta(minutes=15))
+    assert await data_of(registry, during, started_before, APPOINTMENT) == {
+        "appointment": "Thursday, December 10 at 9:00 AM with Dr. Lee"
+    }
 
     # Rendered in clinic time: 19:00 UTC on 28 November is 2:00 PM there.
     assert await data_of(registry, deps, serving("P003", "Maria"), APPOINTMENT) == {
