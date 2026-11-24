@@ -164,8 +164,8 @@ def test_migration_matches_models(
         (
             "requests",
             "ck_requests_type",
-            "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'callback'::text,"
-            " 'transfer'::text])))",
+            "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text,"
+            " 'callback'::text, 'transfer'::text])))",
         ),
         (
             "messages",
@@ -255,6 +255,60 @@ def test_downgrade_removes_the_tables(
     assert downgrade.returncode == 0, downgrade.stderr
     assert table_names(empty_database) == {"alembic_version"}
     assert definitions(empty_database, FUNCTION_DEFINITIONS) == set()
+
+
+REQUEST_TYPE = text(
+    "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_requests_type'"
+)
+
+
+def request_type_rule(settings: StartupSettings) -> str:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            return str(connection.execute(REQUEST_TYPE).scalar_one())
+    finally:
+        engine.dispose()
+
+
+def test_booking_requests_step_down_and_up(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
+    with_booking = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text])))"
+    )
+    without = "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text])))"
+    assert run_alembic(empty_database, "upgrade", "9a4f2c71d0e8").returncode == 0
+    assert request_type_rule(empty_database) == with_booking
+
+    step_down = run_alembic(empty_database, "downgrade", "-1")
+
+    assert step_down.returncode == 0, step_down.stderr
+    assert request_type_rule(empty_database) == without
+    assert run_alembic(empty_database, "upgrade", "9a4f2c71d0e8").returncode == 0
+    assert request_type_rule(empty_database) == with_booking
+
+
+def test_callback_and_transfer_requests_step_down_to_booking(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
+    # The call endings' types come after booking's, and stepping back leaves booking's.
+    every_type = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text,"
+        " 'callback'::text, 'transfer'::text])))"
+    )
+    with_booking = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text])))"
+    )
+    assert run_alembic(empty_database, "upgrade", "head").returncode == 0
+    assert request_type_rule(empty_database) == every_type
+
+    step_down = run_alembic(empty_database, "downgrade", "9a4f2c71d0e8")
+
+    assert step_down.returncode == 0, step_down.stderr
+    assert request_type_rule(empty_database) == with_booking
+    assert run_alembic(empty_database, "upgrade", "head").returncode == 0
+    assert request_type_rule(empty_database) == every_type
 
 
 def test_migration_without_database_settings_names_them(tmp_path: Path) -> None:

@@ -35,14 +35,20 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.scripts import ScriptId
-from app.agent.serving import NEEDS_CONFIRMATION
-from app.agent.state import CallState, IllegalTransitionError, Move, Phase, move, new_call
+from app.agent.serving import NEEDS_CONFIRMATION, stored_text, trimmed
+from app.agent.state import (
+    Caller,
+    CallState,
+    IllegalTransitionError,
+    Move,
+    Phase,
+    move,
+    new_call,
+)
 from app.agent.tool_registry import Deps, HandlerContext, NoArguments, Tool, ToolResult
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.db.models import MAX_MESSAGE_BODY, MESSAGE_KEY, Message, Request
 from app.domain.office_hours import is_open, part_of_day
-from app.guard.mask import mask_ssns
-from app.guard.text import has_hidden_characters
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +72,8 @@ CANCEL_INTERVAL_SECONDS = 0.1
 # (MAX_CONCURRENT_CALLS is at most 20). Past it the oldest is forgotten.
 MAX_LIVE_CALLS = 1000
 
+# Every kind of caller: the emergency line, the goodbye and the transfer are for everyone.
+EVERY_CALLER = frozenset(Caller)
 # The phases the model has tools in.
 TOOL_PHASES = frozenset({Phase.INTAKE, Phase.SERVING, Phase.BOOKING})
 _LIVE_PHASES = frozenset(Phase) - {Phase.ENDED}
@@ -97,17 +105,6 @@ _PENDING: set[asyncio.Future[None]] = set()
 _LATEST: dict[str, asyncio.Future[None]] = {}
 
 
-def _as_stored(value: str, longest: int, field: str) -> str:
-    """Caller text as it is read back and stored: no control or format character, SSNs masked,
-    and at most `longest` characters once masked. Masking makes text longer, never empty."""
-    if has_hidden_characters(value):
-        raise ValueError(f"{field} must not contain control or format characters")
-    stored = mask_ssns(value)
-    if len(stored) > longest:
-        raise ValueError(f"{field} must be at most {longest} characters once SSNs are masked")
-    return stored
-
-
 class TakeMessageArguments(BaseModel):
     """The caller's name, a ten-digit number to call back and the reason, in short."""
 
@@ -121,18 +118,17 @@ class TakeMessageArguments(BaseModel):
     @field_validator("name", "reason_short", mode="before")
     @classmethod
     def _trimmed(cls, value: object) -> object:
-        """Trimmed before the length bounds apply; anything but text is left to be refused."""
-        return value.strip() if isinstance(value, str) else value
+        return trimmed(value)
 
     @field_validator("name")
     @classmethod
     def _name_as_stored(cls, value: str) -> str:
-        return _as_stored(value, MAX_CALLER_NAME, "name")
+        return stored_text(value, MAX_CALLER_NAME)
 
     @field_validator("reason_short")
     @classmethod
     def _reason_as_stored(cls, value: str) -> str:
-        return _as_stored(value, MAX_MESSAGE_BODY, "reason_short")
+        return stored_text(value, MAX_MESSAGE_BODY)
 
     @field_validator("callback_number")
     @classmethod
@@ -272,7 +268,8 @@ TAKE_MESSAGE = Tool(
     closed_phases=frozenset({Phase.INTAKE}),
     writes=True,
     may_verify=False,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=frozenset({Caller.UNIDENTIFIED, Caller.PATIENT}),
     audit_action=Action.MESSAGE_TAKEN,
     outcome_actions={Action.MESSAGE_PREVIEWED: Outcome.SUCCESS},
     audit_reasons=frozenset(),
@@ -289,7 +286,8 @@ TRANSFER_TO_STAFF = Tool(
     closed_phases=frozenset(),
     writes=True,
     may_verify=False,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=EVERY_CALLER,
     audit_action=Action.TRANSFER_REQUESTED,
     outcome_actions={Action.TRANSFER_PREVIEWED: Outcome.SUCCESS},
     audit_reasons=TRANSFER_REASONS,
@@ -306,7 +304,8 @@ REPORT_EMERGENCY = Tool(
     closed_phases=frozenset({Phase.INTAKE}),
     writes=False,
     may_verify=False,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=EVERY_CALLER,
     audit_action=Action.EMERGENCY_DETECTED,
     outcome_actions={},
     audit_reasons=frozenset({Reason.MODEL}),
@@ -323,7 +322,8 @@ CLOSE_CALL = Tool(
     closed_phases=frozenset({Phase.INTAKE}),
     writes=False,
     may_verify=False,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=EVERY_CALLER,
     audit_action=Action.CALL_CLOSED,
     outcome_actions={},
     audit_reasons=frozenset(),

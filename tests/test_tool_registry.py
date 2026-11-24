@@ -25,9 +25,11 @@ from app.agent import tool_registry
 from app.agent.claims import ClaimKeys
 from app.agent.scripts import ScriptId
 from app.agent.state import (
+    Caller,
     CallState,
     IdentityClaim,
     Move,
+    NewPatientDetails,
     Phase,
     Verify,
     count_tool_error,
@@ -39,6 +41,7 @@ from app.agent.tool_registry import (
     REGISTRY,
     DeclarationError,
     Deps,
+    DobKind,
     Grant,
     Handler,
     HandlerContext,
@@ -149,7 +152,8 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "phases": frozenset(Phase),
         "writes": False,
         "may_verify": False,
-        "takes_identity_claim": False,
+        "takes_date_of_birth": None,
+        "callers": frozenset(Caller),
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
         "audit_reasons": frozenset(),
@@ -697,7 +701,8 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "closed_phases": frozenset(),
         "writes": False,
         "may_verify": False,
-        "takes_identity_claim": False,
+        "takes_date_of_birth": None,
+        "callers": frozenset(Caller),
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
         "audit_reasons": frozenset(),
@@ -714,14 +719,34 @@ class ClaimArguments(BaseModel):
     dob: str
 
 
-# A tool that may verify, as the model would call it; and the one that takes a claim.
+class DetailsArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str
+    dob: str
+    phone: str
+
+
+# A tool that may verify, as the model would call it; the one that takes a claim; and the one
+# that takes a new patient's details.
 VERIFIER = valid(name="check_identity", may_verify=True, phi=False, phases=frozenset({INTAKE}))
 CLAIMER = valid(
     name="claim_identity",
     arguments=ClaimArguments,
     phi=False,
     phases=frozenset({INTAKE}),
-    takes_identity_claim=True,
+    takes_date_of_birth=DobKind.IDENTITY_CLAIM,
+    callers=frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED}),
+    resource_type=ResourceType.TOOL,
+)
+NEW_PATIENTS = frozenset({Caller.NEW_PATIENT, Caller.NEW_PATIENT_WITH_DETAILS})
+DETAILER = valid(
+    name="take_details",
+    arguments=DetailsArguments,
+    phi=False,
+    phases=frozenset({BOOKING}),
+    takes_date_of_birth=DobKind.NEW_PATIENT_DETAILS,
+    callers=NEW_PATIENTS,
     resource_type=ResourceType.TOOL,
 )
 
@@ -819,13 +844,17 @@ def test_registration_rules() -> None:
                 "handler",
                 "name",
                 "model_callable",
-                "takes_identity_claim",
+                "takes_date_of_birth",
+                "callers",
                 "outcome_actions",
                 "audit_reasons",
             )
         ],
         ("declare", Tool.model_construct(**valid(audit_reasons={Reason.OTHER}))),
         ("declare", Tool.model_construct(**valid(audit_reasons=frozenset({"other"})))),
+        ("declare", Tool.model_construct(**valid(callers=frozenset()))),
+        ("declare", Tool.model_construct(**valid(callers={Caller.PATIENT}))),
+        ("declare", Tool.model_construct(**valid(takes_date_of_birth="identity_claim"))),
         ("declare", Tool.model_construct(**valid(model_callable="no"))),
         ("declare", Tool.model_construct(**valid(outcome_actions={"tool_called": "success"}))),
         ("declare", Tool.model_construct(**valid(outcome_actions={Action.TOOL_CALLED: "ok"}))),
@@ -941,23 +970,44 @@ def test_registration_rules() -> None:
             "verif",
             Tool(**{**VERIFIER, "model_callable": False, "closed_phases": frozenset({INTAKE})}),
         ),
-        # The tool that takes an identity claim: not a patient-data tool, intake only, office
-        # open only, callable by the model, and it may not verify.
+        # The tool that takes an identity claim: not a patient-data tool, intake only, for an
+        # unidentified caller, office open only, callable by the model, and it may not verify.
         *[
-            ("claim", Tool(**{**CLAIMER, **change}))
+            ("an identity claim", Tool(**{**CLAIMER, **change}))
             for change in (
                 {"phi": True},
                 {"phases": frozenset({INTAKE, SERVING})},
                 {"phases": frozenset({SERVING})},
                 {"closed_phases": frozenset({INTAKE})},
+                {"callers": frozenset(Caller)},
+                {"callers": NEW_PATIENTS},
+                {"callers": frozenset({Caller.UNIDENTIFIED})},
                 {"model_callable": False},
                 {"may_verify": True},
             )
         ],
-        # Only that tool may take a date of birth, and nothing else that names a patient.
-        ("names a patient", Tool(**{**CLAIMER, "takes_identity_claim": False})),
+        # The tool that takes a new patient's details: the same, in booking only, for a new
+        # patient's call only.
         *[
-            ("names a patient", Tool(**{**CLAIMER, "arguments": arguments}))
+            ("a new patient's details", Tool(**{**DETAILER, **change}))
+            for change in (
+                {"phi": True},
+                {"phases": frozenset({INTAKE})},
+                {"phases": frozenset({BOOKING, SERVING})},
+                {"callers": frozenset(Caller)},
+                {"callers": frozenset({Caller.UNIDENTIFIED})},
+                {"callers": frozenset({Caller.NEW_PATIENT})},
+                {"closed_phases": frozenset({BOOKING})},
+                {"model_callable": False},
+                {"may_verify": True},
+            )
+        ],
+        # Only those tools may take a date of birth, and nothing else that names a patient.
+        ("names a patient", Tool(**{**CLAIMER, "takes_date_of_birth": None})),
+        ("names a patient", Tool(**{**DETAILER, "takes_date_of_birth": None})),
+        *[
+            ("names a patient", Tool(**{**declaration, "arguments": arguments}))
+            for declaration in (CLAIMER, DETAILER)
             for arguments in (
                 arguments_with(full_name=(str, ...), date_of_birth=(str, ...)),
                 arguments_with(full_name=(str, ...), dob=(str, ...), ssn=(str, ...)),
@@ -1011,11 +1061,20 @@ def test_registration_rules() -> None:
         registry.register(Tool(**{**verifier, "name": "check_identity_again"}), grant=Grant())
     assert [item.name for item in registry.tools if item.may_verify] == ["check_identity"]
 
-    # One tool at most takes an identity claim; it may take a date of birth.
+    # One tool at most of each kind takes a date of birth.
     registry.register(Tool(**CLAIMER))
-    with pytest.raises(DeclarationError, match="claim"):
+    with pytest.raises(DeclarationError, match="an identity claim"):
         registry.register(Tool(**{**CLAIMER, "name": "claim_identity_again"}))
-    assert [item.name for item in registry.tools if item.takes_identity_claim] == ["claim_identity"]
+    registry.register(Tool(**DETAILER))
+    with pytest.raises(DeclarationError, match="a new patient's details"):
+        registry.register(Tool(**{**DETAILER, "name": "take_details_again"}))
+    assert {item.name: item.takes_date_of_birth for item in registry.tools} == {
+        "read_chart": None,
+        "office_info": None,
+        "check_identity": None,
+        "claim_identity": DobKind.IDENTITY_CLAIM,
+        "take_details": DobKind.NEW_PATIENT_DETAILS,
+    }
 
     # A code-only tool is registered with a grant of its own; a model-callable tool without.
     code_only = valid(name="code_only", phi=False, phases=frozenset({INTAKE}), model_callable=False)
@@ -1049,14 +1108,49 @@ def test_registration_rules() -> None:
         "office_info",
         "check_identity",
         "claim_identity",
+        "take_details",
         "code_only",
         "code_writer",
     ]
 
 
+# Who the caller is, written by hand from the spec: a verified patient, a new patient's call with
+# or without the details collected, a locked call, one with a claim pending, or nobody known
+# yet; nobody, for a state no transition makes.
+def caller_in(state: CallState) -> Caller | None:
+    if state.verified:
+        consistent = state.patient_id is not None and not state.is_new_patient
+        return Caller.PATIENT if consistent else None
+    if state.is_new_patient:
+        if state.new_patient_details is None:
+            return Caller.NEW_PATIENT
+        return Caller.NEW_PATIENT_WITH_DETAILS
+    if state.verify_locked:
+        return Caller.LOCKED
+    if state.pending_claim is not None:
+        return Caller.CLAIMANT
+    return Caller.UNIDENTIFIED
+
+
+# The phase each kind of date of birth may be taken in.
+DOB_PHASES = {DobKind.IDENTITY_CLAIM: INTAKE, DobKind.NEW_PATIENT_DETAILS: BOOKING}
+
+SOME_DETAILS = NewPatientDetails(
+    first_name="Ann",
+    last_name="Lee",
+    dob=date(1990, 1, 1),
+    phone="555-000-0000",
+    email="ann@example.org",
+    insurance_provider=None,
+    member_id=None,
+    self_pay=True,
+    reason_short="Check-up",
+)
+
+
 def gate_violations(registry: Registry) -> list[str]:
     """Every way the registry's tools break a declaration or the gate, over every phase,
-    verification and office state, possible or not."""
+    verification and office state, possible or not, and every kind of caller."""
     problems = []
     for item in registry.tools:
         try:
@@ -1067,6 +1161,24 @@ def gate_violations(registry: Registry) -> list[str]:
     states = every_combination()
     # The verified flag without a patient id, for each phase and office state.
     states += [state.model_copy(update={"patient_id": None}) for state in states if state.verified]
+    # A new patient's call, with and without the details, and one that also claims to be
+    # verified.
+    states += [
+        state.model_copy(update={"is_new_patient": True, "new_patient_details": details})
+        for state in every_combination()
+        for details in (None, SOME_DETAILS)
+    ]
+    # An unverified call with a claim pending, and one whose verification is locked.
+    claim = IdentityClaim(full_name="Ann Lee", dob=date(1990, 1, 1))
+    states += [
+        state.model_copy(update=update)
+        for state in every_combination()
+        if not state.verified
+        for update in (
+            {"pending_claim": claim, "expecting_ssn4": True},
+            {"verify_attempts": 3, "verify_locked": True},
+        )
+    ]
     for state in states:
         offered = {description.name for description in registry.tools_for(state)}
         # What dispatch would run, for the model or for code with the tool's grant.
@@ -1078,8 +1190,11 @@ def gate_violations(registry: Registry) -> list[str]:
             )
             if name in offered and not item.model_callable:
                 problems.append(f"code only: {where}")
-            if item.takes_identity_claim and state.phase is not INTAKE:
-                problems.append(f"claim: {where}")
+            if caller_in(state) not in item.callers:
+                problems.append(f"caller: {where}")
+            kind = item.takes_date_of_birth
+            if kind is not None and state.phase is not DOB_PHASES[kind]:
+                problems.append(f"date of birth: {where}")
             if state.phase in NO_TOOL_PHASES:
                 problems.append(f"no tools: {where}")
             if state.phase not in item.phases | item.closed_phases:
@@ -1108,7 +1223,8 @@ def test_application_registry_obeys_the_gate() -> None:
     assert REGISTRY.sealed
     assert gate_violations(REGISTRY) == []
     assert len([item for item in REGISTRY.tools if item.may_verify]) <= 1
-    assert len([item for item in REGISTRY.tools if item.takes_identity_claim]) <= 1
+    for kind in DobKind:
+        assert len([item for item in REGISTRY.tools if item.takes_date_of_birth is kind]) <= 1
     assert not [item for item in REGISTRY.tools if item.may_verify and item.model_callable]
 
     # The gate offers a tool only in its declared phases, and a patient-data tool cannot be
@@ -1145,6 +1261,8 @@ def test_application_registry_obeys_the_gate() -> None:
             model_callable=False,
         ),
         Tool(**CLAIMER),
+        Tool(**DETAILER),
+        declared("visit_kind", noop, callers=frozenset({Caller.NEW_PATIENT_WITH_DETAILS})),
     ]
     assert gate_violations(registry_of(*tools)) == []
 
@@ -1164,7 +1282,8 @@ def test_application_registry_obeys_the_gate() -> None:
         "office open",
         "verifier",
         "code only",
-        "claim",
+        "caller",
+        "date of birth",
     }
 
 
@@ -1735,15 +1854,47 @@ class ClaimWithValidationAliasDob(BaseModel):
 
 
 def test_the_date_of_birth_exemption_is_narrow() -> None:
-    # Exactly a top-level field named `dob`, of the one claim tool: nothing nested, no other
-    # spelling, no alias that names it otherwise.
-    for arguments in (
-        ClaimWithNestedDob,
-        ClaimWithUpperDob,
-        ClaimWithAliasedDob,
-        ClaimWithValidationAliasDob,
-        arguments_with(full_name=(str, ...), d_o_b=(str, ...)),
-    ):
-        with pytest.raises(DeclarationError, match="names a patient"):
-            Registry().register(Tool(**{**CLAIMER, "arguments": arguments}))
-    Registry().register(Tool(**CLAIMER))
+    # Exactly a top-level field named `dob`, of a tool declared to take one of the two kinds:
+    # nothing nested, no other spelling, no alias that names it otherwise.
+    for declaration in (CLAIMER, DETAILER):
+        for arguments in (
+            ClaimWithNestedDob,
+            ClaimWithUpperDob,
+            ClaimWithAliasedDob,
+            ClaimWithValidationAliasDob,
+            arguments_with(full_name=(str, ...), d_o_b=(str, ...)),
+        ):
+            with pytest.raises(DeclarationError, match="names a patient"):
+                Registry().register(Tool(**{**declaration, "arguments": arguments}))
+        Registry().register(Tool(**declaration))
+    # The two kinds live side by side, each once.
+    registry = Registry()
+    registry.register(Tool(**CLAIMER))
+    registry.register(Tool(**DETAILER))
+    for declaration in (CLAIMER, DETAILER):
+        with pytest.raises(DeclarationError, match="only one tool"):
+            registry.register(Tool(**{**declaration, "name": "another_one"}))
+
+
+async def test_only_the_declared_tool_takes_new_patient_details(
+    deps: Deps, owner_engine: Engine
+) -> None:
+    async def drafts(
+        session: AsyncSession, state: CallState, arguments: Any, context: HandlerContext
+    ) -> ToolResult:
+        return ToolResult(transition=SOME_DETAILS)
+
+    registry = Registry()
+    registry.register(declared("look_up_visit", drafts, phases=frozenset({BOOKING})))
+    registry.register(Tool(**{**DETAILER, "arguments": NoArguments, "handler": drafts}))
+    state = move(intake(), BOOKING)
+
+    after, outcome = await registry.dispatch(state, "look_up_visit", {}, deps)
+    assert (outcome, after.new_patient_details) == (FAILED, None)
+    after, outcome = await registry.dispatch(state, "take_details", {}, deps)
+    assert outcome.status is Status.DONE
+    assert after.new_patient_details == SOME_DETAILS
+    assert events(owner_engine) == [
+        failed_event(state, "look_up_visit"),
+        called_event(state, "take_details"),
+    ]

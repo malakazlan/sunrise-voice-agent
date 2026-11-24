@@ -1389,6 +1389,14 @@ def test_only_registry_members_are_accepted() -> None:
         "transfer_previewed",
         "emergency_detected",
         "call_closed",
+        "new_patient_started",
+        "new_patient_details_collected",
+        "slots_offered",
+        "appointment_booked",
+        "new_patient_booked",
+        "booking_previewed",
+        "slot_taken",
+        "booking_repeated",
     }
     assert {member.value for member in ResourceType} == {
         "call",

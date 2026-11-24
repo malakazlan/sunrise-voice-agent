@@ -60,6 +60,12 @@ LINES = [
         "I'm sorry, I can't help with that. I can take a message for our staff instead.",
         True,
     ),
+    (
+        "booking_instructions",
+        "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
+        " receive a confirmation by email.",
+        True,
+    ),
 ]
 
 # The part of the day the after-hours line wishes the caller, written by hand: `day` from 5 AM
@@ -110,6 +116,7 @@ def test_lines_name_their_values() -> None:
         "goodbye": frozenset(),
         "after_hours_close": frozenset({"name", "part_of_day"}),
         "fallback": frozenset(),
+        "booking_instructions": frozenset(),
     }
 
 

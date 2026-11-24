@@ -72,13 +72,21 @@ APPOINTMENT_REPLY = f"Your next appointment is {SARAH_APPOINTMENT}."
 FIRST_PAIR, SECOND_PAIR = "33", "44"
 DIGITS_IN_WORDS = "three three four four"
 
-INTAKE_TOOLS = ["verify_identity", "transfer_to_staff", "report_emergency", "close_call"]
+INTAKE_TOOLS = [
+    "verify_identity",
+    "start_new_patient",
+    "transfer_to_staff",
+    "report_emergency",
+    "close_call",
+]
 SERVING_TOOLS = [
     "get_next_appointment",
     "request_refill",
     "get_lab_status",
     "get_balance",
     "send_message_to_doctor",
+    "find_slots",
+    "book_appointment",
     "take_message",
     "transfer_to_staff",
     "report_emergency",

@@ -130,6 +130,14 @@ class Action(StrEnum):
     TRANSFER_PREVIEWED = "transfer_previewed"
     EMERGENCY_DETECTED = "emergency_detected"
     CALL_CLOSED = "call_closed"
+    NEW_PATIENT_STARTED = "new_patient_started"
+    NEW_PATIENT_DETAILS_COLLECTED = "new_patient_details_collected"
+    SLOTS_OFFERED = "slots_offered"
+    APPOINTMENT_BOOKED = "appointment_booked"
+    NEW_PATIENT_BOOKED = "new_patient_booked"
+    BOOKING_PREVIEWED = "booking_previewed"
+    SLOT_TAKEN = "slot_taken"
+    BOOKING_REPEATED = "booking_repeated"
 
 
 class ResourceType(StrEnum):

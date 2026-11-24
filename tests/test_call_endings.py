@@ -75,19 +75,23 @@ CLOSE = "close_call"
 
 # What the model is offered, by state, written by hand from the spec.
 CLOSED_TOOLS = [MESSAGE, REPORT, CLOSE]
-OPEN_INTAKE_TOOLS = ["verify_identity", TRANSFER, REPORT, CLOSE]
+OPEN_INTAKE_TOOLS = ["verify_identity", "start_new_patient", TRANSFER, REPORT, CLOSE]
 SERVING_TOOLS = [
     "get_next_appointment",
     "request_refill",
     "get_lab_status",
     "get_balance",
     "send_message_to_doctor",
+    "find_slots",
+    "book_appointment",
     MESSAGE,
     TRANSFER,
     REPORT,
     CLOSE,
 ]
-OPEN_BOOKING_TOOLS = [TRANSFER, REPORT, CLOSE]
+# Booking: a new patient's call before its details, and a verified caller's.
+NEW_PATIENT_BOOKING_TOOLS = ["collect_new_patient", TRANSFER, REPORT, CLOSE]
+PATIENT_BOOKING_TOOLS = ["find_slots", TRANSFER, REPORT, CLOSE]
 
 HEART_ATTACK = "I think I'm having a heart attack"
 
@@ -421,8 +425,8 @@ async def test_closed_office_tools(
     # Against the open office, phase by phase.
     assert names(registry, intake()) == OPEN_INTAKE_TOOLS
     assert names(registry, sarah()) == SERVING_TOOLS
-    assert names(registry, move(intake(), BOOKING)) == OPEN_BOOKING_TOOLS
-    assert names(registry, move(sarah(), BOOKING)) == OPEN_BOOKING_TOOLS
+    assert names(registry, move(intake(), BOOKING)) == NEW_PATIENT_BOOKING_TOOLS
+    assert names(registry, move(sarah(), BOOKING)) == PATIENT_BOOKING_TOOLS
     for phase in (GREETING, EMERGENCY, HANDOFF, CLOSING, ENDED):
         assert names(registry, reach(phase, True)) == [], phase
 

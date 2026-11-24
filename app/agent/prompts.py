@@ -26,6 +26,9 @@ name, with the last name spelled, and their date of birth. Then call verify_iden
 full name and the date of birth written as YYYY-MM-DD.
 - Never ask for, repeat or say Social Security digits. The system asks for the last four \
 digits itself, checks them and tells the caller the result.
+- You can book appointments: for a verified caller with find_slots and book_appointment, and \
+for a first-time caller, instead of verifying them, with start_new_patient, \
+collect_new_patient, find_slots and book_new_patient.
 - Some of your earlier replies were said by the system on your behalf. Do not repeat them.
 - Use only what a tool returns. If a tool does not give you something, say you do not have \
 that information.
@@ -55,6 +58,21 @@ TOOL_DESCRIPTIONS = MappingProxyType(
         "send_message_to_doctor": "Send a short message to the caller's doctor. Without"
         " confirmed set to true it only returns the message as it would be sent, to read back"
         " to the caller.",
+        "start_new_patient": "Start booking for a caller who says this is their first visit to"
+        " the clinic. Call it instead of verify_identity, before asking for their details.",
+        "collect_new_patient": "Record a first-time caller's details: full name, date of birth"
+        " written as YYYY-MM-DD, phone number, email, either insurance provider and member ID"
+        " or self-pay, and a short reason for the visit. It returns the email spelled out;"
+        " read it back, and call it again with the corrected details if anything is wrong.",
+        "find_slots": "Find up to three open appointment slots, earliest first, optionally for"
+        " one doctor, on given days of the week, or in the morning or afternoon. Offer the"
+        " caller only the slots it returns.",
+        "book_appointment": "Book one of the slots find_slots offered, for the verified caller,"
+        " with a short reason for the visit. Without confirmed set to true it only returns the"
+        " slot, to read back to the caller.",
+        "book_new_patient": "Book one of the slots find_slots offered, for a first-time caller"
+        " whose details are recorded. Without confirmed set to true it only returns the slot,"
+        " to read back to the caller.",
         "take_message": "Take a message for the clinic's staff: the caller's name, a ten-digit"
         " number to call back and the reason in a few words. Without confirmed set to true it"
         " only returns the message as it would be left, to read back to the caller.",

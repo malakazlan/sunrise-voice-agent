@@ -1,7 +1,7 @@
 """Add callback messages and transfer requests
 
 Revision ID: 190ccc8799c7
-Revises: 3c3da6d6e340
+Revises: 9a4f2c71d0e8
 Create Date: 2026-11-24 18:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "190ccc8799c7"
-down_revision: str | Sequence[str] | None = "3c3da6d6e340"
+down_revision: str | Sequence[str] | None = "9a4f2c71d0e8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -30,14 +30,16 @@ def upgrade() -> None:
     op.create_check_constraint(
         op.f("ck_requests_type"),
         "requests",
-        "type IN ('refill', 'doctor_message', 'callback', 'transfer')",
+        "type IN ('refill', 'doctor_message', 'booking', 'callback', 'transfer')",
     )
 
 
 def downgrade() -> None:
     op.drop_constraint(op.f("ck_requests_type"), "requests", type_="check")
     op.create_check_constraint(
-        op.f("ck_requests_type"), "requests", "type IN ('refill', 'doctor_message')"
+        op.f("ck_requests_type"),
+        "requests",
+        "type IN ('refill', 'doctor_message', 'booking')",
     )
     op.drop_constraint(op.f("ck_messages_kind"), "messages", type_="check")
     op.create_check_constraint(op.f("ck_messages_kind"), "messages", "kind IN ('doctor_message')")

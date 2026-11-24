@@ -9,8 +9,10 @@ way code calls it. So is `hand_off_to_staff`, which `call_tool` runs when an out
 hand-off.
 """
 
+from app.agent.booking import BOOKING_TOOLS
 from app.agent.endings import (
     ENDING_TOOLS,
+    EVERY_CALLER,
     HAND_OFF_REASONS,
     REPORT_EMERGENCY,
     TAKE_MESSAGE,
@@ -20,12 +22,13 @@ from app.agent.endings import (
 )
 from app.agent.scripts import ScriptId
 from app.agent.serving import SERVING_TOOLS
-from app.agent.state import CallState, Phase, drop_claim
+from app.agent.state import Caller, CallState, Phase, drop_claim
 from app.agent.tool_registry import (
     MAX_TOOL_ERRORS,
     MAX_TOOL_REFUSALS,
     REGISTRY,
     Deps,
+    DobKind,
     Grant,
     NoArguments,
     Registry,
@@ -40,6 +43,9 @@ from app.audit.log import Action, Outcome, Reason, ResourceType
 _SUBMIT_GRANT = Grant()
 _HAND_OFF_GRANT = Grant()
 
+# Whoever is in intake: nobody known yet, a claim pending, or verification locked.
+INTAKE_CALLERS = frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED})
+
 VERIFY_IDENTITY = Tool(
     name="verify_identity",
     arguments=VerifyIdentityArguments,
@@ -50,7 +56,8 @@ VERIFY_IDENTITY = Tool(
     closed_phases=frozenset(),
     writes=False,
     may_verify=False,
-    takes_identity_claim=True,
+    takes_date_of_birth=DobKind.IDENTITY_CLAIM,
+    callers=INTAKE_CALLERS,
     audit_action=Action.IDENTITY_CLAIMED,
     outcome_actions={Action.IDENTITY_LOCKED: Outcome.REFUSED},
     audit_reasons=frozenset(),
@@ -67,7 +74,8 @@ SUBMIT_IDENTITY = Tool(
     closed_phases=frozenset(),
     writes=True,
     may_verify=True,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=INTAKE_CALLERS,
     audit_action=Action.IDENTITY_VERIFIED,
     outcome_actions={
         Action.IDENTITY_REFUSED: Outcome.REFUSED,
@@ -87,7 +95,8 @@ HAND_OFF_TO_STAFF = Tool(
     closed_phases=frozenset(),
     writes=True,
     may_verify=False,
-    takes_identity_claim=False,
+    takes_date_of_birth=None,
+    callers=EVERY_CALLER,
     audit_action=Action.TRANSFER_REQUESTED,
     outcome_actions={},
     audit_reasons=HAND_OFF_REASONS,
@@ -100,7 +109,7 @@ def register_tools() -> Registry:
     if not REGISTRY.sealed:
         REGISTRY.register(VERIFY_IDENTITY)
         REGISTRY.register(SUBMIT_IDENTITY, grant=_SUBMIT_GRANT)
-        for tool in (*SERVING_TOOLS, *ENDING_TOOLS):
+        for tool in (*SERVING_TOOLS, *BOOKING_TOOLS, *ENDING_TOOLS):
             REGISTRY.register(tool)
         REGISTRY.register(HAND_OFF_TO_STAFF, grant=_HAND_OFF_GRANT)
         REGISTRY.seal()

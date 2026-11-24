@@ -14,8 +14,9 @@ and changes nothing; the state changes it asks for are in the decision, for its 
    step and leaves the claim and the buffer for submit_identity, which the caller runs before
    the model sees anything of the turn.
 3. SSN redaction, always: digits after a cue, SSN-shaped numbers and any run that reads as
-   nine digits. In greeting and intake, while the caller is unverified, every other digit and
-   number word too, but for dates, years from 1900 to 2099 and ten- or eleven-digit numbers;
+   nine digits. While the caller is unverified, in every phase but a new patient's booking,
+   every other digit and number word too, but for dates, years from 1900 to 2099 and ten- or
+   eleven-digit numbers;
    once verified, any group that is the caller's own last four. The patterns are the mask
    module's (app/guard/mask.py).
 4. Flags: an attempt to override the instructions, and a request about someone else. The text
@@ -37,8 +38,10 @@ from app.guard.mask import (
     spoken_digits,
 )
 
-# Where an unverified caller's numbers are hidden but for dates, years and callback numbers.
-_UNVERIFIED_PHASES = frozenset({Phase.GREETING, Phase.INTAKE})
+# Where an unverified caller's numbers are not hidden (but for SSNs): a new patient's booking,
+# where times and member numbers are given. Everywhere else, before verification, every digit
+# is hidden but for dates, years and callback numbers.
+_UNVERIFIED_NUMBERS_PASS = Phase.BOOKING
 
 # The digits the SSN step takes, and the armed turns it waits for them.
 SSN_DIGITS = 4
@@ -139,7 +142,7 @@ def guard_input(text: str, state: CallState) -> GuardDecision:
             )
 
     seen = mask_ssns(text)
-    if not state.verified and state.phase in _UNVERIFIED_PHASES:
+    if not state.verified and state.phase is not _UNVERIFIED_NUMBERS_PASS:
         seen = mask_unverified_digits(seen)
     elif state.verified_ssn4 is not None:
         seen = mask_known_digits(seen, state.verified_ssn4)

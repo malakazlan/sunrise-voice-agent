@@ -14,7 +14,9 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from conftest import set_up_roles
+from psycopg import errors
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import StartupSettings
@@ -98,11 +100,24 @@ async def test_setup_fails_when_the_runtime_role_holds_its_lock(
         assert await autocommit.scalar(text("SELECT 1")) == 1
 
 
-async def test_seed_fails_when_the_runtime_role_holds_a_table_lock(
+async def test_seed_fails_when_the_runtime_role_holds_a_lock_it_needs(
     runtime: AsyncEngine, short_timeouts: None, startup_env: None
 ) -> None:
+    # The runtime role may only read and insert patients, so it cannot lock the table against
+    # the seed (that takes UPDATE, DELETE or TRUNCATE on it). It can still hold a row the seed
+    # inserts: a patient with a seed id, inserted and not committed, makes the seed wait.
+    with pytest.raises(DBAPIError) as refused:
+        async with runtime.begin() as connection:
+            await connection.execute(text("LOCK TABLE patients IN SHARE MODE"))
+    assert type(refused.value.orig) is errors.InsufficientPrivilege
     async with runtime.begin() as hostile:
-        await hostile.execute(text("LOCK TABLE patients IN ACCESS EXCLUSIVE MODE"))
+        await hostile.execute(
+            text(
+                "INSERT INTO patients (id, first_name, last_name, dob, phone,"
+                " lab_results_status, balance_due)"
+                " VALUES ('P001', 'Test', 'Patient', '1980-01-01', '555-000-0000', 'Pending', 0)"
+            )
+        )
 
         error, took = await outcome_within(
             OUTER_BOUND_SECONDS, lambda: seed.main(clock=lambda: datetime(2026, 11, 24, tzinfo=UTC))

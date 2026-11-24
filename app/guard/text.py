@@ -2,12 +2,20 @@
 
 import unicodedata
 
-# Control characters (C0, DEL and C1) and format characters (zero-width ones, the soft hyphen,
-# the byte order mark, the bidi overrides, embeddings and isolates): unseen, or able to make
-# text read otherwise than it is stored.
-_HIDDEN_CATEGORIES = frozenset({"Cc", "Cf"})
+# Unicode categories never in text a caller gives to be stored or spoken: controls (C0 with
+# NUL, DEL, C1), format characters (bidi overrides, embeddings and isolates, zero-width
+# characters, soft hyphens, the byte order mark), surrogates, private use, unassigned code
+# points, and line and paragraph separators. Unseen, or able to make text read otherwise than
+# it is stored.
+HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 
-def has_hidden_characters(text: str) -> bool:
-    """Whether the text holds a control or format character."""
-    return any(unicodedata.category(character) in _HIDDEN_CATEGORIES for character in text)
+def plain_text(value: str, *, digits: bool) -> str:
+    """The text, unless it holds a character of HIDDEN_CATEGORIES or, where `digits` is false,
+    a digit of any script: then ValueError."""
+    for char in value:
+        if unicodedata.category(char) in HIDDEN_CATEGORIES:
+            raise ValueError("the text must not contain control or format characters")
+        if not digits and char.isdigit():
+            raise ValueError("the text must not contain digits")
+    return value
