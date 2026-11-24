@@ -326,9 +326,7 @@ No real tool is registered yet; later slices add the tools and wire them to the 
   handler and again after, so a handler that commits or rolls back, with SQLAlchemy or with
   SQL text, fails the call; a commit through SQLAlchemy is refused before it reaches the
   database. On any failure the connection is closed rather than reused, so the server rolls
-  back whatever it holds. A handler that runs a raw `COMMIT` statement has committed by the
-  time dispatch regains control: the call fails, and no success event is written, but the
-  rows it committed stay; the repo's scan keeps such SQL text out of `app/`.
+  back whatever it holds.
 - Every dispatch leaves exactly one audit event. A tool call's event names the tool when its
   resource type is `tool`, the caller's patient id (from the state, never from the handler)
   when it is `patient`, and otherwise the record the handler names. `tool_refused` (outcome
@@ -346,6 +344,9 @@ No real tool is registered yet; later slices add the tools and wire them to the 
   text `"handler"` as `getattr` takes it, a registered handler called by name) and raw
   transaction statements out of `app/` are lints against accidents, not controls: they read
   the source as written.
+- Limit: a handler that runs a raw `COMMIT` statement has committed its work before dispatch
+  regains control, and dispatch cannot undo it. The call fails and no success event is
+  written, but the committed rows stay; the scan keeps such SQL text out of `app/`.
 
 ## Configuration
 
