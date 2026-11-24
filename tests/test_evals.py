@@ -14,12 +14,13 @@ from conftest import offline_settings
 import app.agent.turn
 import app.voice.pipeline
 import evals.runner
-from app.agent.model import AnthropicModel
+from app.agent.model import AnthropicModel, ModelReply
 from app.agent.scripts import ScriptId
 from app.agent.state import Phase
 from app.audit.log import Action
 from app.config import Settings
 from app.guard.input import Flag
+from app.guard.output import OutputRule
 from evals.database import EvalServer, eval_server, eval_settings
 from evals.runner import (
     Failure,
@@ -31,6 +32,7 @@ from evals.runner import (
     run_scenario,
 )
 from evals.scenario import (
+    CallStep,
     RowExpect,
     SayStep,
     Scenario,
@@ -40,6 +42,7 @@ from evals.scenario import (
     load_scenario,
     scenario_files,
 )
+from evals.scripted import ScriptedModel, calls, says
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCENARIO_DIR = REPO_ROOT / "evals" / "scenarios"
@@ -76,6 +79,12 @@ def refill() -> Scenario:
 
 def at_end(scenario: Scenario, **changes: Any) -> Scenario:
     return scenario.model_copy(update={"expect": scenario.expect.model_copy(update=changes)})
+
+
+def scripted_at_turn(scenario: Scenario, index: int, **changes: Any) -> Scenario:
+    turns = list(scenario.turns)
+    turns[index] = turns[index].model_copy(update={"expect_scripted": TurnExpect(**changes)})
+    return scenario.model_copy(update={"turns": turns})
 
 
 def at_turn(scenario: Scenario, index: int, **changes: Any) -> Scenario:
@@ -185,6 +194,18 @@ BROKEN = {
         + "      count: 0\n",
         "is_available",
     ),
+    "unknown-rule": (
+        VALID.replace("      said: []\n", "      withheld: advice\n"),
+        "Input should be .ssn_last4.",
+    ),
+    "withheld-at-the-end": (
+        VALID + "  withheld: medical_advice\n",
+        "Extra inputs are not permitted",
+    ),
+    "empty-scripted-expectations": (
+        VALID.replace("    expect:\n      said: []\n", "    expect_scripted: {}\n"),
+        "states at least one expectation",
+    ),
     "unreadable-column": (
         VALID
         + "  rows:\n    - table: patients\n      where: {dob: '1985-03-14'}\n      count: 0\n",
@@ -268,6 +289,15 @@ BREAKS: dict[str, tuple[Callable[[Scenario], Scenario], tuple[str, str]]] = {
         ("turn 2", "reaches_model"),
     ),
     "model-script": (unused_step, ("turn 4", "model_script")),
+    # Nothing of s01's replies is withheld.
+    "withheld": (
+        lambda s: at_turn(s, 2, withheld=OutputRule.MEDICAL_ADVICE),
+        ("turn 3", "withheld"),
+    ),
+    "expect-scripted": (
+        lambda s: scripted_at_turn(s, 2, said=[ScriptId.VERIFIED]),
+        ("turn 3", "said"),
+    ),
 }
 
 
@@ -280,6 +310,51 @@ async def test_each_expectation_kind_can_fail(server: EvalServer, kind: str) -> 
     failures = await run_scenario(broken(refill()), server)
 
     assert [(failure.scope, failure.kind) for failure in failures] == [expected]
+
+
+def advice() -> Scenario:
+    """s05: the scripted model tries advice in the third turn, and the guard withholds it."""
+    return load_scenario(SCENARIO_DIR / "s05_medical_advice.yaml")
+
+
+def with_reply(scenario: Scenario, index: int, words: str) -> Scenario:
+    turns = list(scenario.turns)
+    turns[index] = turns[index].model_copy(update={"model": [SayStep(say=words)]})
+    return scenario.model_copy(update={"turns": turns})
+
+
+def replies(scenario: Scenario) -> list[ModelReply]:
+    """The scenario's scripted replies in order, for a model of its own to give."""
+    return [
+        calls((step.call, step.args)) if isinstance(step, CallStep) else says(step.say)
+        for turn in scenario.turns
+        for step in turn.model
+    ]
+
+
+@pytest.mark.anyio
+async def test_scripted_expectations_bind_the_scripted_run_only(server: EvalServer) -> None:
+    assert await run_scenario(advice(), server) == []
+
+    # A model that declines on its own: nothing is withheld.
+    declines = with_reply(
+        advice(), 2, "I'm not able to give medical advice. Please ask your doctor."
+    )
+
+    # In scripted mode the turn's scripted-only expectations are checked, and unmet.
+    failures = await run_scenario(declines, server)
+    assert [(failure.scope, failure.kind) for failure in failures] == [
+        ("turn 3", "said"),
+        ("turn 3", "audit"),
+        ("turn 3", "withheld"),
+    ]
+
+    # With a model of the run's own, as in real mode, they are not; the rest still are.
+    assert await run_scenario(declines, server, ScriptedModel(*replies(declines))) == []
+    assert await run_scenario(advice(), server, ScriptedModel(*replies(advice()))) == []
+    forbidden = with_reply(advice(), 3, "Ibuprofen is what most people use.")
+    failures = await run_scenario(forbidden, server, ScriptedModel(*replies(forbidden)))
+    assert [(failure.scope, failure.kind) for failure in failures] == [("call", "never")]
 
 
 # --- R3 ---------------------------------------------------------------------------------

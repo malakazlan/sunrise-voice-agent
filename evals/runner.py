@@ -13,7 +13,9 @@ the model of the settings and the scenario's replies are ignored. Real mode is r
 only: it refuses under pytest or in CI, and without an API key.
 
 After each turn, and at the end of the call, the scenario's expectations are checked
-(evals/scenario.py); each unmet one is a Failure, named by where it is and its kind. A turn's
+(evals/scenario.py); in scripted mode a turn's scripted-only ones too. Each unmet one is a
+Failure, named by where it is and its kind. Audit actions are read once the call's events and
+the output guard's guard_block events still being written are. A turn's
 flags are read from the input guard itself, given the turn and the state the turn starts in:
 the guard is pure, so that is the decision the turn gets. In scripted mode a turn must ask the
 model exactly as many times as it has replies.
@@ -46,7 +48,7 @@ from app.agent.scripts import PLACEHOLDER, SCRIPTS, ScriptId
 from app.agent.state import Phase
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import start_call
+from app.agent.turn import TurnResult, drain_guard_audits, start_call
 from app.audit.log import AuditLog
 from app.config import Settings
 from app.db.models import AuditEvent
@@ -55,6 +57,7 @@ from app.domain.clinic import clinic_date
 from app.guard.input import Flag, guard_input
 from app.guard.logging import configure_logging
 from app.guard.mask import spoken_digits
+from app.guard.output import OutputRule
 from app.voice.calls import CallRegistry
 from evals.database import EvalServer, eval_server, eval_settings
 from evals.scenario import (
@@ -342,16 +345,22 @@ def _check(
 
 
 def _turn_failures(
-    scope: str, expect: TurnExpect, flags: frozenset[Flag], shown: str | None
+    scope: str, expect: TurnExpect, flags: frozenset[Flag], result: TurnResult
 ) -> list[Failure]:
     """The expectations only a turn states."""
     found: list[tuple[str, str]] = []
     if expect.flags is not None and flags != set(expect.flags):
         found.append(("flags", f"{sorted(flag.value for flag in flags)} raised"))
-    reached = shown is not None
+    reached = result.shown is not None
     if expect.reaches_model is not None and reached != expect.reaches_model:
         found.append(("reaches_model", f"the model was {'' if reached else 'not '}shown the turn"))
+    if expect.withheld is not None and result.withheld is not expect.withheld:
+        found.append(("withheld", f"{_rule(result.withheld)} withheld"))
     return [Failure(scope, kind, detail) for kind, detail in found]
+
+
+def _rule(rule: OutputRule | None) -> str:
+    return "nothing" if rule is None else rule.value
 
 
 async def _rows(sessions: async_sessionmaker[AsyncSession]) -> Rows:
@@ -370,6 +379,7 @@ async def _rows(sessions: async_sessionmaker[AsyncSession]) -> Rows:
 async def _actions(sessions: async_sessionmaker[AsyncSession], call_id: str) -> list[str]:
     """The call's audit actions, in order, once its events still being written are."""
     await drain_call_events()
+    await drain_guard_audits()
     async with sessions() as session:
         return list(
             await session.scalars(
@@ -429,9 +439,13 @@ async def run_scenario(
                 if scripted is not None and times != len(turn.model):
                     detail = f"asked {times} times, {len(turn.model)} replies scripted"
                     failures.append(Failure(scope, "model_script", detail))
-                if turn.expect is None:
+                expects = [turn.expect]
+                if scripted is not None:
+                    expects.append(turn.expect_scripted)
+                stated = [expect for expect in expects if expect is not None]
+                if not stated:
                     continue
-                if turn.expect.reaches_model is False:
+                if any(expect.reaches_model is False for expect in stated):
                     unseen.append((scope, turn.caller))
                 seen = _Seen(
                     lines=list(result.lines),
@@ -441,8 +455,10 @@ async def run_scenario(
                     phase=agent.state.phase,
                     verified=agent.state.verified,
                 )
-                failures += _check(scope, turn.expect, seen, await _written(sessions, before))
-                failures += _turn_failures(scope, turn.expect, flags, result.shown)
+                written = await _written(sessions, before)
+                for expect in stated:
+                    failures += _check(scope, expect, seen, written)
+                    failures += _turn_failures(scope, expect, flags, result)
             seen = _Seen(
                 lines=lines,
                 requests=recorded.requests,
@@ -460,6 +476,7 @@ async def run_scenario(
             ]
         finally:
             await drain_call_events()
+            await drain_guard_audits()
     return failures
 
 

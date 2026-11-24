@@ -22,7 +22,10 @@ Expectations, checked after the turn they are under, and over the whole call at 
 `offered` and `never_offered` need at least one model request. A turn can also state:
 - flags: the input guard's flags for the turn;
 - reaches_model: whether the model was shown the turn. A turn that does not reach it appears
-  in nothing the model is shown, then or later.
+  in nothing the model is shown, then or later;
+- withheld: the output guard's rule that withheld part of the model's reply.
+A turn's `expect_scripted` holds expectations for scripted mode only: what comes of a reply
+only the scripted model is given, such as one the output guard withholds. Real mode skips them.
 """
 
 from pathlib import Path
@@ -50,6 +53,7 @@ from app.agent.tools import register_tools
 from app.audit.log import Action
 from app.db.models import Base
 from app.guard.input import Flag
+from app.guard.output import OutputRule
 
 SCENARIO_DIR = Path(__file__).with_name("scenarios")
 
@@ -151,12 +155,14 @@ class Expect(_Strict):
 class TurnExpect(Expect):
     flags: list[Flag] | None = None
     reaches_model: StrictBool | None = None
+    withheld: OutputRule | None = None
 
 
 class Turn(_Strict):
     caller: Text
     model: list[CallStep | SayStep] = []
     expect: TurnExpect | None = None
+    expect_scripted: TurnExpect | None = None
 
 
 class Scenario(_Strict):
