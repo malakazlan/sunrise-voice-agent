@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.scripts import ScriptId
 from app.agent.state import CallState, FailedAttempt, IdentityClaim, Verify, locks_the_call
-from app.agent.tool_registry import HandlerContext, ToolResult
+from app.agent.tool_registry import HandlerContext, NoArguments, ToolResult
 from app.audit.log import Action
 from app.db.models import Patient, VerificationAttempt
 from app.domain.matching import MAX_NAME_LENGTH, name_key, pick_patient
@@ -66,10 +66,6 @@ class VerifyIdentityArguments(BaseModel):
         if value > today:
             raise ValueError("dob is in the future")
         return value
-
-
-class NoArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 _LOCKED = ToolResult(script=ScriptId.VERIFY_LOCKED, audit_action=Action.IDENTITY_LOCKED)

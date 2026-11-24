@@ -112,6 +112,11 @@ class Action(StrEnum):
     IDENTITY_VERIFIED = "identity_verified"
     IDENTITY_REFUSED = "identity_refused"
     IDENTITY_LOCKED = "identity_locked"
+    APPOINTMENT_READ = "appointment_read"
+    REFILL_REQUESTED = "refill_requested"
+    LAB_STATUS_READ = "lab_status_read"
+    BALANCE_READ = "balance_read"
+    DOCTOR_MESSAGE_SENT = "doctor_message_sent"
 
 
 class ResourceType(StrEnum):

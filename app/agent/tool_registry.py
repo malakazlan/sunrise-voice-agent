@@ -123,6 +123,12 @@ class ToolResult(BaseModel):
     resource_id: str | None = None
 
 
+class NoArguments(BaseModel):
+    """The arguments of a tool that takes none."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HandlerContext:
     """What a handler has besides its session: the instant of this tool call on the call's

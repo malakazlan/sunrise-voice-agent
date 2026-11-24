@@ -34,14 +34,19 @@ declares, and nothing else:
   role with a grant option, which the owner cannot revoke, is caught.
 
 Its sessions have the start-up steps' lock and statement timeouts (app/db/session.py): a
-session holding the set-up lock, the runtime role's included, makes set-up fail, not wait.
+session holding the set-up lock or a lock one of its statements needs, the runtime role's
+included (it can hold its own row by changing its password), makes set-up fail, not wait,
+naming the wait and nothing of the driver's error.
 
 Grants on shared objects, such as CONNECT on a database, are taken away server-wide, and
 PUBLIC loses everything on the server's other databases: use a dedicated server.
 """
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 
+from psycopg import Error as DriverError
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
@@ -391,16 +396,31 @@ def runtime_role_differences(connection: Connection, role_name: str) -> list[str
     return sorted(differences)
 
 
+@contextmanager
+def _stopping_on_a_wait(waiting_for: str) -> Iterator[None]:
+    """The one place role set-up names a lock or statement timeout: the start-up steps'
+    failure (app/db/session.py), whichever statement it ended, whether SQLAlchemy's error or,
+    from the password statement, the driver's own. It is raised without the driver's error, so
+    an uncaught one prints nothing of it."""
+    try:
+        yield
+    except (DBAPIError, DriverError) as error:
+        failure = startup_wait_failure("role set-up", error, waiting_for)
+        if failure is None:
+            raise
+        raise failure from None
+
+
 def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> None:
     """Set up the runtime role inside the caller's transaction, as the owner, and check the
     result against the declaration. The caller commits."""
-    try:
+    with _stopping_on_a_wait("the role set-up lock"):
         connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": ROLE_SETUP_LOCK})
-    except DBAPIError as error:
-        failure = startup_wait_failure("role set-up", error, "the role set-up lock")
-        if failure is None:
-            raise
-        raise failure from error
+    with _stopping_on_a_wait("a lock on a database object"):
+        _set_up(connection, settings)
+
+
+def _set_up(connection: Connection, settings: DatabaseSettings) -> None:
     quote = connection.dialect.identifier_preparer.quote_identifier
     role = quote(settings.app_db_user)
     database = quote(connection.execute(text("SELECT current_database()")).scalar_one())
@@ -484,11 +504,6 @@ def main() -> None:
     try:
         with engine.begin() as connection:
             set_up_runtime_role(connection, settings)
-    except DBAPIError as error:
-        failure = startup_wait_failure("role set-up", error)
-        if failure is None:
-            raise
-        raise failure from error
     finally:
         engine.dispose()
 

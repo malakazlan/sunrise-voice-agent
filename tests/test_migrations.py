@@ -21,6 +21,8 @@ TABLES = {
     "available_slots",
     "audit_events",
     "verification_attempts",
+    "requests",
+    "messages",
 }
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
@@ -132,7 +134,7 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 28
+    assert len(migrated_constraints) == 38
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
@@ -145,9 +147,14 @@ def test_migration_matches_models(
         "ck_verification_attempts_claim_key",
         "CHECK ((claim_key ~ '^[0-9a-f]{64}$'::text))",
     ) in migrated_constraints
+    # A call asks for the same thing once, and leaves the same message once.
+    assert {
+        ("requests", "uq_requests_call_id_type_summary", "UNIQUE (call_id, type, summary)"),
+        ("messages", "uq_messages_call_id_kind_body", "UNIQUE (call_id, kind, body)"),
+    } <= migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 50
+    assert len(migrated_columns) == 64
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
     # seq has no default: the app assigns it under the lock, never a sequence.

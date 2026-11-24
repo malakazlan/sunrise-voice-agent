@@ -5,12 +5,16 @@ against Postgres's own catalogs and by trying, as the role, what it must not do.
 import re
 import secrets
 import subprocess
+import sys
 import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
+from pathlib import Path
 from typing import Any
 
+import anyio
 import psycopg
 import pytest
 from conftest import (
@@ -18,6 +22,7 @@ from conftest import (
     assert_refused_by_privileges,
     attempt,
     connects,
+    database_env,
     drop_role,
     new_role_name,
     refused_by_privileges,
@@ -25,7 +30,7 @@ from conftest import (
 )
 from psycopg import errors, sql
 from pydantic import SecretStr
-from sqlalchemy import Connection, Engine, event, text
+from sqlalchemy import Connection, Engine, TextClause, event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.pool import NullPool
@@ -33,6 +38,7 @@ from sqlalchemy.pool import NullPool
 from app.audit.log import Action, AuditLog, Event, Outcome, ResourceType
 from app.config import StartupSettings
 from app.db import grants
+from app.db import session as session_module
 from app.db.models import Base
 from app.db.roles import runtime_role_differences, set_up_runtime_role
 from app.db.session import create_database_engine, create_owner_sync_engine, create_session_factory
@@ -50,15 +56,19 @@ EXPECTED_TABLES = {
     "available_slots": {"SELECT", "UPDATE"},
     "audit_events": {"SELECT", "INSERT"},
     "verification_attempts": {"SELECT", "INSERT"},
+    "requests": {"SELECT", "INSERT"},
+    "messages": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
-# Only the appointments and verification attempts inserts take a number from a sequence;
-# patients have text ids and audit_events numbers its own rows.
+# Only the appointments, verification attempts, requests and messages inserts take a number
+# from a sequence; patients have text ids and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
     "appointments_id_seq": {"USAGE"},
     "verification_attempts_id_seq": {"USAGE"},
     "available_slots_id_seq": set(),
     "medications_id_seq": set(),
+    "requests_id_seq": {"USAGE"},
+    "messages_id_seq": {"USAGE"},
 }
 # The trigger functions of audit_events run as triggers whoever may call them; nobody needs
 # EXECUTE, which Postgres gives everyone by default. Nor the catalog's large-object creators:
@@ -421,6 +431,8 @@ FIRST_COLUMN = {
     "available_slots": "source",
     "audit_events": "reason",
     "verification_attempts": "success",
+    "requests": "patient_id",
+    "messages": "name",
     "alembic_version": "version_num",
 }
 
@@ -840,3 +852,75 @@ async def test_startup_steps_on_an_empty_database(
         assert "app_db_user" in same.stderr
     finally:
         drop_role(empty, empty.app_db_user)
+
+
+# --- Lock waits -------------------------------------------------------------------------------
+
+# A short lock limit for these tests; the real one is the session module's constant.
+SHORT_LOCK_TIMEOUT_MS = 2_000
+# Well past the short limit, and short of the 30 s after which the server ends the holder's
+# idle transaction (the runtime engine's setting), so a set-up that waits without its limit is
+# seen waiting.
+OUTER_BOUND_SECONDS = 20
+ROLE_ROW_WAIT = (
+    "role set-up: waited more than 2 s for a lock on a database object, which another session"
+    " holds; stopping"
+)
+# `python -m app.db.roles` with the short limit: the same main(), in a fresh interpreter.
+MAIN_WITH_A_SHORT_LOCK_LIMIT = (
+    "from app.db import session\n"
+    f"session.STARTUP_LOCK_TIMEOUT_MS = {SHORT_LOCK_TIMEOUT_MS}\n"
+    "from app.db.roles import main\n"
+    "main()\n"
+)
+
+
+def hold_own_role_row(role: str) -> TextClause:
+    """What a session of the runtime role may run on itself and leave uncommitted, holding the
+    role's row in the catalog that set-up's password step updates. NULL needs no password."""
+    return text(f'ALTER ROLE "{role}" PASSWORD NULL')
+
+
+async def test_setup_names_a_wait_on_the_role_row(
+    database: StartupSettings, runtime: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_module, "STARTUP_LOCK_TIMEOUT_MS", SHORT_LOCK_TIMEOUT_MS)
+    # Leaving the block without a commit rolls the change back.
+    async with runtime.connect() as holder:
+        await holder.execute(hold_own_role_row(database.app_db_user))
+
+        with anyio.fail_after(OUTER_BOUND_SECONDS), pytest.raises(RuntimeError) as excinfo:
+            await anyio.to_thread.run_sync(set_up_roles, database, abandon_on_cancel=True)
+
+        assert str(excinfo.value) == ROLE_ROW_WAIT
+        # The holder was not ended to get past it.
+        assert await holder.scalar(text("SELECT 1")) == 1
+
+
+async def test_main_reports_a_lock_wait(
+    database: StartupSettings, runtime: AsyncEngine, tmp_path: Path
+) -> None:
+    async with runtime.connect() as holder:
+        await holder.execute(hold_own_role_row(database.app_db_user))
+
+        result = await anyio.to_thread.run_sync(
+            partial(
+                subprocess.run,
+                [sys.executable, "-c", MAIN_WITH_A_SHORT_LOCK_LIMIT],
+                cwd=tmp_path,
+                env={**database_env(database), "PYTHONIOENCODING": "utf-8"},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=OUTER_BOUND_SECONDS,
+                check=False,
+            )
+        )
+
+        assert result.returncode == 1, result.stderr
+        assert result.stdout == ""
+        assert ROLE_ROW_WAIT in result.stderr
+        # Nothing of the driver's error: its class, its module, its SQLSTATE.
+        for driver_text in ("LockNotAvailable", "psycopg", "SQLSTATE"):
+            assert driver_text not in result.stderr
+        assert await holder.scalar(text("SELECT 1")) == 1

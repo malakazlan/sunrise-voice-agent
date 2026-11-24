@@ -21,16 +21,20 @@ TABLE_PRIVILEGES: dict[str, frozenset[TablePrivilege]] = {
     "available_slots": frozenset({"SELECT", "UPDATE"}),
     "audit_events": frozenset({"SELECT", "INSERT"}),
     "verification_attempts": frozenset({"SELECT", "INSERT"}),
+    "requests": frozenset({"SELECT", "INSERT"}),
+    "messages": frozenset({"SELECT", "INSERT"}),
     "alembic_version": frozenset(),
 }
 
-# Only the sequences the inserts above draw numbers from: appointment and verification attempt
-# ids. Patients have text ids and the audit log numbers its own events.
+# Only the sequences the inserts above draw numbers from: appointment, verification attempt,
+# request and message ids. Patients have text ids and the audit log numbers its own events.
 SEQUENCE_PRIVILEGES: dict[str, frozenset[SequencePrivilege]] = {
     "appointments_id_seq": frozenset({"USAGE"}),
     "verification_attempts_id_seq": frozenset({"USAGE"}),
     "available_slots_id_seq": frozenset(),
     "medications_id_seq": frozenset(),
+    "requests_id_seq": frozenset({"USAGE"}),
+    "messages_id_seq": frozenset({"USAGE"}),
 }
 
 # By SQL signature: every function in the schema, and the catalog's functions that create a

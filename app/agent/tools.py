@@ -8,14 +8,19 @@ the structural tests call it too, so every tool registered here is bound by the 
 way code calls it.
 """
 
+from app.agent.serving import SERVING_TOOLS
 from app.agent.state import CallState, Phase, drop_claim
-from app.agent.tool_registry import REGISTRY, Deps, Grant, Registry, Status, Tool, ToolOutcome
-from app.agent.verification import (
+from app.agent.tool_registry import (
+    REGISTRY,
+    Deps,
+    Grant,
     NoArguments,
-    VerifyIdentityArguments,
-    submit_identity,
-    verify_identity,
+    Registry,
+    Status,
+    Tool,
+    ToolOutcome,
 )
+from app.agent.verification import VerifyIdentityArguments, submit_identity, verify_identity
 from app.audit.log import Action, Outcome, ResourceType
 
 _SUBMIT_GRANT = Grant()
@@ -61,6 +66,8 @@ def register_tools() -> Registry:
     if not REGISTRY.sealed:
         REGISTRY.register(VERIFY_IDENTITY)
         REGISTRY.register(SUBMIT_IDENTITY, grant=_SUBMIT_GRANT)
+        for tool in SERVING_TOOLS:
+            REGISTRY.register(tool)
         REGISTRY.seal()
     return REGISTRY
 

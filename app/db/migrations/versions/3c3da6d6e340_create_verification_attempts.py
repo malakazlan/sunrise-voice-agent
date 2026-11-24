@@ -1,7 +1,7 @@
 """Create verification attempts
 
 Revision ID: 3c3da6d6e340
-Revises: 7c3e9a1d5b40
+Revises: b4d81f0c6a27
 Create Date: 2026-11-24 18:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "3c3da6d6e340"
-down_revision: str | Sequence[str] | None = "7c3e9a1d5b40"
+down_revision: str | Sequence[str] | None = "b4d81f0c6a27"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
