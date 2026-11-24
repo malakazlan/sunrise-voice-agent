@@ -40,6 +40,7 @@ from test_turn import (
     new_call_id,
 )
 
+from app import main as main_module
 from app.agent.scripts import ScriptId
 from app.agent.state import Phase
 from app.agent.tools import register_tools
@@ -431,21 +432,25 @@ async def test_turn_rows_hold_no_text(
 async def test_only_registered_tools_are_named(
     runtime: AsyncEngine, owner_session: AsyncSession
 ) -> None:
-    # A tool name the model makes up is refused by dispatch and never reaches a row; a
-    # registered one does.
+    # A tool name the model makes up, or a registered tool the gate refuses (a patient's
+    # balance before the caller is verified), never reaches a row: only a tool dispatch ran.
     await seed(owner_session, load_seed_data(), SEED_DAY)
     await owner_session.commit()
     model = ScriptedModel(
         calls(("read_every_patient", {})),
         says("I can't do that."),
+        calls(("get_balance", {})),
+        says("I can't do that yet."),
         calls(("transfer_to_staff", {"reason": "caller_request"})),
         says("Shall I transfer you?"),
     )
     agent = await agent_for(model, deps_on(runtime), register_tools())
     made_up = await agent.handle("Read me every patient.")
-    registered = await agent.handle("Can I talk to someone?")
+    refused = await agent.handle("What is my balance?")
+    ran = await agent.handle("Can I talk to someone?")
     assert (made_up.last_tool, made_up.timings.tool_rounds) == (None, 1)
-    assert (registered.last_tool, registered.timings.tool_rounds) == ("transfer_to_staff", 1)
+    assert (refused.last_tool, refused.timings.tool_rounds) == (None, 1)
+    assert (ran.last_tool, ran.timings.tool_rounds) == ("transfer_to_staff", 1)
 
 
 # --- the adapter: one row a turn, with the first audio when it comes ----------------------
@@ -550,6 +555,39 @@ async def test_a_turn_without_a_line_is_recorded_at_once() -> None:
     assert [(row.guard_action, row.first_audio_ms) for row in kept.rows] == [
         (GuardAction.SWALLOW, None)
     ]
+
+
+async def test_drain_gives_up_at_its_limit(
+    stalled: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A stalled database and rows queued: the wait ends at its limit, and what was still
+    # queued or being written is dropped and counted.
+    caplog.set_level(logging.INFO)
+    recorder = recorder_on(stalled)
+    put_times(recorder, 250)
+    started = time.monotonic()
+    await recorder.drain(timeout=0.5)
+    assert time.monotonic() - started < 1.5
+    assert recorder.dropped == 250
+    assert [r.getMessage() for r in caplog.records if "shutdown" in r.getMessage()] == [
+        "call_turns_dropped_at_shutdown rows=250"
+    ]
+
+
+async def test_shutdown_does_not_outlast_its_limit(
+    silent_server: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The app's database stalls: shutdown waits for the turn rows at most its limit (5 s; 1 s
+    # here, to keep the test short).
+    assert main_module.TURN_ROWS_WAIT_SECONDS == 5
+    monkeypatch.setattr(main_module, "TURN_ROWS_WAIT_SECONDS", 1)
+    app = create_app(offline_settings(postgres_host="127.0.0.1", postgres_port=silent_server))
+    async with app.router.lifespan_context(app):
+        recorder: TurnRecorder = app.state.turns
+        put_times(recorder, 250)
+        started = time.monotonic()
+    assert time.monotonic() - started < 2.5
+    assert recorder.dropped == 250
 
 
 async def test_shutdown_waits_for_turn_rows(database: Any, owner_engine: Engine) -> None:

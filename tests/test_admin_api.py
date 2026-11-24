@@ -589,7 +589,10 @@ def test_no_data_without_an_audit_event(admin_app: FastAPI, owner_engine: Engine
 
 
 # R7
-def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
+def test_admin_query_bounds(
+    admin_app: FastAPI, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
     refused_everywhere = [
         "limit=0",
         "limit=101",
@@ -701,8 +704,20 @@ def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
                     "from=2026-11-24&from=2026-11-25",
                     "to=2026-11-30",
                     "limit=1",
+                    # From 2000-01-01 to 2100-12-31 only: a date past them is refused here,
+                    # never read.
+                    "from=1999-12-31",
+                    "from=2101-01-01",
+                    "from=9999-12-31",
+                    "from=9999-12-31&days=14",
                 ],
-                ["from=2026-11-24", "days=14", "days=1&from=2026-02-28"],
+                [
+                    "from=2026-11-24",
+                    "days=14",
+                    "days=1&from=2026-02-28",
+                    "from=2000-01-01",
+                    "from=2100-12-31&days=14",
+                ],
             ),
             **{
                 route: (
@@ -724,7 +739,9 @@ def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
             written += len(allowed)
             assert len(events(owner_engine)) == written, route
     assert len(events(owner_engine)) == written
-    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 3 + 2 + 2
+    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 5 + 2 + 2
+    # No read failed: every refused value was refused before the database was asked.
+    assert "admin_read_failed" not in caplog.text
 
 
 def test_audit_reader_refuses_unvalidated_filters() -> None:

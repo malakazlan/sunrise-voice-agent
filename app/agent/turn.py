@@ -162,7 +162,7 @@ class TurnResult:
     given nothing), the lines said in order, whether a hand-off is asked for, and the output
     guard's rule when it withheld part of the model's reply. Then what the turn's row records of
     the call (app/agent/turn_record.py): its phase after the turn, the verified caller's patient
-    id, and the last registered tool the model ran in the turn."""
+    id, and the last tool that ran for the model in the turn."""
 
     action: GuardAction
     shown: str | None = field(repr=False)
@@ -257,7 +257,7 @@ class CallAgent:
         # The texts of the lines released in the turn running, in order.
         self._turn_lines: list[str] = []
         self._filler_said = False
-        # The registered tools, and the last of them the model ran in the turn running.
+        # The registered tools, and the last of them that ran for the model in the turn running.
         self._tool_names = frozenset(tool.name for tool in registry.tools)
         self._last_tool: str | None = None
         # The history the call record stores: what the model is shown and what is said, and
@@ -612,11 +612,13 @@ class CallAgent:
             if scripted is not None:
                 results.append(_result(call, NOT_RUN, error=True))
                 continue
+            refusals = self._state.tool_refusals
             self._state, outcome = await call_tool(
                 self._state, call.name, call.arguments, self._deps
             )
-            # A name the model made up is never recorded.
-            if call.name in self._tool_names:
+            # Only a tool dispatch ran is recorded: never a name the model made up, nor a call
+            # the gate refused, which counted a refusal (whatever code did after it).
+            if call.name in self._tool_names and self._state.tool_refusals == refusals:
                 self._last_tool = call.name
             self._hand_off = self._hand_off or outcome.hand_off
             if outcome.script is not None:

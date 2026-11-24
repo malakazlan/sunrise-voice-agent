@@ -13,7 +13,8 @@ batches of at most BATCH_ROWS, one insert each. A batch's write is given up afte
 batch that fails or is given up is logged and its rows are counted as dropped. Each row carries
 what its hand-over cost the call (`record_us`) and how many rows the recorder had dropped before
 it (`dropped_before`), so that both can be read from the table. `drain` waits for the writer, for
-tests and for shutdown.
+tests and for shutdown; given a limit, it then stops the writer and drops and counts what is
+left.
 
 Logs carry event names, call ids, turn numbers, counts and exception class names; never text.
 """
@@ -135,15 +136,35 @@ class TurnRecorder:
         self._full = False
         queued.record_us = (time.perf_counter_ns() - started) // 1000
 
-    async def drain(self) -> None:
-        """Wait until every row queued has been written or dropped."""
+    async def drain(self, timeout: float | None = None) -> None:
+        """Wait until every row queued has been written or dropped; with a `timeout`, at most
+        that many seconds: then the writer is stopped, and the rows still queued or being
+        written are dropped and counted."""
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         while self._writer is not None and not self._writer.done():
-            await asyncio.wait({self._writer})
+            left = None if deadline is None else max(0.0, deadline - loop.time())
+            await asyncio.wait({self._writer}, timeout=left)
+            if deadline is not None and loop.time() >= deadline:
+                while not self._writer.done():
+                    self._writer.cancel()
+                    await asyncio.wait({self._writer}, timeout=CANCEL_INTERVAL_SECONDS)
 
     async def _write_all(self) -> None:
-        while not self._queue.empty():
-            batch = [self._queue.get_nowait() for _ in range(min(BATCH_ROWS, self._queue.qsize()))]
-            await self._write_bounded(batch)
+        batch: list[_Queued] = []
+        try:
+            while not self._queue.empty():
+                size = min(BATCH_ROWS, self._queue.qsize())
+                batch = [self._queue.get_nowait() for _ in range(size)]
+                await self._write_bounded(batch)
+                batch = []
+        except asyncio.CancelledError:
+            left = len(batch) + self._queue.qsize()
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._dropped += left
+            logger.error("call_turns_dropped_at_shutdown rows=%d", left)
+            raise
 
     async def _write_bounded(self, batch: list[_Queued]) -> None:
         """Write the batch, giving it up after `write_seconds`; a failure is logged and its rows

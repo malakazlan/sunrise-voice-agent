@@ -61,6 +61,9 @@ ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # The days a summary or the slots cover: a week unless asked.
 DEFAULT_DAYS = 7
 MAX_SLOT_DAYS = 14
+# The days the slots may be read from: a date far past them overflows the window's end.
+FIRST_SLOT_DAY = date(2000, 1, 1)
+LAST_SLOT_DAY = date(2100, 12, 31)
 MAX_SUMMARY_DAYS = 30
 
 REQUEST_COLUMNS = (
@@ -147,12 +150,12 @@ class TurnPage(BaseModel):
 
 
 class SlotQuery(BaseModel):
-    """The slots of 1 to MAX_SLOT_DAYS days from a date at the clinic (YYYY-MM-DD; today if
-    not given)."""
+    """The slots of 1 to MAX_SLOT_DAYS days from a date at the clinic (YYYY-MM-DD, from
+    FIRST_SLOT_DAY to LAST_SLOT_DAY; today if not given)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    start: date | None = Field(default=None, alias="from")
+    start: date | None = Field(default=None, alias="from", ge=FIRST_SLOT_DAY, le=LAST_SLOT_DAY)
     days: int = Field(default=DEFAULT_DAYS, ge=1, le=MAX_SLOT_DAYS)
 
     @field_validator("start", mode="before")

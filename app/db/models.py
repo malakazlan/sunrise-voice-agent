@@ -238,7 +238,7 @@ GUARD_ACTIONS = ("pass", "swallow", "emergency")
 class CallTurn(Base):
     """One caller turn of a call, written after the turn by the turn recorder
     (app/agent/turn_record.py): the call's phase after it, whether the caller was verified and as
-    which patient, the input guard's action, the last registered tool the model ran in it and how
+    which patient, the input guard's action, the last tool that ran for the model in it and how
     many tool rounds it took, and its timings in milliseconds as the voice pipeline measured them.
     `record_us` is what handing the row over cost the call, in microseconds; `dropped_before`
     the rows the recorder had dropped before this one. Only ids, registry names, booleans and

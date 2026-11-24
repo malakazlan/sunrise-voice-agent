@@ -32,6 +32,9 @@ from app.voice.vocabulary import Vocabulary
 logger = logging.getLogger(__name__)
 
 CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
+# How long shutdown waits for the turn rows still queued; what is left then is dropped, so a
+# stalled database cannot hold the stop past the container's grace period.
+TURN_ROWS_WAIT_SECONDS = 5
 
 
 def build_deps(settings: Settings, engine: AsyncEngine) -> Deps:
@@ -83,7 +86,7 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         await drain_guard_audits()
         # And the call records still being masked and stored, and the turn rows still queued.
         await drain_call_records()
-        await turns.drain()
+        await turns.drain(timeout=TURN_ROWS_WAIT_SECONDS)
         if model is not None:
             await model.close()
         await engine.dispose()
