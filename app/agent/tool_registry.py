@@ -90,9 +90,16 @@ OWNER_FIELDS = frozenset(
 # the date of birth the caller claims. Code matches the claim; no record is looked up by it.
 CLAIM_FIELDS = frozenset({"dob"})
 
-# The actions dispatch and the call itself write; no tool may declare one as its own.
+# The actions dispatch, the call itself and the output guard's turn loop write; no tool may
+# declare one as its own.
 RESERVED_ACTIONS = frozenset(
-    {Action.TOOL_REFUSED, Action.TOOL_FAILED, Action.CALL_STARTED, Action.CALL_ENDED}
+    {
+        Action.TOOL_REFUSED,
+        Action.TOOL_FAILED,
+        Action.CALL_STARTED,
+        Action.CALL_ENDED,
+        Action.GUARD_BLOCK,
+    }
 )
 
 # At this many failed tool calls in one call, or this many refused ones, every outcome asks

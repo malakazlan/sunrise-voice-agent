@@ -1379,6 +1379,7 @@ def test_only_registry_members_are_accepted() -> None:
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
+        "guard_block",
     }
     assert {member.value for member in ResourceType} == {
         "call",
@@ -1389,7 +1390,15 @@ def test_only_registry_members_are_accepted() -> None:
         "tool",
     }
     assert {member.value for member in Outcome} == {"success", "failure", "refused"}
-    assert {member.value for member in Reason} == {"caller_hung_up"}
+    assert {member.value for member in Reason} == {
+        "caller_hung_up",
+        # The output guard's rules (app/guard/output.py), each the reason of a guard_block.
+        "ssn_last4",
+        "ssn_shape",
+        "phi_outside_gate",
+        "medical_advice",
+        "refill_promise",
+    }
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:
             assert re.fullmatch("[a-z0-9_]{1,64}", member.value)

@@ -120,6 +120,7 @@ class Action(StrEnum):
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
+    GUARD_BLOCK = "guard_block"
 
 
 class ResourceType(StrEnum):
@@ -150,6 +151,12 @@ class Outcome(StrEnum):
 
 class Reason(StrEnum):
     CALLER_HUNG_UP = "caller_hung_up"
+    # The output guard's rules, each the reason of a guard_block (app/guard/output.py).
+    SSN_LAST4 = "ssn_last4"
+    SSN_SHAPE = "ssn_shape"
+    PHI_OUTSIDE_GATE = "phi_outside_gate"
+    MEDICAL_ADVICE = "medical_advice"
+    REFILL_PROMISE = "refill_promise"
 
 
 def _check_member(name: str, value: object, registry: type[StrEnum]) -> None:

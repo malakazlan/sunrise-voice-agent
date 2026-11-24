@@ -844,7 +844,7 @@ def test_registration_rules() -> None:
                 list[Any],
             )
         ],
-        # The actions dispatch writes itself are not a tool's to declare.
+        # The actions dispatch, the call and the output guard write are not a tool's to declare.
         *[
             ("reserved", Tool(**valid(audit_action=action)))
             for action in (
@@ -852,6 +852,7 @@ def test_registration_rules() -> None:
                 Action.TOOL_FAILED,
                 Action.CALL_STARTED,
                 Action.CALL_ENDED,
+                Action.GUARD_BLOCK,
             )
         ],
         # A tool that may verify the caller: not a patient-data tool, in intake only, and never

@@ -60,6 +60,7 @@ EMERGENCY = (
     " nearest emergency room right away."
 )
 FALLBACK = "I'm sorry, I can't help with that. I can take a message for our staff instead."
+ADVICE_REFUSAL = "I'm not able to give medical advice. I can send a message to your doctor instead."
 
 CLAIM_TURN = "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
 SARAH_CLAIM = {"full_name": "Sarah Johnson", "dob": "1985-03-14"}
@@ -80,6 +81,9 @@ SERVING_TOOLS = [
 ]
 
 EVENTS = text("SELECT action, resource_type, resource_id, outcome FROM audit_events ORDER BY seq")
+EVENTS_WITH_REASONS = text(
+    "SELECT action, resource_type, resource_id, outcome, reason FROM audit_events ORDER BY seq"
+)
 
 
 # --- the scripted model -----------------------------------------------------------------
@@ -702,6 +706,101 @@ async def test_prompt_is_static(deps: Deps, registry: Registry) -> None:
 def test_every_offered_tool_is_described() -> None:
     registry = register_tools()
     assert sorted(t.name for t in registry.tools if t.model_callable) == sorted(TOOL_DESCRIPTIONS)
+
+
+# --- the output guard (spec 12: R9, R10) --------------------------------------------------
+
+
+def rows_with_reasons(engine: Engine) -> list[tuple[Any, ...]]:
+    with engine.connect() as connection:
+        return [tuple(row) for row in connection.execute(EVENTS_WITH_REASONS)]
+
+
+async def test_blocked_text_goes_nowhere(
+    deps: Deps, registry: Registry, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    marker = "marker-blocked-words"
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry, FIXED_CALL_ID)
+    await verified(agent, model)
+    model.then(
+        says(f"Let me see. You should stop taking {marker} today. Then call us back."),
+        says("Is there anything else?"),
+    )
+
+    result = await agent.handle("Should I keep taking my pills?")
+
+    # What came before the blocked sentence is said; the sentence is replaced by its line and
+    # the rest of the reply is dropped.
+    assert result.lines == ("Let me see.", ADVICE_REFUSAL)
+    assert result.withheld == "medical_advice"
+    assert result.hand_off is False
+
+    await agent.handle("No, thanks.")
+    await agent.settle()
+    # The conversation has what was said, never the blocked text or what came after it.
+    sent = everything_sent(model)
+    for blocked in (marker, "stop taking", "Then call us back"):
+        assert blocked not in sent, blocked
+    assert model.requests[-1].messages[-3:] == [
+        {"role": "assistant", "content": "Let me see."},
+        {"role": "assistant", "content": ADVICE_REFUSAL},
+        {"role": "user", "content": "No, thanks."},
+    ]
+    assert_well_formed(model.requests[-1].messages)
+    # The log has the rule's name, the call id and the count, never the text.
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
+        f"guard_block call_id={FIXED_CALL_ID} rule=medical_advice blocks=1 hand_off=False"
+    ]
+    for blocked in (marker, "stop taking", "Then call us back", "Let me see"):
+        assert blocked not in caplog.text, blocked
+    # One audit event, the rule its reason; no text in it.
+    events = rows_with_reasons(owner_engine)
+    assert events[-1] == ("guard_block", "call", FIXED_CALL_ID, "refused", "medical_advice")
+    assert [event[0] for event in events].count("guard_block") == 1
+    assert marker not in json.dumps([[str(value) for value in event] for event in events])
+
+
+async def test_two_blocks_hand_off(
+    deps: Deps, registry: Registry, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    model = ScriptedModel(
+        says("It's probably just a cold."),
+        says("Our staff can help with that."),
+        says("You should skip your next dose."),
+        says("That's nothing to worry about."),
+        says("I can take a message."),
+    )
+    agent = agent_for(model, deps, registry)
+
+    turns = [
+        await agent.handle(caller)
+        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?", "Okay.")
+    ]
+
+    assert [(turn.lines, turn.withheld, turn.hand_off) for turn in turns] == [
+        ((ADVICE_REFUSAL,), "medical_advice", False),
+        # An allowed reply in between: the count starts again.
+        (("Our staff can help with that.",), None, False),
+        ((ADVICE_REFUSAL,), "medical_advice", False),
+        # Two blocks in a row.
+        ((ADVICE_REFUSAL,), "medical_advice", True),
+        # The hand-off, once asked for, stays asked for.
+        (("I can take a message.",), None, True),
+    ]
+    call_id = agent.state.call_id
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
+        f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
+        f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
+        f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
+    ]
+    await agent.settle()
+    assert (
+        rows_with_reasons(owner_engine)
+        == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
+    )
 
 
 # --- R10 --------------------------------------------------------------------------------
