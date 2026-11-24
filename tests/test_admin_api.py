@@ -96,9 +96,9 @@ INSERT_MESSAGE = text(
 )
 INSERT_CALL = text(
     "INSERT INTO call_sessions (id, call_id, started_at, ended_at, office_open, verified,"
-    " patient_id, end_reason, turn_count, transcript, transcript_truncated)"
+    " patient_id, end_reason, turn_count, transcript, transcript_truncated, names_masked)"
     " VALUES (:id, :call_id, :started_at, :ended_at, true, :verified, :patient_id, 'completed',"
-    " :turn_count, :transcript, false)"
+    " :turn_count, :transcript, false, true)"
 )
 
 
@@ -373,6 +373,7 @@ def test_admin_output_is_masked(
             "transcript": "caller: Refill please, dob ****-**-14, ssn ****\n"
             "agent: I'll mail j***@***.com and call ***-***-3344.",
             "transcript_truncated": False,
+            "names_masked": True,
         }
     }
     assert bodies["/admin/api/audit"].json() == {

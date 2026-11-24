@@ -182,7 +182,10 @@ async def _newest(
 async def _call(session: AsyncSession, call_id: str) -> dict[str, Any] | None:
     """The stored call with its transcript, or None."""
     statement = select(
-        *CALL_COLUMNS, models.CallSession.transcript, models.CallSession.transcript_truncated
+        *CALL_COLUMNS,
+        models.CallSession.transcript,
+        models.CallSession.transcript_truncated,
+        models.CallSession.names_masked,
     ).where(models.CallSession.call_id == call_id)
     row = (await session.execute(statement)).first()
     return None if row is None else dict(row._mapping)

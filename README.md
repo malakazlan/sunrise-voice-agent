@@ -729,24 +729,43 @@ number of caller turns, and the transcript. Audio is never stored.
 - The transcript is the conversation as the model was given it and as the agent said it, one
   line per message (`caller: ...`, `agent: ...`): each caller turn as the input guard passed it
   on, each line said, scripted ones included. A turn the guard swallowed (the SSN step) is the
-  fixed line `caller: (turn withheld)`; its text is never kept anywhere. Tool calls and their
-  results are not in it.
-- It is masked twice before it is stored: first by `mask` (SSNs and SSN-shaped numbers, dates,
-  phone numbers, email addresses, as in the logs), then by Presidio with spaCy's small English
-  model (`en_core_web_sm`), which replaces the names, locations and dates it finds in free text
-  with `<PERSON>`, `<LOCATION>` and `<DATE_TIME>`. Name detection is statistical: it can miss a
-  name, an unusual one or one in a short fragment especially, and it can take an ordinary word
-  for one (it takes "today" for a date). The admin API masks again on the way out, but that pass hides shapes, not names.
+  fixed line `caller: (turn withheld)`, and a turn the guard took for an emergency is
+  `caller: (emergency turn withheld)`; their text is never kept anywhere. Both count as caller
+  turns. Tool calls, any text the model wrote beside a tool call (never said, never checked by
+  the output guard) and tool results are not in it.
+- It is masked three times before it is stored:
+  1. `mask`: SSNs and SSN-shaped numbers, dates, phone numbers, email addresses, as in the logs.
+  2. The names the call itself knows, replaced by `<PERSON>` as whole words in any case, and
+     spelled out letter by letter with spaces, dots, commas or hyphens (`S A R A H`,
+     `j-o-h-n-s-o-n`): the verified patient's first and last name from their patients row (if
+     that read fails, `call_record_patient_lookup_failed` is logged and the first name the call
+     state holds is used), and every name given to `verify_identity` (failed attempts too),
+     `collect_new_patient` and `take_message`. Words of one letter are left alone. One
+     compiled pattern, one pass over the text.
+  3. Presidio with spaCy's small English model (`en_core_web_sm`), which replaces the names,
+     locations and dates it finds in free text with `<PERSON>`, `<LOCATION>` and
+     `<DATE_TIME>`. `names_masked` is true only when this pass ran.
+- What the passes do not catch: a name the call never learned (a relative mentioned in passing)
+  said in lower case, which the statistical model often misses; a date of birth said in words
+  by a caller already verified; a street address said in lower case. Presidio can also take an
+  ordinary word for a name or a date (it takes "today" for a date), and a patient whose name is
+  an ordinary word (Will, May) has that word hidden everywhere. Medications, balances, lab
+  status, appointment times and message content are kept by design: staff need them. The admin
+  API masks again on the way out, but that pass hides shapes, not names.
 - Where it runs: in a task of its own after the call has ended, which nothing on a caller's turn
-  waits for, and all the work on one worker thread of its own, never on the event loop that
-  carries the calls. Presidio is imported and the model loaded on the first record, never at
-  start-up; the model is installed in the image from the lock and is never downloaded at run
-  time. Measured on the development machine: about 3 seconds to load, about 0.1 second for the
-  Presidio pass over a 20-turn transcript.
-- If the Presidio pass fails, the `mask` text is stored and `call_record_presidio_failed` is
-  logged with the error class. If the row cannot be written, `call_record_failed` is logged and
-  the record is dropped. A call is stored once; a second record of it is ignored. Logs carry
-  event names, the call id and counts, never transcript text.
+  waits for. The patients read is one query on the event loop; the rest of the work runs on one
+  worker thread of its own. Presidio is imported and the model loaded on the first record,
+  never at start-up; the model is installed in the image from the lock and is never downloaded
+  at run time. Measured on the development machine: about 3 seconds to load, about 0.1 second
+  for the Presidio pass over a 20-turn transcript.
+- Limit: the worker thread keeps the work off the event loop but not out of Python's
+  interpreter lock. While a record is being masked, the loop that carries the calls can stall
+  for up to about 100 ms at a time (measured). Masking in a separate process would remove that.
+- If the Presidio pass fails, the text of the first two passes is stored and
+  `call_record_presidio_failed` is logged with the error class. If the row cannot be written,
+  `call_record_failed` is logged and the record is dropped. A call is stored once; a second
+  record of it stores nothing and logs `call_record_duplicate`. Logs carry event names, the call
+  id and counts, never transcript text or a name.
 - The transcript is cut at a line boundary to at most 20,000 characters (before the masking
   passes, so they never read more, and again after, since a replacement can lengthen it), and
   `transcript_truncated` says so.
@@ -760,8 +779,8 @@ number of caller turns, and the transcript. Audio is never stored.
 ### Admin API
 
 A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages,
-call records and audit log can be read and the chain checked without opening the database. It is off
-unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
+call records and audit log can be read and the chain checked without opening the database. It
+is off unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
 answer `404` and the app logs `admin_api_off` once at start.
 
 | Route (all `GET`) | Returns |
@@ -769,7 +788,7 @@ answer `404` and the app logs `admin_api_off` once at start.
 | `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
 | `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
 | `/admin/api/calls` | `{"calls": [...]}`: id, call_id, started_at, ended_at, office_open, verified, patient_id, end_reason, turn_count; no transcript |
-| `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript and transcript_truncated; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
+| `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript, transcript_truncated and names_masked; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
 | `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
 | `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
 

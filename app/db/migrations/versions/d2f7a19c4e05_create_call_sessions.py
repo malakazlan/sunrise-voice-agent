@@ -31,6 +31,7 @@ def upgrade() -> None:
         sa.Column("turn_count", sa.Integer(), nullable=False),
         sa.Column("transcript", sa.Text(), nullable=False),
         sa.Column("transcript_truncated", sa.Boolean(), nullable=False),
+        sa.Column("names_masked", sa.Boolean(), nullable=False),
         sa.CheckConstraint(
             "call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'",
             name=op.f("ck_call_sessions_call_id"),

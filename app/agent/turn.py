@@ -99,9 +99,10 @@ BLOCK_REASONS = {
 # The Messages API takes a conversation that starts with the caller; this, fixed and written by
 # code, is the caller's first message, before the opening line.
 CALL_CONNECTED = "(The call has connected.)"
-# Where a swallowed turn was, in the history the call record keeps (app/agent/call_record.py);
-# never in the conversation the model is given.
+# Where a swallowed turn and an emergency turn were, in the history the call record keeps
+# (app/agent/call_record.py); never in the conversation the model is given.
 SWALLOWED_TURN = "(turn withheld)"
+EMERGENCY_TURN = "(emergency turn withheld)"
 
 # What the model is told about a tool call that ended its turn with a scripted line, and about
 # one asked for after it in the same reply, which does not run.
@@ -186,8 +187,9 @@ class CallAgent:
         self._blocks = 0
         self._hand_off = False
         self._lock = asyncio.Lock()
-        # Where in the conversation each swallowed turn came: for the call record only.
-        self._swallowed: list[int] = []
+        # Where in the conversation each turn the model never saw came, and its marker: for the
+        # call record only.
+        self._withheld: list[tuple[int, str]] = []
 
     @property
     def state(self) -> CallState:
@@ -196,10 +198,11 @@ class CallAgent:
     @property
     def history(self) -> tuple[dict[str, Any], ...]:
         """The conversation for the call record: what the model is given, with a SWALLOWED_TURN
-        caller message where each swallowed turn came. Never sent to the model."""
+        or EMERGENCY_TURN caller message where each turn it never saw came. Never sent to the
+        model."""
         history = list(self._messages)
-        for at in reversed(self._swallowed):
-            history.insert(at, {"role": "user", "content": SWALLOWED_TURN})
+        for at, marker in reversed(self._withheld):
+            history.insert(at, {"role": "user", "content": marker})
         return tuple(history)
 
     def say(self, script: ScriptId, values: Mapping[str, str] | None = None) -> str:
@@ -232,6 +235,7 @@ class CallAgent:
         timings = TurnTimings(first_token_ms=None, last_token_ms=None, tool_rounds=0)
 
         if decision.action is GuardAction.EMERGENCY:
+            self._withheld.append((at, EMERGENCY_TURN))
             # The emergency's one way: the move and the line first, its event in the background.
             self._state, script = await emergency(self._state, Reason.GUARD, self._deps)
             lines.append(self.say(script))
@@ -248,7 +252,7 @@ class CallAgent:
             lines.append(self.say(decision.script))
 
         if decision.action is GuardAction.SWALLOW:
-            self._swallowed.append(at)
+            self._withheld.append((at, SWALLOWED_TURN))
         if decision.action is GuardAction.SWALLOW or decision.text is None:
             return self._turn(decision.action, None, lines, timings)
 

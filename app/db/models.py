@@ -192,8 +192,9 @@ MAX_TRANSCRIPT = 20_000
 class CallSession(Base):
     """The record of one ended call, written once, after it ended (app/agent/call_record.py).
     `verified` goes with the patient id code verified the caller as. The transcript was masked
-    by `mask` and by Presidio before it was stored, and cut at a line to MAX_TRANSCRIPT
-    characters when `transcript_truncated`. Never audio."""
+    by `mask`, by the names the call knew and by Presidio before it was stored, and cut at a line
+    to MAX_TRANSCRIPT characters when `transcript_truncated`; `names_masked` says whether the
+    Presidio pass ran. Never audio."""
 
     __tablename__ = "call_sessions"
     __table_args__ = (
@@ -216,6 +217,7 @@ class CallSession(Base):
     turn_count: Mapped[int]
     transcript: Mapped[str]
     transcript_truncated: Mapped[bool]
+    names_masked: Mapped[bool]
 
 
 # Every text column of an audit event except the MACs: identifiers and registry codes only.

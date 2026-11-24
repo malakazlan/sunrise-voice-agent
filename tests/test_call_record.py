@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from test_admin_api import admin_settings
 from test_turn import (
     DIGITS_IN_WORDS,
+    EMERGENCY,
     FIRST_PAIR,
     GREETING,
     SARAH_CLAIM,
@@ -59,7 +60,7 @@ TURN_MODULE = REPO_ROOT / "app" / "agent" / "turn.py"
 
 STORED = text(
     "SELECT call_id, started_at, ended_at, office_open, verified, patient_id, end_reason,"
-    " turn_count, transcript, transcript_truncated FROM call_sessions ORDER BY id"
+    " turn_count, transcript, transcript_truncated, names_masked FROM call_sessions ORDER BY id"
 )
 
 # The caller's words, with every kind of identifier the two passes hide. Built from short
@@ -72,6 +73,7 @@ CONTACT_REPLY = "I'll pass that on to the staff."
 SSN_DIGITS = FIRST_PAIR + SECOND_PAIR
 # The fixed line a swallowed turn leaves in the record, written out by hand.
 SWALLOWED_LINE = "caller: (turn withheld)"
+EMERGENCY_LINE = "caller: (emergency turn withheld)"
 # When the call in the failure test ends: five minutes after it started.
 LATER = T0 + timedelta(minutes=5)
 
@@ -158,7 +160,7 @@ async def test_transcript_is_masked_and_late(
     # Three caller turns: the claim and the contact turn the model was shown, and the digits
     # it was not.
     assert row[:8] == (ended.call_id, T0, T0, True, True, "P001", "caller_hung_up", 3)
-    assert row[9] is False
+    assert row[9:] == (False, True)
     transcript = row[8]
     for raw in (
         "Sarah",
@@ -202,7 +204,11 @@ async def test_transcript_is_masked_and_late(
 
     # The logs name the record, never its text.
     recorded = [r.getMessage() for r in caplog.records if r.name == "app.agent.call_record"]
-    assert recorded == [f"call_recorded call_id={ended.call_id} turns=3 truncated=False"] * 2
+    # The second record of the call stored nothing, and says so.
+    assert sorted(recorded) == [
+        f"call_record_duplicate call_id={ended.call_id}",
+        f"call_recorded call_id={ended.call_id} turns=3 truncated=False",
+    ]
     for raw in ("Sarah", "Johnson", PHONE, EMAIL, SSN_DIGITS, DIGITS_IN_WORDS, CONTACT_REPLY):
         assert raw not in caplog.text, raw
 
@@ -242,11 +248,189 @@ async def test_each_swallowed_turn_leaves_one_marker(
         f"agent: {SSN_ASK}",
         SWALLOWED_LINE,
         SWALLOWED_LINE,
-        "agent: Thank you, Sarah. You're verified. How can I help you today?",
+        "agent: Thank you, <PERSON>. You're verified. How can I help you today?",
     ]
     # Reading the record changed nothing the model is given.
     assert [request.messages for request in model.requests] == sent
     assert "withheld" not in everything_sent(model)
+
+
+def tool_exchange(tool: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    """A tool call as the conversation holds it, with text the model wrote beside it, and its
+    result."""
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me note that."},
+                {"type": "tool_use", "id": "toolu_9", "name": tool, "input": arguments},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": "{}"}],
+        },
+    ]
+
+
+# Each tool a name is given to, what it was given, what the caller said around it, and the
+# lines kept: in lower case, alone, and spelled with spaces, dots, commas or hyphens.
+NAMES_GIVEN_TO_TOOLS = {
+    "take_message": (
+        {"name": "Maria Lopez", "callback_number": PHONE, "reason_short": "a refill question"},
+        ("yes it's maria", "thanks, that's lopez, l-o-p-e-z"),
+        ("caller: yes it's <PERSON>", "caller: thanks, that's <PERSON>, <PERSON>"),
+    ),
+    # A claim that matched no patient: the name is still the caller's.
+    "verify_identity": (
+        {"full_name": "Tom Baker", "dob": "1990-01-01"},
+        ("this is tom baker", "it's T O M, b.a.k.e.r"),
+        ("caller: this is <PERSON> <PERSON>", "caller: it's <PERSON>, <PERSON>"),
+    ),
+    "collect_new_patient": (
+        {"full_name": "Ana Silva", "dob": "1990-01-01", "phone": PHONE, "email": EMAIL},
+        ("ana silva", "A-N-A, s, i, l, v, a"),
+        ("caller: <PERSON> <PERSON>", "caller: <PERSON>, <PERSON>"),
+    ),
+}
+
+
+@pytest.mark.parametrize("tool", list(NAMES_GIVEN_TO_TOOLS))
+async def test_names_given_to_tools_are_hidden(
+    tool: str, database: Any, runtime: AsyncEngine, owner_engine: Engine, plain_presidio: None
+) -> None:
+    arguments, (before, after), (kept_before, kept_after) = NAMES_GIVEN_TO_TOOLS[tool]
+    history = [
+        {"role": "user", "content": before},
+        *tool_exchange(tool, arguments),
+        {"role": "assistant", "content": "Thank you."},
+        {"role": "user", "content": after},
+    ]
+    record_call(ended_call(), history, Reason.COMPLETED, deps_on(runtime))
+    await drain_call_records()
+
+    [(turns, transcript, names_masked)] = [(r[7], r[8], r[10]) for r in stored(owner_engine)]
+    assert (turns, names_masked) == (2, True)
+    assert transcript == f"{kept_before}\nagent: Thank you.\n{kept_after}"
+
+
+def test_the_name_arguments_are_the_tools() -> None:
+    assert call_record.NAME_ARGUMENTS == {
+        "verify_identity": "full_name",
+        "collect_new_patient": "full_name",
+        "take_message": "name",
+    }
+    tools = {tool.name: tool for tool in register_tools().tools}
+    for tool, argument in call_record.NAME_ARGUMENTS.items():
+        assert argument in tools[tool].arguments.model_fields, tool
+
+
+def test_short_name_words_are_not_hidden() -> None:
+    # A one-letter word of a name would hide every such letter in the text.
+    assert call_record._hide_names("a j or a J. Smith", ["J Smith"]) == "a j or a J. <PERSON>"
+    assert call_record._hide_names("Smithson and smith", ["J Smith"]) == "Smithson and <PERSON>"
+
+
+DIGIT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+VERIFIED_EMILY = "Thank you, Emily. You're verified. How can I help you today?"
+HEART_ATTACK = "I think I'm having a heart attack"
+
+
+async def verified_emily(deps: Deps) -> tuple[CallState, tuple[dict[str, Any], ...]]:
+    """Patient P005 of the seed data verified, through the claim and her last four, and the
+    call ended."""
+    emily = next(p for p in load_seed_data()["patients"] if p["id"] == "P005")
+    claim = {"full_name": f"{emily['first_name']} {emily['last_name']}", "dob": emily["dob"]}
+    model = ScriptedModel(calls(("verify_identity", claim)))
+    agent = agent_for(model, deps, register_tools())
+    await agent.handle("hi, this is emily nguyen")
+    last_four = " ".join(DIGIT_WORDS[int(digit)] for digit in emily["ssn_last4"])
+    assert (await agent.handle(last_four)).lines == (VERIFIED_EMILY,)
+    return await end_call(agent.state, Reason.CALLER_HUNG_UP, deps), agent.history
+
+
+async def test_the_verified_patients_names_are_hidden(
+    deps: Deps, owner_engine: Engine, presidio: None
+) -> None:
+    ended, history = await verified_emily(deps)
+    record_call(ended, history, Reason.CALLER_HUNG_UP, deps)
+    await drain_call_records()
+    await drain_call_events()
+
+    [transcript] = [row[8] for row in stored(owner_engine)]
+    assert "emily" not in transcript.casefold()
+    assert "nguyen" not in transcript.casefold()
+    lines = transcript.split("\n")
+    assert lines[1] == "caller: hi, this is <PERSON> <PERSON>"
+    assert lines[-1].startswith("agent: Thank you, <PERSON>. You're verified. How can I help ")
+
+
+# What a verified caller's record holds that no tool was given: her name from the patients
+# row, said and spelled.
+SAID_TO_EMILY = [
+    {"role": "assistant", "content": VERIFIED_EMILY},
+    {"role": "user", "content": "nguyen, n g u y e n"},
+]
+
+
+async def test_the_patients_row_names_the_caller(
+    deps: Deps, owner_engine: Engine, plain_presidio: None
+) -> None:
+    ended, _history = await verified_emily(deps)
+    record_call(ended, SAID_TO_EMILY, Reason.CALLER_HUNG_UP, deps)
+    await drain_call_records()
+    await drain_call_events()
+
+    assert [row[8] for row in stored(owner_engine)] == [
+        "agent: Thank you, <PERSON>. You're verified. How can I help you today?\n"
+        "caller: <PERSON>, <PERSON>"
+    ]
+
+
+async def test_a_failed_patient_lookup_keeps_the_first_name(
+    deps: Deps,
+    owner_engine: Engine,
+    plain_presidio: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def broken(_session: AsyncSession, _patient_id: str) -> list[str]:
+        raise RuntimeError("the database went away")
+
+    ended, _history = await verified_emily(deps)
+    monkeypatch.setattr(call_record, "_patient_names", broken)
+    caplog.set_level(logging.INFO)
+    record_call(ended, SAID_TO_EMILY, Reason.CALLER_HUNG_UP, deps)
+    await drain_call_records()
+    await drain_call_events()
+
+    # The first name the state holds is hidden; the last name only the row knew is not.
+    assert [row[8] for row in stored(owner_engine)] == [
+        "agent: Thank you, <PERSON>. You're verified. How can I help you today?\n"
+        "caller: nguyen, n g u y e n"
+    ]
+    assert [r.getMessage() for r in caplog.records if r.name == "app.agent.call_record"] == [
+        f"call_record_patient_lookup_failed call_id={ended.call_id} error=RuntimeError",
+        f"call_recorded call_id={ended.call_id} turns=1 truncated=False",
+    ]
+    assert "went away" not in caplog.text
+
+
+async def test_an_emergency_turn_leaves_its_marker(
+    deps: Deps, owner_engine: Engine, plain_presidio: None
+) -> None:
+    model = ScriptedModel()
+    agent = agent_for(model, deps, register_tools())
+    assert (await agent.handle(HEART_ATTACK)).action is GuardAction.EMERGENCY
+    ended = await end_call(agent.state, Reason.EMERGENCY, deps)
+    record_call(ended, agent.history, Reason.EMERGENCY, deps)
+    await drain_call_records()
+    await drain_call_events()
+
+    assert [(row[7], row[8]) for row in stored(owner_engine)] == [
+        (1, f"agent: {GREETING}\n{EMERGENCY_LINE}\nagent: {EMERGENCY}")
+    ]
+    assert model.requests == []
 
 
 async def test_masking_runs_off_the_event_loop(
@@ -324,10 +508,11 @@ async def test_presidio_failure_is_survivable(
             None,
             "error",
             1,
+            # The text the model wrote beside its tool call was never said: it is not kept.
             "agent: How can I help?\n"
             "caller: I'm Jane Roe, born ****-**-14, call ***-***-7788.\n"
-            "agent: Let me check.\n"
             "agent: Your balance is twenty dollars.",
+            False,
             False,
         )
     ]

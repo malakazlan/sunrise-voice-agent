@@ -205,7 +205,7 @@ def test_migration_matches_models(
     } <= migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 76
+    assert len(migrated_columns) == 77
     assert (
         "messages",
         "after_hours",
