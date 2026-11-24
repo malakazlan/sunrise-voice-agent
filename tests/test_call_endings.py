@@ -932,9 +932,7 @@ async def test_automatic_handoff(
     closed = refused_four_times(intake(office_open=False))
     after, outcome = await call_tool(closed, "verify_identity", {}, deps)
     assert after == count_refusal(closed)
-    assert outcome == REFUSED.model_copy(
-        update={"hand_off": True, "script": ScriptId.GUARD_FALLBACK}
-    )
+    assert outcome == REFUSED.model_copy(update={"hand_off": True, "script": ScriptId.FALLBACK})
     assert await events_of(owner_engine, closed) == [refused_event(closed, "verify_identity")]
 
     # A call already on its way out is left to go: no second move, no request.
@@ -967,7 +965,7 @@ async def test_hand_off_acts_once(
     clock.now = CLOSED_AT
     closed = refused_four_times(intake(office_open=False))
     first, outcome = await call_tool(closed, "verify_identity", {}, deps)
-    assert outcome.script is ScriptId.GUARD_FALLBACK
+    assert outcome.script is ScriptId.FALLBACK
     second, outcome = await call_tool(first, "verify_identity", {}, deps)
     assert (second, outcome) == (
         count_refusal(first),

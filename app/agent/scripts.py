@@ -27,7 +27,7 @@ class ScriptId(StrEnum):
     TRANSFER = "transfer"
     GOODBYE = "goodbye"
     AFTER_HOURS_CLOSE = "after_hours_close"
-    GUARD_FALLBACK = "guard_fallback"
+    FALLBACK = "fallback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +88,9 @@ SCRIPTS = MappingProxyType(
             " 911. Have a good {part_of_day}.",
             interruptible=True,
         ),
-        ScriptId.GUARD_FALLBACK: Script(
+        # For a model turn that failed or ran too long (app/agent/turn.py), and for the
+        # automatic hand-off with the office closed (app/agent/tools.py).
+        ScriptId.FALLBACK: Script(
             "I'm sorry, I can't help with that. I can take a message for our staff instead.",
             interruptible=True,
         ),

@@ -139,7 +139,7 @@ async def call_tool(
             after, HAND_OFF_TO_STAFF.name, {}, deps, grant=_HAND_OFF_GRANT
         )
     if is_available(TAKE_MESSAGE, after):
-        return after, outcome.model_copy(update={"script": ScriptId.GUARD_FALLBACK})
+        return after, outcome.model_copy(update={"script": ScriptId.FALLBACK})
     return after, outcome
 
 

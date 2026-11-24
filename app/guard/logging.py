@@ -21,6 +21,9 @@ UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
 # Pipecat logs through loguru, and its WebRTC stack through these loggers. Below WARNING they
 # write signaling detail and candidate addresses, so only their warnings and errors are kept.
 WEBRTC_LOGGERS = ("aioice", "aiortc")
+# The vendors' clients: below WARNING they write the request bodies (the whole conversation sent
+# to the model) and websocket frames (transcripts). Only their warnings and errors are kept.
+VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "deepgram")
 THIRD_PARTY_FLOOR = logging.WARNING
 
 
@@ -83,7 +86,7 @@ def configure_logging(settings: DatabaseSettings) -> None:
     access.handlers.clear()
     access.propagate = False
 
-    for name in WEBRTC_LOGGERS:
+    for name in (*WEBRTC_LOGGERS, *VENDOR_LOGGERS):
         logging.getLogger(name).setLevel(third_party_level)
     # A handler that fails to write would otherwise print the raw message and its arguments.
     logging.raiseExceptions = False

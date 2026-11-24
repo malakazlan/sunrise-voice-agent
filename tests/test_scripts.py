@@ -56,7 +56,7 @@ LINES = [
         True,
     ),
     (
-        "guard_fallback",
+        "fallback",
         "I'm sorry, I can't help with that. I can take a message for our staff instead.",
         True,
     ),
@@ -109,7 +109,7 @@ def test_lines_name_their_values() -> None:
         "transfer": frozenset(),
         "goodbye": frozenset(),
         "after_hours_close": frozenset({"name", "part_of_day"}),
-        "guard_fallback": frozenset(),
+        "fallback": frozenset(),
     }
 
 
