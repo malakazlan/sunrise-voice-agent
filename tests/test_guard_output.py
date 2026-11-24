@@ -267,6 +267,8 @@ PHI = [
     "Your balance is 120 dollars and 50 cents.",
     "You have a balance of $15.25.",
     "Your balance is zero.",
+    "That comes to $45.00.",
+    "It's forty-five dollars.",
     # A lab status.
     "Your lab results are ready, and the doctor will call to discuss them.",
     "Your results are still pending.",
@@ -410,6 +412,7 @@ NOT_ADVICE = [
     "You might have a message from our office.",
     "I'd suggest trying our patient portal.",
     "It's normal for lab results to take a few days.",
+    "It's normal for test results to take a week.",
     "It's probably in your spam folder.",
     "You should take your insurance card to the visit.",
     "You should take a moment to find your insurance card.",
@@ -462,6 +465,8 @@ PROMISES = [
     "Your medication is all set.",
     "Your Lisinopril has been refilled.",
     "It's been approved, so your prescription is on its way.",
+    # A hedge after the promise does not take it back.
+    "Your refill is approved, so call us if you have questions.",
 ]
 
 NOT_PROMISES = [
