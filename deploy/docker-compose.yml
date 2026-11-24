@@ -51,6 +51,7 @@ services:
       POSTGRES_PORT: "5432"
       APP_ENV: ${APP_ENV:?APP_ENV is not set; pass --env-file .env}
       LOG_LEVEL: ${LOG_LEVEL:-}
+      SIMULATED_NOW: ${SIMULATED_NOW:-}
       MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
       MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}

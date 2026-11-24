@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -16,3 +16,21 @@ def test_clinic_date_is_the_new_york_calendar_date() -> None:
 def test_clinic_date_refuses_a_naive_time() -> None:
     with pytest.raises(ValueError, match="timezone"):
         clinic_date(datetime(2026, 11, 25, 2, 30))
+
+
+class NoOffset(tzinfo):
+    """A tzinfo that is set but gives no offset: the datetime is still naive."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return None
+
+
+def test_clinic_date_refuses_a_tzinfo_without_an_offset() -> None:
+    with pytest.raises(ValueError, match="timezone"):
+        clinic_date(datetime(2026, 11, 25, 2, 30, tzinfo=NoOffset()))
