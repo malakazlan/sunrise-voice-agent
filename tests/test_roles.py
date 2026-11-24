@@ -512,7 +512,7 @@ async def test_runtime_role_attributes(
 
 
 def password_statements(statements: list[str]) -> list[str]:
-    return [statement for statement in statements if "PASSWORD" in statement.upper()]
+    return [statement for statement in statements if "PASSWORD '" in statement.upper()]
 
 
 SCRAM_IN_STATEMENT = re.compile(
@@ -550,6 +550,8 @@ def test_role_password_is_never_in_sql_or_errors(
     event.listen(engine, "before_cursor_execute", record)
     try:
         with engine.begin() as connection:
+            # The verifier's algorithm is named, never taken from the server's setting.
+            connection.execute(text("SET LOCAL password_encryption = 'md5'"))
             set_up_runtime_role(connection, settings)
     finally:
         engine.dispose()
@@ -712,6 +714,27 @@ async def test_undeclared_privilege_is_revoked(fresh_role: Settings, owner: Engi
     finally:
         await engine.dispose()
     assert mode == "origin"
+
+
+def test_setup_stops_when_the_role_owns_something(fresh_role: Settings, owner: Engine) -> None:
+    set_up_roles(fresh_role)
+    role = f'"{fresh_role.app_db_user}"'
+    with owner.begin() as connection:
+        connection.execute(text("CREATE TABLE owned_by_runtime (id int)"))
+        connection.execute(text("INSERT INTO owned_by_runtime VALUES (1)"))
+        connection.execute(text(f"ALTER TABLE owned_by_runtime OWNER TO {role}"))
+        connection.execute(text(f"GRANT pg_read_all_data TO {role}"))
+
+    # DROP OWNED would drop the table with its rows; set-up stops instead, changing nothing.
+    with pytest.raises(RuntimeError, match="owns database objects"):
+        set_up_roles(fresh_role)
+
+    with owner.begin() as connection:
+        assert connection.execute(text("SELECT id FROM owned_by_runtime")).scalars().all() == [1]
+        oid = connection.execute(ROLE_OID, {"name": fresh_role.app_db_user}).scalar_one()
+        member_of = connection.execute(MEMBERSHIPS, {"role": oid}).scalars().all()
+        assert member_of == ["pg_read_all_data"]
+        connection.execute(text("DROP TABLE owned_by_runtime"))
 
 
 # --- Start-up -------------------------------------------------------------------------------
