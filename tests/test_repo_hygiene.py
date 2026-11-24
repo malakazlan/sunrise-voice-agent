@@ -995,13 +995,14 @@ def test_no_print_in_app() -> None:
 
 
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last
-# four and the spoken digit words. The input guard takes them from there; no other file under
-# app/ may hold a pattern that matches what they match, or a list of the digit words. A pattern
-# counts when it matches a sample whole but not the same shape written in letters, so a pattern
-# for any text of that shape is not taken for one. Like the scans above, a lint against
-# accidents: a pattern assembled at runtime is not seen.
+# four and the spoken digit words. The input and output guards take them from there; no other
+# file under app/ may hold a pattern that matches what they match, or a list of the digit words.
+# A pattern counts when it matches a sample whole but not the same shape written in letters, so
+# a pattern for any text of that shape is not taken for one. Like the scans above, a lint
+# against accidents: a pattern assembled at runtime is not seen.
 SSN_OWNER = "app/guard/mask.py"
 INPUT_GUARD = "app/guard/input.py"
+OUTPUT_GUARD = "app/guard/output.py"
 DIGIT_WORDS = {"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
 
 
@@ -1082,11 +1083,16 @@ def test_ssn_patterns_have_one_owner() -> None:
     # The owner is seen by the scan, and it is the only file that is.
     assert owners == {SSN_OWNER}
 
-    # The guard uses the owner's redaction and digit reading, not a copy.
+    # The guards use the owner's redaction and digit reading, not a copy.
     assert imports_from(sources[INPUT_GUARD], "app.guard.mask") >= {
         "mask_ssns",
         "mask_unverified_digits",
         "mask_known_digits",
         "says_a_number",
         "spoken_digits",
+    }
+    assert imports_from(sources[OUTPUT_GUARD], "app.guard.mask") >= {
+        "mask_known_digits",
+        "reads_as_nine_digits",
+        "says_a_number",
     }

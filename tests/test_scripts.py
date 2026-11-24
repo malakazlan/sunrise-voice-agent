@@ -46,6 +46,12 @@ LINES = [
         "I'm sorry, I can't help with that. I can take a message for our staff instead.",
         True,
     ),
+    (
+        "advice_refusal",
+        "I'm not able to give medical advice. I can send a message to your doctor instead.",
+        True,
+    ),
+    ("refill_sent", "Your request has been sent to our team.", True),
 ]
 
 

@@ -406,6 +406,18 @@ def says_a_number(text: str) -> bool:
     return any(token.counted for run in _runs(text) for token in run)
 
 
+def reads_as_nine_digits(text: str) -> bool:
+    """Whether any run of the text, or the run without the homophones and "oh" at its ends,
+    reads as exactly nine digits, line by line: what `mask` hides as an SSN, here wherever the
+    run starts or ends, inside letters or digits too."""
+    return any(
+        len(_digits(group)) == 9
+        for line in text.split("\n")
+        for run in _runs(line)
+        for group in _groups(run)
+    )
+
+
 def _allowed_spans(line: str) -> list[tuple[int, int]]:
     dates = [match.span() for match in _IDENTIFIER.finditer(line) if match.lastgroup in _DATE_KINDS]
     years = [match.span() for match in _YEAR_WORDS.finditer(line)]

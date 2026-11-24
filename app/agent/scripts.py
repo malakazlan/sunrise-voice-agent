@@ -19,6 +19,8 @@ class ScriptId(StrEnum):
     VERIFY_LOCKED = "verify_locked"
     EMERGENCY = "emergency"
     FALLBACK = "fallback"
+    ADVICE_REFUSAL = "advice_refusal"
+    REFILL_SENT = "refill_sent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,10 +69,18 @@ SCRIPTS = MappingProxyType(
             " the nearest emergency room right away.",
             interruptible=False,
         ),
-        # For a model turn that failed or ran too long (app/agent/turn.py).
+        # For a model turn that failed or ran too long (app/agent/turn.py), and in place of a
+        # sentence the output guard blocks for SSN digits or patient data (app/guard/output.py).
         ScriptId.FALLBACK: Script(
             "I'm sorry, I can't help with that. I can take a message for our staff instead.",
             interruptible=True,
         ),
+        # In place of a sentence the output guard blocks as medical advice.
+        ScriptId.ADVICE_REFUSAL: Script(
+            "I'm not able to give medical advice. I can send a message to your doctor instead.",
+            interruptible=True,
+        ),
+        # In place of a sentence the output guard blocks as a refill promise.
+        ScriptId.REFILL_SENT: Script("Your request has been sent to our team.", interruptible=True),
     }
 )
