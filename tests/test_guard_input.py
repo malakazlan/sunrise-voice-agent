@@ -366,6 +366,10 @@ def test_one_sentence_before_being_asked() -> None:
         None,
         False,
     )
+    # What the caller said stays out of the decision's text form: it may hold a name.
+    for shown in (repr(decision), str(decision)):
+        assert "Sarah" not in shown
+        assert "1985" not in shown
 
 
 OVERRIDES = [
