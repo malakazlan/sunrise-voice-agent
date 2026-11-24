@@ -522,13 +522,19 @@ PUBLIC_CHANGES = [
         "REVOKE EXECUTE ON FUNCTION pg_catalog.now() FROM PUBLIC",
         "function pg_catalog.now(): EXECUTE taken from PUBLIC's initial privileges",
     ),
+    (
+        # Not a grant on anything yet, but on every table the owner creates from now on.
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC",
+        "default acl for role {owner} on tables:"
+        " SELECT granted to PUBLIC beyond its initial privileges",
+    ),
 ]
 
 
 @pytest.mark.parametrize(
     ("statement", "reported"),
     PUBLIC_CHANGES,
-    ids=["pg_authid", "pg_read_file", "information_schema", "revoked"],
+    ids=["pg_authid", "pg_read_file", "information_schema", "revoked", "default-privileges"],
 )
 def test_public_privileges_on_system_objects_must_be_the_initial_ones(
     fresh_role: StartupSettings, owner_engine: Engine, statement: str, reported: str
@@ -539,6 +545,7 @@ def test_public_privileges_on_system_objects_must_be_the_initial_ones(
     with pytest.raises(RuntimeError) as excinfo:
         set_up_roles(fresh_role)
 
+    reported = reported.format(owner=fresh_role.postgres_user)
     assert str(excinfo.value) == f"the runtime role does not match the declaration: {reported}"
 
 
