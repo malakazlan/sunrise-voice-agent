@@ -28,8 +28,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Short limits for these tests; the real ones are the session module's constants.
 LOCK_TIMEOUT_MS = 2_000
 STATEMENT_TIMEOUT_MS = 20_000
-# How long a test waits from outside before it calls the step hung.
-OUTER_BOUND_SECONDS = 60
+# How long a test waits from outside before it calls the step hung: well past the short lock
+# timeout, and short of the 30 s after which the server ends the holding session's idle
+# transaction (the runtime engine's setting), so a step without its limits is seen hanging.
+OUTER_BOUND_SECONDS = 20
 
 
 @pytest.fixture
