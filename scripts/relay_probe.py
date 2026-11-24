@@ -1,17 +1,20 @@
-"""Call the running app as a WebRTC client, send a tone, and check the same tone comes back.
+"""Call the running app as a WebRTC client, send a tone, and check that the server received it.
 
-Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. Each call sends a tone
-at a frequency chosen at random for that run and no other call, so a call that hears another
-call's audio, or a recording, fails. A call that ends before the requested length fails too.
+Uses aiortc, the WebRTC library the pipecat-ai[webrtc] extra installs. The app speaks nothing
+back, so the proof is the server's own RTCP receiver reports for this call's stream: they say
+how many of the call's packets arrived, and they come back over the same path, so with --relay
+both directions went through TURN. A report is for one stream (its SSRC), so a call never
+counts another call's reports. A call whose reports do not show the requested length of audio
+fails.
 
-    uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2 [--relay]
+    uv run python scripts/relay_probe.py --url http://127.0.0.1:8000 --calls 2 [--relay]
 
 With --hoard N it first opens N relay-only connections on one credential, as a greedy client
 would, and holds them while the calls run; --expect-hoarded M fails the run unless exactly M of
 them got a relay (coturn's per-credential quota).
 
-The access token is read from the PROBE_TOKEN environment variable. Exit code 0 means
-every call heard its own tone back.
+The access token is read from the PROBE_TOKEN environment variable. Exit code 0 means the
+server reported every call's audio received.
 """
 
 import argparse
@@ -19,7 +22,6 @@ import asyncio
 import fractions
 import json
 import os
-import random
 import sys
 import time
 import urllib.error
@@ -38,16 +40,15 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.mediastreams import MediaStreamError
+from aiortc.stats import RTCRemoteInboundRtpStreamStats
 from av import AudioFrame
 
 SAMPLE_RATE = 48_000
 SAMPLES_PER_FRAME = 960  # 20 ms
-# Candidate tones 60 Hz apart, so each call's tone is far from every other call's.
-TONES_HZ = [float(hz) for hz in range(300, 1500, 60)]
+TONE_HZ = 440.0
+PACKETS_PER_SECOND = 50  # one per 20 ms frame
+POLL_SECONDS = 0.2
 MAX_CALLS = 4
-SKIP_FRAMES = 25  # the first half second while the jitter buffers fill
-MIN_RMS = 500.0  # full-scale int16 is 32767; the tone is sent at half scale
-MAX_PEAK_ERROR_HZ = 10.0
 # Bound for each signaling step (gathering, answering, closing); HTTP requests have their own.
 STEP_TIMEOUT = 30.0
 
@@ -108,16 +109,17 @@ def candidate_types(sdp: str) -> dict[str, int]:
     return dict(types)
 
 
-def dominant_frequency(samples: np.ndarray, sample_rate: int) -> float:
-    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
-    frequencies = np.fft.rfftfreq(len(samples), 1 / sample_rate)
-    return float(frequencies[int(np.argmax(spectrum[1:])) + 1])
+async def packets_received(pc: RTCPeerConnection) -> int:
+    """How many of this call's audio packets the server says it received, from its latest
+    receiver report; 0 before the first one."""
+    for report in (await pc.getStats()).values():
+        if isinstance(report, RTCRemoteInboundRtpStreamStats) and report.kind == "audio":
+            return report.packetsReceived
+    return 0
 
 
-async def one_call(
-    url: str, token: str | None, frequency: float, relay: bool, seconds: float
-) -> bool:
-    label = f"call {frequency:.0f} Hz"
+async def one_call(url: str, token: str | None, number: int, relay: bool, seconds: float) -> bool:
+    label = f"call {number}"
     ice = await asyncio.to_thread(http, "GET", f"{url}/ice-servers", token)
     servers = [
         RTCIceServer(urls=s["urls"], username=s.get("username"), credential=s.get("credential"))
@@ -125,32 +127,18 @@ async def one_call(
     ]
     policy = RTCIceTransportPolicy.RELAY if relay else RTCIceTransportPolicy.ALL
     pc = RTCPeerConnection(RTCConfiguration(iceServers=servers, iceTransportPolicy=policy))
-    received: list[np.ndarray] = []
-    sample_rate = SAMPLE_RATE
-    enough = asyncio.Event()
-    wanted = SKIP_FRAMES + int(seconds * 50)
+    wanted = int(seconds * PACKETS_PER_SECOND)
+    received = 0
 
-    @pc.on("track")
-    def on_track(track: MediaStreamTrack) -> None:
-        async def read() -> None:
-            nonlocal sample_rate
-            while len(received) < wanted:
-                try:
-                    frame = await track.recv()
-                except MediaStreamError:
-                    break
-                if not isinstance(frame, AudioFrame):
-                    break
-                sample_rate = frame.sample_rate
-                channels = len(frame.layout.channels)
-                received.append(frame.to_ndarray().reshape(-1, channels)[:, 0])
-            enough.set()
-
-        asyncio.ensure_future(read())
+    async def reported() -> None:
+        nonlocal received
+        while received < wanted:
+            await asyncio.sleep(POLL_SECONDS)
+            received = await packets_received(pc)
 
     waiting_for = "gathering candidates"
     try:
-        pc.addTransceiver(ToneTrack(frequency), direction="sendrecv")
+        pc.addTransceiver(ToneTrack(TONE_HZ), direction="sendrecv")
         await bounded(pc.setLocalDescription(await pc.createOffer()), STEP_TIMEOUT)
         print(f"{label}: offer candidates {candidate_types(pc.localDescription.sdp)}")
         waiting_for = "the answer"
@@ -167,11 +155,11 @@ async def one_call(
             pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer")),
             STEP_TIMEOUT,
         )
-        waiting_for = f"{wanted} audio frames back"
-        await bounded(enough.wait(), seconds + 30)
-        print(f"{label}: ice {pc.iceConnectionState}, {time.monotonic() - started:.1f}s to audio")
+        waiting_for = f"the server to report {wanted} packets received"
+        await bounded(reported(), seconds + 30)
+        elapsed = time.monotonic() - started
     except TimeoutError:
-        print(f"{label}: FAILED timed out waiting for {waiting_for}; {len(received)} frames back")
+        print(f"{label}: FAILED timed out waiting for {waiting_for}; {received} reported")
         return False
     except urllib.error.URLError as error:
         print(f"{label}: FAILED {type(error).__name__} {error} while waiting for {waiting_for}")
@@ -179,16 +167,9 @@ async def one_call(
     finally:
         await close(pc, label)
 
-    if len(received) < wanted:
-        print(f"{label}: FAILED the call ended after {len(received)} of {wanted} frames")
-        return False
-    samples = np.concatenate(received[SKIP_FRAMES:]).astype(np.float64)
-    rms = float(np.sqrt(np.mean(samples**2)))
-    peak = dominant_frequency(samples, sample_rate)
-    ok = rms >= MIN_RMS and abs(peak - frequency) <= MAX_PEAK_ERROR_HZ
-    verdict = "OK" if ok else "FAILED"
-    print(f"{label}: {verdict} {len(samples)} samples back, rms {rms:.0f}, peak {peak:.1f} Hz")
-    return ok
+    print(f"{label}: OK ice {pc.iceConnectionState}, {received} packets received by the server,")
+    print(f"{label}: reported {elapsed:.1f}s after the offer")
+    return True
 
 
 async def hoard_relays(url: str, token: str | None, count: int) -> list[RTCPeerConnection]:
@@ -259,13 +240,13 @@ async def main() -> int:
             hoard_ok = args.expect_hoarded is None or relays == args.expect_hoarded
         results = await asyncio.gather(
             *(
-                one_call(url, token, tone, args.relay, args.seconds)
-                for tone in random.SystemRandom().sample(TONES_HZ, args.calls)
+                one_call(url, token, number, args.relay, args.seconds)
+                for number in range(args.calls)
             )
         )
     finally:
         await asyncio.gather(*(close(pc, "hoarding connection") for pc in hoarded))
-    print(f"{sum(results)}/{len(results)} calls heard their own tone back")
+    print(f"{sum(results)}/{len(results)} calls had their audio received by the server")
     return 0 if all(results) and hoard_ok else 1
 
 

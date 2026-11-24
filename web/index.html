@@ -3,18 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Voice echo test</title>
+  <title>Voice agent test</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
     label, button { display: block; margin: 0.75rem 0; }
     input[type="password"] { width: 100%; padding: 0.4rem; box-sizing: border-box; }
     button { padding: 0.6rem 1.2rem; font-size: 1rem; }
     dt { font-weight: bold; margin-top: 0.5rem; }
+    ol#turns { padding-left: 1.2rem; }
+    ol#turns li { margin: 0.75rem 0; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
+    .given { color: #444; }
+    .hidden { font-style: italic; color: #777; }
+    .reply { font-weight: bold; margin: 0.3rem 0; }
+    .timings { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #555; }
+    .handoff { color: #a00; font-weight: bold; }
   </style>
 </head>
 <body>
-  <h1>Voice echo test</h1>
-  <p>Test page. The server sends your own audio back to you.</p>
+  <h1>Voice agent test</h1>
+  <p>Test page, synthetic data only. Speak after the opening line; the agent's replies appear
+    here as text. Nothing is spoken back.</p>
 
   <label>Access token
     <input id="token" type="password" autocomplete="off">
@@ -26,9 +34,10 @@
   <dl>
     <dt>Connection state</dt><dd id="state">idle</dd>
     <dt>Candidate type in use</dt><dd id="candidate">none</dd>
-    <dt>Audio received from server</dt><dd id="received">none</dd>
   </dl>
-  <audio id="remote" autoplay></audio>
+
+  <h2>Turns</h2>
+  <ol id="turns"></ol>
 
   <script>
     const el = (id) => document.getElementById(id);
@@ -62,13 +71,9 @@
       if (!pc) return;
       const stats = await pc.getStats();
       let pair = null;
-      let packets = 0;
       stats.forEach((report) => {
         if (report.type === "transport" && report.selectedCandidatePairId) {
           pair = stats.get(report.selectedCandidatePairId);
-        }
-        if (report.type === "inbound-rtp" && report.kind === "audio") {
-          packets = report.packetsReceived;
         }
       });
       if (!pair) {
@@ -82,7 +87,40 @@
         const remote = stats.get(pair.remoteCandidateId);
         show("candidate", `this device: ${local?.candidateType ?? "?"}, server: ${remote?.candidateType ?? "?"}`);
       }
-      show("received", `${packets} audio packets`);
+    };
+
+    // Everything from the server is data: written with textContent, never as markup.
+    const line = (className, text) => {
+      const node = document.createElement("div");
+      node.className = className;
+      node.textContent = text;
+      return node;
+    };
+
+    const ms = (value) => (typeof value === "number" ? `${value} ms` : "-");
+
+    const addTurn = (message) => {
+      const item = document.createElement("li");
+      if (message.type === "opening") {
+        item.append(line("given", "Opening line (said by the system)"));
+      } else {
+        const given = typeof message.shown === "string"
+          ? line("given", `Given to the assistant: ${message.shown}`)
+          : line("hidden", "(not shown to the assistant)");
+        item.append(given);
+      }
+      const lines = Array.isArray(message.lines) ? message.lines : [];
+      if (lines.length === 0) item.append(line("hidden", "(no reply)"));
+      lines.forEach((text) => item.append(line("reply", String(text))));
+      if (message.type === "turn") {
+        const t = message.timings || {};
+        item.append(line("timings",
+          `speech end to transcript ${ms(t.stt_ms)} | to first token ${ms(t.first_token_ms)}`
+          + ` | to last token ${ms(t.last_token_ms)} | tool rounds ${t.tool_rounds ?? "-"}`
+          + ` | total ${ms(t.total_ms)}`));
+        if (message.hand_off === true) item.append(line("handoff", "Hand-off requested"));
+      }
+      el("turns").append(item);
     };
 
     const hangUp = () => {
@@ -92,7 +130,6 @@
       pc = null;
       if (mic) mic.getTracks().forEach((track) => track.stop());
       mic = null;
-      el("remote").srcObject = null;
       el("call").disabled = false;
       el("hangup").disabled = true;
     };
@@ -101,7 +138,7 @@
       el("call").disabled = true;
       el("hangup").disabled = false;
       show("candidate", "none");
-      show("received", "none");
+      el("turns").replaceChildren();
       try {
         show("state", "fetching ICE servers");
         const ice = await fetch("/ice-servers", { headers: authHeaders() });
@@ -116,8 +153,12 @@
           iceTransportPolicy: el("relay").checked ? "relay" : "all",
         });
         pc.addTransceiver(mic.getAudioTracks()[0], { direction: "sendrecv" });
-        pc.ontrack = (event) => {
-          el("remote").srcObject = event.streams[0] ?? new MediaStream([event.track]);
+        // The server sends each turn's result on this channel, as JSON.
+        const channel = pc.createDataChannel("messages");
+        channel.onmessage = (event) => {
+          let message;
+          try { message = JSON.parse(event.data); } catch { return; }
+          if (message && (message.type === "opening" || message.type === "turn")) addTurn(message);
         };
         pc.onconnectionstatechange = () => {
           if (!pc) return;
