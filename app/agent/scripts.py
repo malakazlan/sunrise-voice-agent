@@ -31,6 +31,8 @@ class ScriptId(StrEnum):
     BOOKING_INSTRUCTIONS = "booking_instructions"
     ADVICE_REFUSAL = "advice_refusal"
     REFILL_NO_PROMISE = "refill_no_promise"
+    STILL_THERE = "still_there"
+    FILLER = "filler"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +117,10 @@ SCRIPTS = MappingProxyType(
             " team.",
             interruptible=True,
         ),
+        # After IDLE_SECONDS of silence from the caller (app/voice/pipeline.py).
+        ScriptId.STILL_THERE: Script("Are you still there?", interruptible=True),
+        # While a tool round's answer is slow in coming (app/agent/turn.py).
+        ScriptId.FILLER: Script("One moment while I check.", interruptible=True),
     }
 )
 

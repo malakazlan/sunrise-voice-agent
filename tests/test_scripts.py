@@ -76,6 +76,8 @@ LINES = [
         "I'm not able to confirm that a refill is approved. I can send the request to our team.",
         True,
     ),
+    ("still_there", "Are you still there?", True),
+    ("filler", "One moment while I check.", True),
 ]
 
 # The part of the day the after-hours line wishes the caller, written by hand: `day` from 5 AM
@@ -129,6 +131,8 @@ def test_lines_name_their_values() -> None:
         "booking_instructions": frozenset(),
         "advice_refusal": frozenset(),
         "refill_no_promise": frozenset(),
+        "still_there": frozenset(),
+        "filler": frozenset(),
     }
 
 

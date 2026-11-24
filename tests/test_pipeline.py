@@ -16,32 +16,34 @@ from conftest import REPO_ROOT, VOICE_SECRETS, offline_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pipecat.frames.frames import (
-    EndWorkerFrame,
     Frame,
     InterimTranscriptionFrame,
-    OutputTransportMessageUrgentFrame,
     TranscriptionFinalizedFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
+from speech_fakes import CallPipeline, FakeTime, FakeVoice, until
 from test_turn import ADVICE_REFUSAL, ScriptedModel, deps_on, says
 
 import app.voice.pipeline
 import app.voice.transport
+from app.agent.scripts import ScriptId
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import CallAgent, TurnResult, TurnTimings
+from app.agent.turn import CallAgent, Line, Speak, TurnResult, TurnTimings
+from app.audit.log import Reason
+from app.config import Settings
 from app.db.session import create_database_engine
 from app.guard.input import GuardAction
 from app.guard.output import OutputRule
 from app.main import create_app
 from app.voice.calls import CallRegistry
-from app.voice.pipeline import AgentProcessor, deepgram_stt, open_agent_call
+from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, open_agent_call
+from app.voice.speech import Playback
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
 CALL_ID = "0f1e2d3c4b5a46978a1b2c3d4e5f6a7b"
@@ -50,12 +52,6 @@ OPENING = "Thank you for calling."
 
 def transcript(text: str, finalized: bool = False) -> TranscriptionFrame:
     return TranscriptionFrame(text, "", "2026-11-24T15:00:00Z", finalized=finalized)
-
-
-def messages(frames: list[Frame]) -> list[dict[str, Any]]:
-    return [
-        frame.message for frame in frames if isinstance(frame, OutputTransportMessageUrgentFrame)
-    ]
 
 
 @pytest.fixture
@@ -87,59 +83,92 @@ def agent_in_intake(
     return CallAgent(state, deps, model, register_tools(), clock=clock)
 
 
+def adapter(agent: Agent, clock: Clock) -> tuple[AgentProcessor, Playback]:
+    """The voice adapter around an agent the test built, OPENING its opening line."""
+
+    async def start() -> tuple[Agent, Line]:
+        return agent, Line(id=0, text=OPENING, script=ScriptId.GREETING)
+
+    playback = Playback()
+    processor = AgentProcessor(
+        CALL_ID,
+        start,
+        playback,
+        idle_seconds=30,
+        max_seconds=600,
+        vad_stop_seconds=0.5,
+        clock=clock,
+        sleep=FakeTime().sleep,
+    )
+    return processor, playback
+
+
+def turns(call: CallPipeline) -> list[dict[str, Any]]:
+    return [m for m in call.messages() if m["type"] == "turn"]
+
+
 @pytest.mark.anyio
 async def test_finished_utterances_become_turns(
     offline_deps: Deps, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.DEBUG)
     model = ScriptedModel(says("How can I help with your appointment?"))
-    clock = Clock()
-    processor = AgentProcessor(CALL_ID, agent_in_intake(offline_deps, model, clock), OPENING, clock)
-    processor.greet()
+    processor, playback = adapter(agent_in_intake(offline_deps, model, Clock()), Clock())
+    voice = FakeVoice(autoplay=False)
 
-    down, _up = await run_test(
-        processor,
-        frames_to_send=[
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the opening line")
+        await voice.play_all()
+        await call.send(
             VADUserStoppedSpeakingFrame(),
             InterimTranscriptionFrame("I have a", "", "t"),
             transcript("I have a question"),
             transcript("about my appointment.", finalized=True),
-            SleepFrame(sleep=0.3),
-        ],
-    )
+        )
+        await until(lambda: len(turns(call)) == 1, "the turn's message")
+        # The reply plays once the turn's message is out, so the clock is read in this order.
+        await voice.play_all()
+        await until(lambda: len(call.messages()) == 3, "the first audio")
 
     # The transcript reaches the agent, whole, and nothing downstream.
     assert model.requests[0].messages[-1] == {
         "role": "user",
         "content": "I have a question about my appointment.",
     }
-    assert not [f for f in down if isinstance(f, (TranscriptionFrame, InterimTranscriptionFrame))]
-    assert messages(list(down)) == [
+    assert not [
+        f for f in call.down if isinstance(f, (TranscriptionFrame, InterimTranscriptionFrame))
+    ]
+    assert call.messages()[:3] == [
         {"type": "opening", "lines": [OPENING]},
         {
             "type": "turn",
+            "turn": 1,
             "action": "pass",
             "shown": "I have a question about my appointment.",
             "lines": ["How can I help with your appointment?"],
             "withheld": None,
             "hand_off": False,
             "timings": {
-                # One clock, read in turn: speech end 100.1, transcript final 100.2, the turn's
-                # start 100.3, first token 100.4, last token 100.5, reply sent 100.6.
+                # The adapter's clock, read in turn: speech end 100.1, transcript final 100.2,
+                # the turn's report 100.3, the reply's first audio 100.4. The caller stopped
+                # speaking the detector's wait (0.5 s) before it said so: at 99.6. The agent's
+                # own clock: the turn's start 100.1, first token 100.2, last token 100.3.
+                "vad_ms": 500,
                 "stt_ms": 100,
                 "first_token_ms": 100,
                 "last_token_ms": 200,
                 "tool_rounds": 0,
-                "total_ms": 500,
+                "total_ms": 700,
             },
         },
+        {"type": "first_audio", "turn": 1, "first_audio_ms": 800},
     ]
-    measured = [
-        r.getMessage() for r in caplog.records if r.getMessage().startswith("turn_measured")
-    ]
+    measured = [r.getMessage() for r in caplog.records if r.getMessage().startswith("turn_")]
     assert measured == [
-        f"turn_measured call_id={CALL_ID} action=pass stt_ms=100 first_token_ms=100"
-        " last_token_ms=200 tool_rounds=0 total_ms=500 hand_off=False"
+        f"turn_measured call_id={CALL_ID} turn=1 action=pass vad_ms=500 stt_ms=100"
+        " first_token_ms=100 last_token_ms=200 tool_rounds=0 total_ms=700 hand_off=False",
+        f"turn_first_audio call_id={CALL_ID} turn=1 first_audio_ms=800",
     ]
     assert "question" not in caplog.text
     assert "appointment" not in caplog.text
@@ -148,17 +177,17 @@ async def test_finished_utterances_become_turns(
 @pytest.mark.anyio
 async def test_a_swallowed_turn_reaches_the_page_as_nothing(offline_deps: Deps) -> None:
     model = ScriptedModel()
-    clock = Clock()
-    processor = AgentProcessor(
-        CALL_ID, agent_in_intake(offline_deps, model, clock, armed=True), OPENING, clock
+    processor, playback = adapter(
+        agent_in_intake(offline_deps, model, Clock(), armed=True), Clock()
     )
 
-    down, _up = await run_test(
-        processor,
-        frames_to_send=[transcript("three three", finalized=True), SleepFrame(sleep=0.3)],
-    )
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("three three", finalized=True))
+        await until(lambda: len(turns(call)) == 1, "the turn's message")
 
-    (turn,) = messages(list(down))
+    (turn,) = turns(call)
     assert (turn["action"], turn["shown"], turn["lines"]) == ("swallow", None, [])
     assert "three" not in json.dumps(turn)
     assert model.requests == []
@@ -167,12 +196,12 @@ async def test_a_swallowed_turn_reaches_the_page_as_nothing(offline_deps: Deps) 
 @pytest.mark.anyio
 async def test_turns_wait_for_the_finalized_transcript(offline_deps: Deps) -> None:
     model = ScriptedModel(says("One."), says("Two."))
-    clock = Clock()
-    processor = AgentProcessor(CALL_ID, agent_in_intake(offline_deps, model, clock), OPENING, clock)
+    processor, playback = adapter(agent_in_intake(offline_deps, model, Clock()), Clock())
 
-    down, _up = await run_test(
-        processor,
-        frames_to_send=[
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(
             transcript("first part"),
             transcript("still first", finalized=True),
             # Deepgram had already sent the text when it confirmed the finalize.
@@ -180,18 +209,22 @@ async def test_turns_wait_for_the_finalized_transcript(offline_deps: Deps) -> No
             TranscriptionFinalizedFrame(),
             # A finalize with nothing heard is no turn.
             TranscriptionFinalizedFrame(),
-            SleepFrame(sleep=0.3),
-        ],
-    )
+        )
+        await until(lambda: len(turns(call)) == 2, "two turns")
 
-    assert [m["shown"] for m in messages(list(down))] == ["first part still first", "second"]
-    assert [m["timings"]["stt_ms"] for m in messages(list(down))] == [None, None]
+    assert [m["shown"] for m in turns(call)] == ["first part still first", "second"]
+    assert [m["timings"]["stt_ms"] for m in turns(call)] == [None, None]
 
 
 class Withheld:
     """A turn whose reply the output guard blocked."""
 
-    async def handle(self, transcript: str) -> TurnResult:
+    ending: Reason | None = None
+
+    def __init__(self) -> None:
+        self.ended: Reason | None = None
+
+    async def handle(self, transcript: str, speak: Speak | None = None) -> TurnResult:
         return TurnResult(
             action=GuardAction.PASS,
             shown=transcript,
@@ -201,38 +234,53 @@ class Withheld:
             withheld=OutputRule.MEDICAL_ADVICE,
         )
 
+    async def prompt(self, script: ScriptId, speak: Speak) -> Line:
+        raise AssertionError("no line is asked for")
+
+    def heard(self, line_id: int, words: int | None = None) -> None:
+        return None
+
+    async def end(self, reason: Reason) -> None:
+        self.ended = reason
+
 
 @pytest.mark.anyio
 async def test_a_withheld_reply_reaches_the_page_by_its_rule() -> None:
-    processor = AgentProcessor(CALL_ID, Withheld(), OPENING, Clock())
+    processor, playback = adapter(Withheld(), Clock())
 
-    down, _up = await run_test(
-        processor,
-        frames_to_send=[transcript("Is it serious?", finalized=True), SleepFrame(sleep=0.3)],
-    )
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("Is it serious?", finalized=True))
+        await until(lambda: len(turns(call)) == 1, "the turn")
 
-    (turn,) = messages(list(down))
+    (turn,) = turns(call)
     assert (turn["lines"], turn["withheld"]) == ([ADVICE_REFUSAL], "medical_advice")
     page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert "(a reply was withheld: ${message.withheld})" in page
 
 
-class Broken:
-    async def handle(self, transcript: str) -> TurnResult:
+class Broken(Withheld):
+    async def handle(self, transcript: str, speak: Speak | None = None) -> TurnResult:
         raise RuntimeError("an unknown state")
 
 
 @pytest.mark.anyio
 async def test_a_failed_turn_ends_the_call(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
-    processor = AgentProcessor(CALL_ID, Broken(), OPENING, Clock())
+    agent = Broken()
+    processor, playback = adapter(agent, Clock())
 
-    _down, up = await run_test(
-        processor,
-        frames_to_send=[transcript("hello there", finalized=True), SleepFrame(sleep=0.3)],
-        expected_up_frames=[EndWorkerFrame],
-    )
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("hello there", finalized=True))
+        await until(lambda: call.ended, "the call to end")
 
+    assert agent.ended is Reason.ERROR
+    assert [m for m in call.messages() if m["type"] == "ended"] == [
+        {"type": "ended", "reason": "error"}
+    ]
     assert f"turn_failed call_id={CALL_ID} error=RuntimeError" in caplog.text
     assert "an unknown state" not in caplog.text
 
@@ -277,6 +325,10 @@ def no_vendor(_key: SecretStr) -> FrameProcessor:
     return PassThrough()
 
 
+def no_speech_out(_settings: Settings) -> FrameProcessor:
+    return PassThrough()
+
+
 DEV_WITHOUT_VOICE: dict[str, Any] = {
     "app_env": "dev",
     "demo_access_token": None,
@@ -311,6 +363,7 @@ def test_call_that_never_connects_ends_itself() -> None:
                 "offer",
                 connect_timeout=0.5,
                 speech_to_text=no_vendor,
+                text_to_speech=no_speech_out,
             )
             # asyncio.wait, not wait_for: Pipecat's runner swallows cancellation, so a
             # cancelled run() would look like one that ended by itself.
@@ -381,7 +434,10 @@ def test_connection_closed_when_call_setup_fails(monkeypatch: pytest.MonkeyPatch
     assert opened[0].pc.connectionState == "closed"
 
 
-@pytest.mark.parametrize("missing", ["anthropic_api_key", "deepgram_api_key"])
+@pytest.mark.parametrize(
+    "missing",
+    ["anthropic_api_key", "deepgram_api_key", "elevenlabs_api_key", "elevenlabs_voice_id"],
+)
 def test_no_call_without_both_vendor_keys(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, missing: str
 ) -> None:
