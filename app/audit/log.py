@@ -2,9 +2,7 @@
 
 This module is the only code that writes or verifies `audit_events` (a repo hygiene test keeps
 it that way). Each event is chained to the one before it with a keyed MAC, so that changing,
-removing, reordering or forging an event breaks the chain where it happened. Removing the last
-events (the tail) leaves an intact, shorter chain: that is only visible against a copy of the
-head kept outside the database.
+removing, reordering or forging an event breaks the chain where it happened.
 
 MAC
     HMAC-SHA256 under the audit key over `prev_mac` (the 64 lowercase hex characters stored
