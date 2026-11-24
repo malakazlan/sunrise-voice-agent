@@ -22,6 +22,7 @@ from app.config import StartupSettings
 from app.db.models import Appointment, AvailableSlot, Medication, Patient
 from app.db.session import create_owner_engine, create_session_factory, startup_wait_failure
 from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL, clinic_date
+from app.guard.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,7 @@ def main(clock: Callable[[], datetime] = _utc_now) -> None:
     today's date at the clinic, taken from `clock` (the real clock unless a test passes one).
     """
     settings = StartupSettings()
-    logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
+    configure_logging(settings)
     today = clinic_date(clock())
     # psycopg's async mode needs a selector event loop; Windows defaults to the proactor loop.
     asyncio.run(_run(settings, today), loop_factory=asyncio.SelectorEventLoop)

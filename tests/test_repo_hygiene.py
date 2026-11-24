@@ -544,3 +544,123 @@ def test_domain_is_pure() -> None:
     }
 
     assert offenders == {}
+
+
+# Log output is configured in app/guard/logging.py only, where every handler gets the masking
+# formatter: no other file may configure logging, build or add a handler or formatter, or add or
+# remove loguru's sinks. Tests included. A lint against accidents, like the scans above: a name
+# reached another way gets past it.
+LOGGING_MODULE = "app/guard/logging.py"
+LOGGING_SETUP_CALLS = {
+    "basicConfig",
+    "dictConfig",
+    "fileConfig",
+    "addHandler",
+    "removeHandler",
+    "setFormatter",
+}
+LOGGING_SETUP_SUFFIXES = ("Handler", "Formatter")
+LOGURU_SETUP_CALLS = {"add", "remove", "configure"}
+
+
+def is_loguru_logger(node: ast.expr, names: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in names
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "logger"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "loguru"
+    )
+
+
+def logging_setup_uses(source: str) -> list[str]:
+    tree = ast.parse(source)
+    loguru_names = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "loguru"
+        for alias in node.names
+        if alias.name == "logger"
+    }
+    uses = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None) or ""
+            if name in LOGGING_SETUP_CALLS or name.endswith(LOGGING_SETUP_SUFFIXES):
+                uses.append(name)
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and name in LOGURU_SETUP_CALLS
+                and is_loguru_logger(node.func.value, loguru_names)
+            ):
+                uses.append(f"loguru.{name}")
+        elif isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                name = getattr(base, "id", None) or getattr(base, "attr", None) or ""
+                if name.endswith(LOGGING_SETUP_SUFFIXES):
+                    uses.append(f"class {node.name}")
+    return uses
+
+
+def test_logging_is_configured_in_one_module() -> None:
+    for sample in (
+        "import logging\nlogging.basicConfig(level='INFO')\n",
+        "from logging.config import dictConfig\ndictConfig({'version': 1})\n",
+        "import logging.config\nlogging.config.fileConfig('alembic.ini')\n",
+        "handler = logging.StreamHandler()\n",
+        "from logging import FileHandler\nFileHandler('calls.log')\n",
+        "logging.Formatter('%(message)s')\n",
+        "logging.getLogger('app').addHandler(handler)\n",
+        "logging.getLogger().removeHandler(handler)\n",
+        "handler.setFormatter(formatter)\n",
+        "class Plain(logging.Formatter):\n    pass\n",
+        "class Quiet(Handler):\n    pass\n",
+        "from loguru import logger\nlogger.add(sys.stderr)\n",
+        "from loguru import logger as log\nlog.remove()\n",
+        "import loguru\nloguru.logger.add(sys.stderr, level='DEBUG')\n",
+        "from loguru import logger\nlogger.configure(handlers=[])\n",
+    ):
+        assert logging_setup_uses(sample), sample
+    assert not logging_setup_uses(
+        "import logging\n"
+        "logger = logging.getLogger(__name__)\n"
+        "logger.info('call_started call_id=%s', call_id)\n"
+        "seen.add(call_id)\n"
+        "pending.remove(call_id)\n"
+        "transport.add_event_handler('on_client_connected', handler)\n"
+        "from loguru import logger as pipecat_logger\n"
+        "pipecat_logger.warning('x')\n"
+    )
+
+    users = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in tracked_files()
+        if path.suffix == ".py" and logging_setup_uses(path.read_text(encoding="utf-8"))
+    }
+
+    assert users == {LOGGING_MODULE}
+
+
+def print_uses(source: str) -> list[int]:
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print"
+    ]
+
+
+def test_no_print_in_app() -> None:
+    assert print_uses("print('call started')\n")
+    assert print_uses("def f() -> None:\n    print()\n")
+    assert not print_uses("logger.info('x')\nprinter.print('x')\n")
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix(): found
+        for path in tracked_files()
+        if path.suffix == ".py"
+        and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+        and (found := print_uses(path.read_text(encoding="utf-8")))
+    }
+
+    assert offenders == {}

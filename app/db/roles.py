@@ -49,6 +49,7 @@ from sqlalchemy.pool import NullPool
 from app.config import DatabaseSettings, StartupSettings
 from app.db import grants
 from app.db.session import create_owner_sync_engine, set_role_password, startup_wait_failure
+from app.guard.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +479,7 @@ def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> N
 def main() -> None:
     """Set up the runtime role from the environment's settings, as the owner."""
     settings = StartupSettings()
-    logging.basicConfig(level=settings.log_level, format="%(levelname)s [%(name)s] %(message)s")
+    configure_logging(settings)
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.begin() as connection:

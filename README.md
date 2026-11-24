@@ -205,6 +205,27 @@ All data used by this project is synthetic. No real customer or personal data is
       create objects there before the next start-up; that start-up then refuses to run until
       those objects are removed by hand.
 
+- Masked log output. `app/guard/logging.py` is the only place log output is configured; the
+  application and each start-up step call it first. Every line goes to stderr as
+  `timestamp LEVEL logger message`, and the message and any traceback pass through
+  `app/guard/mask.py` first:
+  - SSNs (`***-**-****`, and up to nine digits, spoken or written, after `ssn`, `social`,
+    `last four` or `last 4` become `****`), dates (`****-**-DD`), phone numbers
+    (`***-***-` and the last four digits) and email addresses (`s***@***.com`) are masked.
+    Text longer than 10,000 characters is cut, with ` [cut]` at the end, before masking.
+    Call ids, patient ids, times, amounts, years, version numbers and four-digit numbers
+    without a cue are left alone; a nine-digit or ten-digit number on its own is masked
+    whatever it is.
+  - The level is `LOG_LEVEL`, for the root logger and uvicorn's loggers. uvicorn's access log
+    is off. Pipecat (through loguru) and its WebRTC stack (`aioice`, `aiortc`) keep only
+    warnings and errors, and loguru does not print the values of local variables.
+  - What remains: names are not masked; an identifier split across two log calls is not
+    seen; Pipecat prints a version banner through loguru's own sink when it is imported,
+    before the configuration runs; a traceback Python prints itself for an exception nobody
+    catches (a start-up step that fails) is not masked; a handler a library adds after the
+    configuration is not covered. The repo's scan that keeps log configuration in one module
+    is a lint against accidents.
+
 ### Voice echo call
 
 The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC

@@ -1,5 +1,3 @@
-import logging
-import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
@@ -7,36 +5,21 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
-from loguru import logger as pipecat_logger
 
 from app.api.offer import OpenCall, build_router
-from app.config import LogLevel, Settings
+from app.config import Settings
+from app.guard.logging import configure_logging
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import open_echo_call
 
 CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 
 
-def configure_logging(level: LogLevel) -> None:
-    logging.getLogger().setLevel(level)
-    # Only the app's own loggers get a handler. aioice logs candidate addresses at INFO,
-    # so the root logger is left without one.
-    app_logger = logging.getLogger("app")
-    if not app_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-        app_logger.addHandler(handler)
-    # Pipecat logs through loguru. Its debug and info output includes signaling detail,
-    # so only its warnings and errors are kept.
-    pipecat_logger.remove()
-    pipecat_logger.add(sys.stderr, level="WARNING")
-
-
 def create_app(settings: Settings | None = None, open_call: OpenCall | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
 
-    configure_logging(settings.log_level)
+    configure_logging(settings)
 
     if open_call is None:
         open_call = partial(open_echo_call, settings)
