@@ -13,7 +13,9 @@ agent and nowhere else: not downstream, not to the page, not to a log. The page 
 model was given (the guard's text, or nothing for a swallowed turn), the lines said, the name of
 the output guard's rule when it withheld part of the reply (never the withheld text) and the
 timings, from the moment the caller stopped speaking: the silence voice activity detection waits
-for, speech-to-text, the model, and the first audio of the reply.
+for, speech-to-text, the model, and the first audio of the reply. The same numbers, with the
+call's phase, the caller's patient id and the turn's last tool, go to the turn recorder
+(app/agent/turn_record.py) as the turn's row, which takes it without waiting.
 
 While the caller is muted (the opening line, the closed line, the emergency line) nothing they
 say is a turn, an interruption or an emergency. Otherwise, when they start speaking over a line,
@@ -44,7 +46,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Protocol
 
@@ -82,6 +84,7 @@ from app.agent.scripts import ScriptId
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import Line, Speak, TurnResult, start_call
+from app.agent.turn_record import TurnRecorder, TurnRow
 from app.audit.log import Reason
 from app.config import Settings
 from app.voice.speech import CallerGate, LineMark, Playback, PlayoutTracker, elevenlabs_tts
@@ -186,9 +189,16 @@ class AgentProcessor(FrameProcessor):
         speech_refused: Callable[[], None],
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        turns: TurnRecorder | None = None,
     ) -> None:
         super().__init__()
         self._call_id = call_id
+        # Where each turn's row goes; None for the adapter's own tests, which record nothing.
+        self._recorder = turns
+        # Turn rows waiting for their first audio, and first audio that came before its turn's
+        # row, by turn.
+        self._unrecorded: dict[int, TurnRow] = {}
+        self._early_audio: dict[int, int] = {}
         self._start = start
         self._playback = playback
         self._idle_seconds = idle_seconds
@@ -391,10 +401,13 @@ class AgentProcessor(FrameProcessor):
             turn,
             first_audio_ms,
         )
+        self._first_audio(turn, first_audio_ms)
         await self._send({"type": "first_audio", "turn": turn, "first_audio_ms": first_audio_ms})
 
     async def _line_over(self, line_id: int, words: int | None) -> None:
-        self._first_lines.pop(line_id, None)
+        unheard = self._first_lines.pop(line_id, None)
+        if unheard is not None:
+            self._hand_over(unheard[0])
         if self._agent is not None:
             self._agent.heard(line_id, words)
         self._rearm_idle()
@@ -457,15 +470,16 @@ class AgentProcessor(FrameProcessor):
 
     async def _report(self, heard: _Utterance, caller_end: float, result: TurnResult) -> None:
         done = self._clock()
+        vad_ms = None if heard.speech_end is None else _ms(self._vad_stop_seconds)
+        stt_ms = None if heard.speech_end is None else _ms(heard.transcribed - heard.speech_end)
+        total_ms = _ms(done - caller_end)
         timings = {
-            "vad_ms": None if heard.speech_end is None else _ms(self._vad_stop_seconds),
-            "stt_ms": None
-            if heard.speech_end is None
-            else _ms(heard.transcribed - heard.speech_end),
+            "vad_ms": vad_ms,
+            "stt_ms": stt_ms,
             "first_token_ms": result.timings.first_token_ms,
             "last_token_ms": result.timings.last_token_ms,
             "tool_rounds": result.timings.tool_rounds,
-            "total_ms": _ms(done - caller_end),
+            "total_ms": total_ms,
         }
         logger.info(
             "turn_measured call_id=%s turn=%d action=%s vad_ms=%s stt_ms=%s first_token_ms=%s"
@@ -481,6 +495,7 @@ class AgentProcessor(FrameProcessor):
             timings["total_ms"],
             result.hand_off,
         )
+        self._record(result, vad_ms, stt_ms, total_ms)
         await self._send(
             {
                 "type": "turn",
@@ -493,6 +508,57 @@ class AgentProcessor(FrameProcessor):
                 "timings": timings,
             }
         )
+
+    # --- the turn's row --------------------------------------------------------------------
+
+    def _record(
+        self, result: TurnResult, vad_ms: int | None, stt_ms: int | None, total_ms: int
+    ) -> None:
+        """The turn's row, with the numbers the page is given. It goes to the recorder once its
+        first audio is known: now, if the turn's first line has played or there is none to play;
+        otherwise when the line plays or is over unheard, the next turn is reported or the call
+        ends, whichever comes first."""
+        if self._recorder is None:
+            return
+        self._hand_over_all()
+        turn = self._turn_count
+        self._unrecorded[turn] = TurnRow(
+            call_id=self._call_id,
+            turn=turn,
+            phase=result.phase,
+            patient_id=result.patient_id,
+            guard_action=result.action,
+            last_tool=result.last_tool,
+            tool_rounds=result.timings.tool_rounds,
+            vad_ms=vad_ms,
+            stt_ms=stt_ms,
+            first_token_ms=result.timings.first_token_ms,
+            last_token_ms=result.timings.last_token_ms,
+            first_audio_ms=self._early_audio.pop(turn, None),
+            total_ms=total_ms,
+        )
+        awaited = any(waiting == turn for waiting, _end in self._first_lines.values())
+        if self._unrecorded[turn].first_audio_ms is not None or not awaited:
+            self._hand_over(turn)
+
+    def _first_audio(self, turn: int, first_audio_ms: int) -> None:
+        if self._recorder is None:
+            return
+        row = self._unrecorded.pop(turn, None)
+        if row is None:
+            # The line played before the turn was reported.
+            self._early_audio[turn] = first_audio_ms
+            return
+        self._recorder.put(replace(row, first_audio_ms=first_audio_ms))
+
+    def _hand_over(self, turn: int) -> None:
+        row = self._unrecorded.pop(turn, None)
+        if row is not None and self._recorder is not None:
+            self._recorder.put(row)
+
+    def _hand_over_all(self) -> None:
+        for turn in list(self._unrecorded):
+            self._hand_over(turn)
 
     # --- timers ----------------------------------------------------------------------------
 
@@ -600,6 +666,7 @@ class AgentProcessor(FrameProcessor):
         await self._finish(self._closing)
 
     async def _finish(self, reason: Reason) -> None:
+        self._hand_over_all()
         if self._ended or self._agent is None:
             return
         self._ended = True
@@ -732,6 +799,8 @@ async def open_agent_call(
     connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     speech_to_text: Callable[[SecretStr, Sequence[str]], FrameProcessor] = deepgram_stt,
     text_to_speech: Callable[[Settings], FrameProcessor] = elevenlabs_tts,
+    *,
+    turns: TurnRecorder,
 ) -> AgentCall:
     if (
         model is None
@@ -763,6 +832,7 @@ async def open_agent_call(
         max_seconds=settings.max_call_seconds,
         vad_stop_seconds=settings.vad_stop_seconds,
         speech_refused=speech_check.start,
+        turns=turns,
     )
     try:
         return AgentCall(call_id, connection, connect_timeout, agent, playback, vad, stt, tts)

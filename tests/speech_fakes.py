@@ -35,6 +35,7 @@ from app.agent.model import Model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import start_call
+from app.agent.turn_record import TurnRecorder
 from app.voice.pipeline import AgentProcessor
 from app.voice.speech import CallerGate, LineMark, Playback, PlayoutTracker
 
@@ -251,9 +252,11 @@ def agent_call(
     *,
     idle_seconds: float = 30.0,
     max_seconds: float = 600.0,
+    turns: TurnRecorder | None = None,
 ) -> tuple[AgentProcessor, Playback]:
-    """The voice adapter of a call whose agent is the real one, its timers on `time`. Speech
-    out is the fake's, which ElevenLabs never refuses: nothing is checked."""
+    """The voice adapter of a call whose agent is the real one, its timers on `time`; its turn
+    rows go to `turns`, if given. Speech out is the fake's, which ElevenLabs never refuses:
+    nothing is checked."""
     playback = Playback()
     processor = AgentProcessor(
         call_id,
@@ -265,6 +268,7 @@ def agent_call(
         speech_refused=_never_checked,
         clock=time.clock,
         sleep=time.sleep,
+        turns=turns,
     )
     return processor, playback
 

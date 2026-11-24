@@ -24,6 +24,7 @@ TABLES = {
     "requests",
     "messages",
     "call_sessions",
+    "call_turns",
 }
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
@@ -96,6 +97,13 @@ FUNCTION_DEFINITIONS = text(
 )
 
 
+CONSOLE_INDEXES = text(
+    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'"
+    " AND indexname IN ('ix_audit_events_action_ts', 'ix_call_turns_at',"
+    " 'ix_verification_attempts_created_at')"
+)
+
+
 def definitions(settings: StartupSettings, query: TextClause) -> set[tuple[object, ...]]:
     engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
@@ -135,7 +143,7 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 46
+    assert len(migrated_constraints) == 59
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
@@ -204,8 +212,51 @@ def test_migration_matches_models(
         ("call_sessions", "ck_call_sessions_turn_count", "CHECK ((turn_count >= 0))"),
     } <= migrated_constraints
 
+    # A call's turn is stored once, with ids of their declared shapes, registry names, and a
+    # patient only when verified.
+    assert {
+        ("call_turns", "uq_call_turns_call_id_turn", "UNIQUE (call_id, turn)"),
+        (
+            "call_turns",
+            "ck_call_turns_call_id",
+            "CHECK ((call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'::text))",
+        ),
+        (
+            "call_turns",
+            "ck_call_turns_patient_id",
+            "CHECK ((patient_id ~ '^P[0-9]{3,6}$'::text))",
+        ),
+        (
+            "call_turns",
+            "ck_call_turns_verified_patient",
+            "CHECK ((verified = (patient_id IS NOT NULL)))",
+        ),
+        ("call_turns", "ck_call_turns_last_tool", "CHECK ((last_tool ~ '^[a-z_]{2,40}$'::text))"),
+        ("call_turns", "ck_call_turns_turn", "CHECK ((turn >= 1))"),
+        ("call_turns", "ck_call_turns_tool_rounds", "CHECK ((tool_rounds >= 0))"),
+        ("call_turns", "ck_call_turns_record_us", "CHECK ((record_us >= 0))"),
+        ("call_turns", "ck_call_turns_dropped_before", "CHECK ((dropped_before >= 0))"),
+    } <= migrated_constraints
+
+    # The indexes the console's reads use: the audit log by action and time, the attempts and
+    # the turns by time.
+    assert definitions(migrated, CONSOLE_INDEXES) == {
+        (
+            "ix_audit_events_action_ts",
+            "CREATE INDEX ix_audit_events_action_ts"
+            " ON public.audit_events USING btree (action, ts)",
+        ),
+        ("ix_call_turns_at", "CREATE INDEX ix_call_turns_at ON public.call_turns USING btree (at)"),
+        (
+            "ix_verification_attempts_created_at",
+            "CREATE INDEX ix_verification_attempts_created_at"
+            " ON public.verification_attempts USING btree (created_at)",
+        ),
+    }
+    assert definitions(from_models, CONSOLE_INDEXES) == definitions(migrated, CONSOLE_INDEXES)
+
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 77
+    assert len(migrated_columns) == 95
     assert (
         "messages",
         "after_hours",

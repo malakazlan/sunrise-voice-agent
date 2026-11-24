@@ -220,6 +220,69 @@ class CallSession(Base):
     names_masked: Mapped[bool]
 
 
+# The phases a call's turn may leave it in (Phase in app/agent/state.py) and the input guard's
+# actions (GuardAction in app/guard/input.py).
+TURN_PHASES = (
+    "greeting",
+    "intake",
+    "serving",
+    "booking",
+    "emergency",
+    "handoff",
+    "closing",
+    "ended",
+)
+GUARD_ACTIONS = ("pass", "swallow", "emergency")
+
+
+class CallTurn(Base):
+    """One caller turn of a call, written after the turn by the turn recorder
+    (app/agent/turn_record.py): the call's phase after it, whether the caller was verified and as
+    which patient, the input guard's action, the last tool that ran for the model in it and how
+    many tool rounds it took, and its timings in milliseconds as the voice pipeline measured them.
+    `record_us` is what handing the row over cost the call, in microseconds; `dropped_before`
+    the rows the recorder had dropped before this one. Only ids, registry names, booleans and
+    numbers: nothing of what was said."""
+
+    __tablename__ = "call_turns"
+    __table_args__ = (
+        UniqueConstraint("call_id", "turn"),
+        # The declared shapes of a call id and a patient id (app/audit/log.py), and a tool's
+        # registered name.
+        CheckConstraint("call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'", name="call_id"),
+        CheckConstraint("patient_id ~ '^P[0-9]{3,6}$'", name="patient_id"),
+        CheckConstraint("verified = (patient_id IS NOT NULL)", name="verified_patient"),
+        CheckConstraint(literal_column("phase").in_(TURN_PHASES), name="phase"),
+        CheckConstraint(literal_column("guard_action").in_(GUARD_ACTIONS), name="guard_action"),
+        CheckConstraint("last_tool ~ '^[a-z_]{2,40}$'", name="last_tool"),
+        CheckConstraint("turn >= 1", name="turn"),
+        CheckConstraint("tool_rounds >= 0", name="tool_rounds"),
+        CheckConstraint("record_us >= 0", name="record_us"),
+        CheckConstraint("dropped_before >= 0", name="dropped_before"),
+        # The console's summaries read the turns of a window of days.
+        Index("ix_call_turns_at", "at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    call_id: Mapped[str]
+    turn: Mapped[int]
+    at: Mapped[datetime]
+    phase: Mapped[str]
+    verified: Mapped[bool]
+    patient_id: Mapped[str | None] = mapped_column(ForeignKey("patients.id"))
+    guard_action: Mapped[str]
+    last_tool: Mapped[str | None]
+    tool_rounds: Mapped[int]
+    vad_ms: Mapped[int | None]
+    stt_ms: Mapped[int | None]
+    first_token_ms: Mapped[int | None]
+    last_token_ms: Mapped[int | None]
+    first_audio_ms: Mapped[int | None]
+    total_ms: Mapped[int]
+    record_us: Mapped[int]
+    dropped_before: Mapped[int]
+
+
 # Every text column of an audit event except the MACs: identifiers and registry codes only.
 # Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
 AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"
@@ -233,17 +296,21 @@ class AuditEvent(Base):
     """One event of the audit log. Written and verified only by app/audit/log.py."""
 
     __tablename__ = "audit_events"
-    __table_args__ = tuple(
-        _audit_text(column)
-        for column in (
-            "call_id",
-            "actor",
-            "action",
-            "resource_type",
-            "resource_id",
-            "outcome",
-            "reason",
-        )
+    __table_args__ = (
+        *(
+            _audit_text(column)
+            for column in (
+                "call_id",
+                "actor",
+                "action",
+                "resource_type",
+                "resource_id",
+                "outcome",
+                "reason",
+            )
+        ),
+        # The console's reads take events of a few actions over a window of time.
+        Index("ix_audit_events_action_ts", "action", "ts"),
     )
 
     # No default and no sequence: the app assigns previous + 1 under the chain's lock.
@@ -270,6 +337,8 @@ class VerificationAttempt(Base):
         # The declared shape of a call id (CALL_ID in app/audit/log.py).
         CheckConstraint("call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'", name="call_id"),
         Index("ix_verification_attempts_claim_key_created_at", "claim_key", "created_at"),
+        # The console's summaries count the attempts of a window of days.
+        Index("ix_verification_attempts_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

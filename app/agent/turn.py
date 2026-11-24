@@ -160,7 +160,9 @@ class TurnTimings:
 class TurnResult:
     """What came of a turn: the guard's action, what the model was given (None when it was
     given nothing), the lines said in order, whether a hand-off is asked for, and the output
-    guard's rule when it withheld part of the model's reply."""
+    guard's rule when it withheld part of the model's reply. Then what the turn's row records of
+    the call (app/agent/turn_record.py): its phase after the turn, the verified caller's patient
+    id, and the last tool that ran for the model in the turn."""
 
     action: GuardAction
     shown: str | None = field(repr=False)
@@ -168,6 +170,9 @@ class TurnResult:
     hand_off: bool
     timings: TurnTimings
     withheld: OutputRule | None
+    phase: Phase
+    patient_id: str | None
+    last_tool: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +257,9 @@ class CallAgent:
         # The texts of the lines released in the turn running, in order.
         self._turn_lines: list[str] = []
         self._filler_said = False
+        # The registered tools, and the last of them that ran for the model in the turn running.
+        self._tool_names = frozenset(tool.name for tool in registry.tools)
+        self._last_tool: str | None = None
         # The history the call record stores: what the model is shown and what is said, and
         # the marker of each turn the model never saw. Never sent to the model.
         self._record: list[dict[str, Any]] = []
@@ -381,6 +389,7 @@ class CallAgent:
         started = self._clock()
         self._turn_lines = []
         self._filler_said = False
+        self._last_tool = None
         decision = guard_input(transcript, self._state)
         timings = TurnTimings(first_token_ms=None, last_token_ms=None, tool_rounds=0)
 
@@ -423,6 +432,9 @@ class CallAgent:
             hand_off=self._hand_off,
             timings=timings,
             withheld=withheld,
+            phase=self._state.phase,
+            patient_id=self._state.patient_id,
+            last_tool=self._last_tool,
         )
 
     async def _model_turn(self, text: str, started: float) -> tuple[OutputRule | None, TurnTimings]:
@@ -600,9 +612,14 @@ class CallAgent:
             if scripted is not None:
                 results.append(_result(call, NOT_RUN, error=True))
                 continue
+            refusals = self._state.tool_refusals
             self._state, outcome = await call_tool(
                 self._state, call.name, call.arguments, self._deps
             )
+            # Only a tool dispatch ran is recorded: never a name the model made up, nor a call
+            # the gate refused, which counted a refusal (whatever code did after it).
+            if call.name in self._tool_names and self._state.tool_refusals == refusals:
+                self._last_tool = call.name
             self._hand_off = self._hand_off or outcome.hand_off
             if outcome.script is not None:
                 scripted = outcome

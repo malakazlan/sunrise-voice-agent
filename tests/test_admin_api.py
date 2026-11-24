@@ -41,8 +41,10 @@ def cid(number: int) -> str:
     return f"{number:012x}4{number:03x}8{number:015x}"
 
 
-# The one call the single-call route reads in these tests.
+# The one call the single-call routes read in these tests.
 CALL_ROUTE = f"/admin/api/calls/{cid(1)}"
+TURNS_ROUTE = f"/admin/api/calls/{cid(1)}/turns"
+LIVE_ROUTE = "/admin/api/calls/live"
 ROUTES = [
     "/admin/api/requests",
     "/admin/api/messages",
@@ -50,6 +52,12 @@ ROUTES = [
     "/admin/api/audit/verify",
     "/admin/api/calls",
     CALL_ROUTE,
+    LIVE_ROUTE,
+    TURNS_ROUTE,
+    "/admin/api/appointments",
+    "/admin/api/slots",
+    "/admin/api/guardrails/summary",
+    "/admin/api/metrics/summary",
 ]
 # Each route's audit action, resource type and resource id, written out by hand.
 ROUTE_EVENTS = {
@@ -59,13 +67,21 @@ ROUTE_EVENTS = {
     "/admin/api/audit/verify": ("admin_verify_audit", "audit_event", None),
     "/admin/api/calls": ("admin_read_calls", "call", None),
     CALL_ROUTE: ("admin_read_call", "call", cid(1)),
+    LIVE_ROUTE: ("admin_read_live_calls", "call", None),
+    TURNS_ROUTE: ("admin_read_call_turns", "call", cid(1)),
+    "/admin/api/appointments": ("admin_read_appointments", "appointment", None),
+    "/admin/api/slots": ("admin_read_slots", "slot", None),
+    "/admin/api/guardrails/summary": ("admin_read_guardrails", "audit_event", None),
+    "/admin/api/metrics/summary": ("admin_read_metrics", "call", None),
 }
 LISTS = {
     "/admin/api/requests": "requests",
     "/admin/api/messages": "messages",
     "/admin/api/audit": "events",
     "/admin/api/calls": "calls",
+    "/admin/api/appointments": "appointments",
 }
+SUMMARIES = ("/admin/api/guardrails/summary", "/admin/api/metrics/summary")
 
 REFUSED_BODY = {"detail": "Sign-in required"}
 REFUSED_CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
@@ -100,6 +116,48 @@ INSERT_CALL = text(
     " VALUES (:id, :call_id, :started_at, :ended_at, true, :verified, :patient_id, 'completed',"
     " :turn_count, :transcript, false, true)"
 )
+
+
+INSERT_APPOINTMENT = text(
+    "INSERT INTO appointments (id, patient_id, doctor, starts_at, reason_short, status)"
+    " VALUES (:id, :patient_id, 'Dr. Patel', :starts_at, :reason, 'scheduled')"
+)
+INSERT_SLOT = text(
+    "INSERT INTO available_slots (id, doctor, starts_at, is_available, source)"
+    " VALUES (:id, 'Dr. Patel', :starts_at, :available, 'generated')"
+)
+INSERT_TURN = text(
+    "INSERT INTO call_turns (call_id, turn, at, phase, verified, patient_id, guard_action,"
+    " last_tool, tool_rounds, vad_ms, stt_ms, first_token_ms, last_token_ms, first_audio_ms,"
+    " total_ms, record_us, dropped_before) VALUES (:call_id, :turn, :at, :phase, :verified,"
+    " :patient_id, :guard_action, :last_tool, :tool_rounds, :vad_ms, :stt_ms, :first_token_ms,"
+    " :last_token_ms, :first_audio_ms, :total_ms, :record_us, :dropped_before)"
+)
+
+
+def insert_turn(connection: Connection, number: int, turn: int, **changes: Any) -> None:
+    """A turn of call `number`: a verified caller's, a tool turn, one minute after T0."""
+    values: dict[str, Any] = {
+        "call_id": cid(number),
+        "turn": turn,
+        "at": T0 + timedelta(minutes=1),
+        "phase": "serving",
+        "verified": True,
+        "patient_id": "P001",
+        "guard_action": "pass",
+        "last_tool": "get_lab_status",
+        "tool_rounds": 1,
+        "vad_ms": 500,
+        "stt_ms": 120,
+        "first_token_ms": 300,
+        "last_token_ms": 900,
+        "first_audio_ms": 1500,
+        "total_ms": 1400,
+        "record_us": 40,
+        "dropped_before": 0,
+    }
+    values.update(changes)
+    connection.execute(INSERT_TURN, values)
 
 
 def insert_call(
@@ -215,8 +273,8 @@ def ssn_sample() -> str:
 
 
 def seed_identifiers(engine: Engine) -> None:
-    """One request, one message and one call holding every kind of identifier the masking
-    hides."""
+    """One request, one message, one call and one appointment holding every kind of identifier
+    the masking hides; a turn of the call, and an open slot."""
     with engine.begin() as connection:
         connection.execute(INSERT_PATIENT)
         connection.execute(
@@ -249,6 +307,19 @@ def seed_identifiers(engine: Engine) -> None:
             "agent: I'll mail jane.doe@example.com and call 555-201-3344.",
             patient_id="P001",
         )
+        connection.execute(
+            INSERT_APPOINTMENT,
+            {
+                "id": 1,
+                "patient_id": "P001",
+                "starts_at": T0 + timedelta(days=1),
+                "reason": f"Follow-up, dob 1985-03-14, ssn {ssn_sample()}, jane.doe@example.com",
+            },
+        )
+        connection.execute(
+            INSERT_SLOT, {"id": 1, "starts_at": T0 + timedelta(days=1), "available": True}
+        )
+        insert_turn(connection, 1, 1)
 
 
 # R1
@@ -281,7 +352,7 @@ def test_admin_requires_credentials(database: StartupSettings) -> None:
             assert response.status_code == 401, (route, name)
             assert response.json() == REFUSED_BODY, (route, name)
             assert response.headers["www-authenticate"] == REFUSED_CHALLENGE, (route, name)
-    assert seen == 78
+    assert seen == 12 * 13
 
 
 # R2
@@ -305,12 +376,13 @@ def test_admin_is_off_without_a_password(
 
 
 # R4
-def test_admin_output_is_masked(
-    admin_app: FastAPI, owner_engine: Engine, database: StartupSettings
-) -> None:
+def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings) -> None:
     seed_identifiers(owner_engine)
     append_events(database, [call_started(1)])
     raw = [ssn_sample(), "1985-03-14", "555-201-3344", "201-3344", "jane.doe@", "3/14/1985"]
+    # The clinic's clock ten minutes after the call started: it is live, and the slot is in
+    # the week from today.
+    admin_app = create_app(admin_settings(database, simulated_now="2026-11-24T15:40:00Z"))
 
     with client_from(admin_app) as client:
         # The audit read asks for call events only, so its answer is the one seeded above and
@@ -391,6 +463,71 @@ def test_admin_output_is_masked(
             }
         ]
     }
+    timings = {
+        "vad_ms": 500,
+        "stt_ms": 120,
+        "first_token_ms": 300,
+        "last_token_ms": 900,
+        "first_audio_ms": 1500,
+        "total_ms": 1400,
+    }
+    assert bodies[LIVE_ROUTE].json() == {
+        "calls": [
+            {
+                "call_id": cid(1),
+                "started_at": "2026-11-24T15:30:00+00:00",
+                "turn": 1,
+                "phase": "serving",
+                "verified": True,
+                "patient_id": "P001",
+                "last_tool": "get_lab_status",
+                **timings,
+            }
+        ]
+    }
+    assert bodies[TURNS_ROUTE].json() == {
+        "turns": [
+            {
+                "turn": 1,
+                "at": "2026-11-24T15:31:00+00:00",
+                "phase": "serving",
+                "verified": True,
+                "patient_id": "P001",
+                "guard_action": "pass",
+                "last_tool": "get_lab_status",
+                "tool_rounds": 1,
+                **timings,
+                "record_us": 40,
+            }
+        ]
+    }
+    # Instants in clinic time, and the appointment's in UTC as well.
+    assert bodies["/admin/api/appointments"].json() == {
+        "appointments": [
+            {
+                "id": 1,
+                "starts_at": "2026-11-25T10:30:00-05:00",
+                "starts_at_utc": "2026-11-25T15:30:00+00:00",
+                "doctor": "Dr. Patel",
+                "patient_id": "P001",
+                "new_patient": False,
+                "reason": "Follow-up, dob ****-**-14, ssn ****, j***@***.com",
+                "status": "scheduled",
+                "booked_by_call": None,
+            }
+        ]
+    }
+    assert bodies["/admin/api/slots"].json() == {
+        "slots": [
+            {
+                "id": 1,
+                "doctor": "Dr. Patel",
+                "starts_at": "2026-11-25T10:30:00-05:00",
+                "available": True,
+            }
+        ],
+        "truncated": False,
+    }
 
 
 # R5
@@ -415,12 +552,17 @@ def test_admin_reads_are_audited(admin_app: FastAPI, owner_engine: Engine) -> No
             response = client.get(f"/admin/api/calls/{missing}", headers=SIGNED_IN)
             assert response.status_code == 404, missing
             assert response.json() == NOT_FOUND_BODY, missing
+        # Nor are the turns of an id that is not a call's.
+        for malformed in missing_ids[1:]:
+            response = client.get(f"/admin/api/calls/{malformed}/turns", headers=SIGNED_IN)
+            assert response.status_code == 404, malformed
+            assert response.json() == NOT_FOUND_BODY, malformed
         assert events(owner_engine) == before
 
         # The chain the reads wrote verifies.
         verified = client.get("/admin/api/audit/verify", headers=SIGNED_IN).json()
-    assert verified == {"ok": True, "checked": 6, "breaks": [], "truncated": False}
-    assert [row[0] for row in events(owner_engine)] == [1, 2, 3, 4, 5, 6, 7]
+    assert verified == {"ok": True, "checked": 12, "breaks": [], "truncated": False}
+    assert [row[0] for row in events(owner_engine)] == list(range(1, 14))
 
 
 # R6
@@ -447,7 +589,10 @@ def test_no_data_without_an_audit_event(admin_app: FastAPI, owner_engine: Engine
 
 
 # R7
-def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
+def test_admin_query_bounds(
+    admin_app: FastAPI, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
     refused_everywhere = [
         "limit=0",
         "limit=101",
@@ -511,14 +656,92 @@ def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
             written += len(allowed)
             assert len(events(owner_engine)) == written, route
 
-        # The verify and single-call routes take no parameters at all.
-        for route in ("/admin/api/audit/verify", CALL_ROUTE):
+        # The verify, single-call and live routes take no parameters at all.
+        for route in ("/admin/api/audit/verify", CALL_ROUTE, LIVE_ROUTE):
             for query in ["limit=1", "before=1", "call_id=" + cid(1), "x=1"]:
                 response = client.get(f"{route}?{query}", headers=SIGNED_IN)
                 assert response.status_code == 422, (route, query)
                 assert response.json() == INVALID_QUERY_BODY, (route, query)
+
+        # The other routes' own parameters: the requests' type, one call's turns after a turn
+        # number, the slots of up to 14 days from a date, and summaries of 1 to 30 days.
+        own = {
+            "/admin/api/requests": (
+                [
+                    "type=nope",
+                    "type=REFILL",
+                    "type=",
+                    "type=refill'",
+                    "type=refill&type=booking",
+                ],
+                ["type=refill", "type=transfer&limit=5&before=7"],
+            ),
+            TURNS_ROUTE: (
+                [
+                    "limit=0",
+                    "limit=101",
+                    "after=0",
+                    "after=-1",
+                    "after=2147483648",
+                    "after=1;",
+                    "after=1&after=2",
+                    "before=1",
+                    "x=1",
+                ],
+                ["limit=1", "after=1", "limit=100&after=2147483647"],
+            ),
+            "/admin/api/slots": (
+                [
+                    "days=0",
+                    "days=15",
+                    "days=-1",
+                    "days=x",
+                    "from=2026-13-01",
+                    "from=2026-11-24T00:00",
+                    "from=1764000000",
+                    "from=24/11/2026",
+                    "from=",
+                    "from=2026-11-24&from=2026-11-25",
+                    "to=2026-11-30",
+                    "limit=1",
+                    # From 2000-01-01 to 2100-12-31 only: a date past them is refused here,
+                    # never read.
+                    "from=1999-12-31",
+                    "from=2101-01-01",
+                    "from=9999-12-31",
+                    "from=9999-12-31&days=14",
+                ],
+                [
+                    "from=2026-11-24",
+                    "days=14",
+                    "days=1&from=2026-02-28",
+                    "from=2000-01-01",
+                    "from=2100-12-31&days=14",
+                ],
+            ),
+            **{
+                route: (
+                    ["days=0", "days=31", "days=-1", "days=x", "days=7&days=8", "limit=1"],
+                    ["days=1", "days=30"],
+                )
+                for route in SUMMARIES
+            },
+        }
+        for route, (refused, allowed) in own.items():
+            for query in refused:
+                response = client.get(f"{route}?{query}", headers=SIGNED_IN)
+                assert response.status_code == 422, (route, query)
+                assert response.json() == INVALID_QUERY_BODY, (route, query)
+            assert len(events(owner_engine)) == written, route
+            for query in allowed:
+                response = client.get(f"{route}?{query}", headers=SIGNED_IN)
+                assert response.status_code == 200, (route, query)
+            written += len(allowed)
+            assert len(events(owner_engine)) == written, route
     assert len(events(owner_engine)) == written
-    assert written == 4 + 4 + 7 + 4
+    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 5 + 2 + 2
+    # No read failed: every refused value was refused before the database was asked.
+    assert "admin_read_failed" not in caplog.text
 
 
 def test_audit_reader_refuses_unvalidated_filters() -> None:
@@ -545,7 +768,18 @@ def test_audit_reader_refuses_unvalidated_filters() -> None:
 # R8
 def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: StartupSettings) -> None:
     with owner_engine.begin() as connection:
+        connection.execute(INSERT_PATIENT)
         for number in range(1, 121):
+            connection.execute(
+                INSERT_APPOINTMENT,
+                {
+                    "id": number,
+                    "patient_id": "P001",
+                    "starts_at": T0 + timedelta(hours=number),
+                    "reason": None,
+                },
+            )
+            insert_turn(connection, 1, number)
             at = T0 + timedelta(minutes=number)
             connection.execute(
                 INSERT_REQUEST,
@@ -578,6 +812,7 @@ def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: Startu
             ("/admin/api/requests", "id", ""),
             ("/admin/api/messages", "id", ""),
             ("/admin/api/calls", "id", ""),
+            ("/admin/api/appointments", "id", ""),
             # Only the events appended above; the reads add their own as they go.
             ("/admin/api/audit", "seq", "&action=call_started"),
         ):
@@ -597,6 +832,20 @@ def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: Startu
                 query = f"limit=50&before={rows[-1][key]}{extra}"
             assert sizes == [50, 50, 20, 0], route
             assert seen == list(range(120, 0, -1)), route
+
+        # A call's turns come in order, a page at a time after the last turn seen.
+        turns: list[int] = []
+        sizes = []
+        query = "limit=50"
+        for _ in range(5):
+            rows = client.get(f"{TURNS_ROUTE}?{query}", headers=SIGNED_IN).json()["turns"]
+            sizes.append(len(rows))
+            if not rows:
+                break
+            turns += [row["turn"] for row in rows]
+            query = f"limit=50&after={rows[-1]['turn']}"
+        assert sizes == [50, 50, 20, 0]
+        assert turns == list(range(1, 121))
 
 
 # R9
@@ -783,6 +1032,11 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
         assert client.get("/admin/api/requests", headers=SIGNED_IN).json() == {"requests": []}
         assert client.get("/admin/api/messages", headers=SIGNED_IN).json() == {"messages": []}
         assert client.get("/admin/api/calls", headers=SIGNED_IN).json() == {"calls": []}
+        assert client.get("/admin/api/appointments", headers=SIGNED_IN).json() == {
+            "appointments": []
+        }
+        assert client.get(LIVE_ROUTE, headers=SIGNED_IN).json() == {"calls": []}
+        assert client.get(TURNS_ROUTE, headers=SIGNED_IN).json() == {"turns": []}
         # Past the oldest row: nothing.
         seed_identifiers(owner_engine)
         assert client.get("/admin/api/requests?before=1", headers=SIGNED_IN).json() == {
@@ -792,6 +1046,9 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
         admin_event("/admin/api/requests"),
         admin_event("/admin/api/messages"),
         admin_event("/admin/api/calls"),
+        admin_event("/admin/api/appointments"),
+        admin_event(LIVE_ROUTE),
+        admin_event(TURNS_ROUTE),
         admin_event("/admin/api/requests"),
     ]
 
@@ -806,9 +1063,10 @@ def test_admin_database_down(database: StartupSettings, caplog: pytest.LogCaptur
             assert response.json() == UNAVAILABLE_BODY, route
         # An id that is not a call id is refused before the database is asked.
         for malformed in (cid(0xABC).upper(), "not-a-call", cid(1) + "0"):
-            response = client.get(f"/admin/api/calls/{malformed}", headers=SIGNED_IN)
-            assert response.status_code == 404, malformed
-            assert response.json() == NOT_FOUND_BODY, malformed
+            for path in (f"/admin/api/calls/{malformed}", f"/admin/api/calls/{malformed}/turns"):
+                response = client.get(path, headers=SIGNED_IN)
+                assert response.status_code == 404, path
+                assert response.json() == NOT_FOUND_BODY, path
     assert [r.getMessage() for r in caplog.records if r.name == "app.api.admin"] == [
         f"admin_read_failed action={ROUTE_EVENTS[route][0]} error=OperationalError"
         for route in ROUTES

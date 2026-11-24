@@ -639,6 +639,7 @@ def test_a_membership_another_role_granted_stops_the_setup(
         "; sequence appointments_id_seq: SELECT not declared"
         "; sequence available_slots_id_seq: SELECT not declared"
         "; sequence call_sessions_id_seq: SELECT not declared"
+        "; sequence call_turns_id_seq: SELECT not declared"
         "; sequence medications_id_seq: SELECT not declared"
         "; sequence messages_id_seq: SELECT not declared"
         "; sequence requests_id_seq: SELECT not declared"

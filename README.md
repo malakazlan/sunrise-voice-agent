@@ -866,6 +866,76 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
     number written another way (spelled out without a cue, for example) is shown as written.
   - A read event records which list was read, not which rows.
 
+### Console data: turn timings and the console's reads
+
+Each caller turn leaves one row of `call_turns`: the call id, the turn number, the time (the
+call's clock, as the audit log's), the phase after the turn, whether the caller was verified and
+the patient id, the input guard's action, the last tool that ran for the model in the turn,
+the tool rounds, and the timings in milliseconds the pipeline already sends the page and logs as
+`turn_measured` (silence wait, transcript, first token, last token, total) with the reply's first
+audio. Only ids, registry names, booleans and numbers; every text column is held by a CHECK to
+an id's shape or a registry's names. The runtime role may insert and read it, nothing more.
+
+- Never on the call's time: the voice adapter hands the row to `TurnRecorder.put`
+  (`app/agent/turn_record.py`), a plain function that puts it on an in-memory queue of 1,000
+  rows and returns; one background task writes the queue in batches of up to 100 rows, each
+  insert given up after 2 seconds. A full queue drops the row; a failed batch drops its rows;
+  both are counted and logged (`call_turn_dropped`, `call_turns_write_failed`), never raised
+  into the call. Measured on the development machine: building and handing over a row takes a
+  median of 6 µs (99th percentile 40 µs, worst of 5,000 130 µs); each row stores the cost of
+  its own hand-over as `record_us`.
+- The first audio usually comes after the turn's result, so the row waits for it in the
+  adapter: it goes when the turn's first line starts playing, or without a first audio when
+  that line is over unheard, when the next turn is reported, or when the call ends; a turn
+  with no line goes at once.
+- At shutdown the app waits for the queue to be written (`TurnRecorder.drain()`), at most 5
+  seconds; a process killed outright loses what was queued.
+
+The admin API (above) has these read routes for the console, under the same rules: sign-in,
+`no-store`, masked output, unknown or repeated parameters refused, one audit event per
+successful read in the read's transaction and nothing without it. The reads are in
+`app/audit/console.py`; days are the clinic's, and "now" is the clinic's clock (simulated in dev
+and demo when set).
+
+| Route (all `GET`) | Returns | Audit action |
+|---|---|---|
+| `/admin/api/calls/live` | `{"calls": [...]}`: call_id, started_at, and the latest turn's turn, phase, verified, patient_id, last_tool and timings (null before the first turn); newest first, at most 100 | `admin_read_live_calls` |
+| `/admin/api/calls/{call_id}/turns` | `{"turns": [...]}`: the call's turns in order; `limit` 1 to 100, `after=<turn>` for the next page | `admin_read_call_turns` |
+| `/admin/api/appointments` | `{"appointments": [...]}`: id, starts_at (clinic time), starts_at_utc, doctor, patient_id, new_patient, reason (masked), status, booked_by_call; newest first, paged as the lists above | `admin_read_appointments` |
+| `/admin/api/slots?from=&days=` | `{"slots": [...], "truncated"}`: id, doctor, starts_at (clinic time), available; `days` 1 to 14 (default 7) from `from` (`YYYY-MM-DD` from 2000-01-01 to 2100-12-31, default today), at most 1,000 slots | `admin_read_slots` |
+| `/admin/api/requests?type=` | the requests of one type (`refill`, `doctor_message`, `booking`, `callback`, `transfer`) | `admin_read_requests` |
+| `/admin/api/guardrails/summary?days=` | `{"days", "since", "counts": [...]}`: per clinic day, action and reason, the count of `guard_block`, `emergency_detected`, `tool_refused`, `identity_locked` and `identity_refused` events; `days` 1 to 30 (default 7), today included | `admin_read_guardrails` |
+| `/admin/api/metrics/summary?days=` | `{"days", "since", "calls_per_day", "ended", "verified_calls", "verification_attempts", "verification_successes", "latency", "record_us_turns", "record_us_p50", "turn_rows_dropped"}`; `latency` holds, for each kind of turn (`scripted`: the model not asked; `tool`: a tool round; `plain`: the rest) and each stage, the turns, the values, and the median and 95th percentile | `admin_read_metrics` |
+
+- Percentiles are Postgres's `percentile_cont`, rounded to whole milliseconds. A kind of turn
+  with fewer than 20 values of a stage gets the count and nulls, never a figure.
+- Indexes: `audit_events (action, ts)`, `call_turns (at)`, `verification_attempts (created_at)`;
+  each summary reads a window of days through them. The two heaviest, measured on 300,000
+  events and 200,000 turns over 60 days, for 7 days: the latency figures (an index scan of
+  `ix_call_turns_at`, 22,000 turns, 23 ms) and the guardrail counts (a bitmap scan of
+  `ix_audit_events_action_ts`, 11,000 events, 16 ms). Both grow with the days asked for.
+- An appointment names the call that booked it when that is known: a booking writes the
+  appointment and its request in one transaction, so both carry its time; exactly one call's
+  booking request for the patient at that time names it. Seeded appointments have none.
+- Limits:
+  - Live calls are derived from recorded events, not asked of the voice process: a call appears
+    once its `call_started` event is written and leaves once its `call_ended` event is. A process
+    that dies mid-call leaves its calls "live" until the window has passed: 15 minutes plus
+    `MAX_CALL_SECONDS` after they started.
+  - Timing rows can be dropped under load (a full queue or a failed write). The count of rows
+    dropped is carried on the next row written, and the metrics show the latest row's: during
+    a database outage it shows only after the next successful write, and it is per process
+    (the rows dropped since that voice process started; a restart counts from zero).
+  - With a test clock set (`SIMULATED_NOW`) every event has the same time, so a call whose end
+    was never recorded stays "live" and all calls fall on one day. Development and demo only.
+  - A turn cut off by a hang-up or by an emergency heard outside the turn has no row.
+    `last_tool` is the last tool that ran for the model in that turn: never a name it made up
+    nor a call the gate refused (those are in the audit log as `tool_refused`).
+  - At shutdown the app waits at most 5 seconds for the queued rows; what is left is dropped,
+    counted and logged (`call_turns_dropped_at_shutdown`).
+  - The summaries count events and rows, not their causes: a guard block's reason is its rule
+    name, nothing of what was said.
+
 ### Output guard
 
 Every sentence of the model's own answer is checked in code before it is returned

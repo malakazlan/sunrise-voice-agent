@@ -41,10 +41,11 @@ from app.agent.state import IdentityClaim, Phase, claim, move, new_call
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import CallAgent, Line, Speak, TurnResult, TurnTimings
+from app.agent.turn_record import TurnRecorder
 from app.audit.log import Reason
 from app.config import Settings
 from app.db.seed import load_seed_data
-from app.db.session import create_database_engine
+from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
 from app.guard.output import OutputRule
 from app.main import create_app
@@ -249,6 +250,9 @@ class Withheld:
             hand_off=False,
             timings=TurnTimings(first_token_ms=1, last_token_ms=2, tool_rounds=0),
             withheld=OutputRule.MEDICAL_ADVICE,
+            phase=Phase.SERVING,
+            patient_id="P001",
+            last_tool=None,
         )
 
     async def prompt(self, script: ScriptId, speak: Speak) -> Line:
@@ -498,6 +502,7 @@ def test_call_that_never_connects_ends_itself() -> None:
                 connect_timeout=0.5,
                 speech_to_text=no_vendor,
                 text_to_speech=no_speech_out,
+                turns=TurnRecorder(create_session_factory(engine), lambda: T0),
             )
             # asyncio.wait, not wait_for: Pipecat's runner swallows cancellation, so a
             # cancelled run() would look like one that ended by itself.
