@@ -146,8 +146,9 @@ any step stops the container. The database is not published to the host.
 the variable, if `APP_ENV` or a database credential is missing. Each container receives only
 its own variables: the database its three credentials, the app its settings, coturn
 `TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn checks those three by the
-same rules as the app and stops at start-up, naming the variable, if one is missing or not
-valid, so the whole stack needs the TURN values set. coturn uses host networking, which needs a
+same rules as the app and stops at start-up, naming the variable, if `TURN_HOST` or
+`TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty
+`MAX_CONCURRENT_CALLS` means 3, as in the app. So the whole stack needs the TURN values set. coturn uses host networking, which needs a
 Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49359. The app is
 published on `127.0.0.1:8000` only.
 

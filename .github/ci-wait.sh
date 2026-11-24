@@ -30,19 +30,24 @@ bounded_run() {
   return "$code"
 }
 
-# wait_for_status SECONDS URL STATUS WHAT: poll URL once a second until it answers STATUS.
+# wait_for_status SECONDS URL STATUS WHAT: poll URL about once a second until it answers
+# STATUS, for at most SECONDS of wall-clock time: no request runs past the deadline.
 wait_for_status() {
   seconds=$1
   url=$2
   expected=$3
   what=$4
   status=000
-  for _ in $(seq 1 "$seconds"); do
-    status=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$url" || true)
+  deadline=$(($(date +%s) + seconds))
+  while :; do
+    left=$((deadline - $(date +%s)))
+    [ "$left" -gt 0 ] || break
+    status=$(curl -s -m "$((left < 5 ? left : 5))" -o /dev/null -w '%{http_code}' "$url" || true)
     if [ "$status" = "$expected" ]; then
       echo "GET $url -> $status"
       return 0
     fi
+    [ $((deadline - $(date +%s))) -gt 0 ] || break
     sleep 1
   done
   echo "gave up after ${seconds}s waiting for $what (GET $url -> $status)" >&2
