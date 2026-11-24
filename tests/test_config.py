@@ -34,6 +34,7 @@ APPLICATION_FIELDS = {
     "app_db_user",
     "app_db_password",
     "audit_hmac_key",
+    "identity_hash_key",
     "simulated_now",
     "max_concurrent_calls",
     "max_call_seconds",
@@ -400,6 +401,7 @@ def test_missing_database_settings_are_rejected(monkeypatch: pytest.MonkeyPatch)
         ("missing", ("app_db_password",)),
         ("missing", ("app_db_user",)),
         ("missing", ("audit_hmac_key",)),
+        ("missing", ("identity_hash_key",)),
         ("missing", ("postgres_db",)),
         ("missing", ("postgres_host",)),
     ]
@@ -829,6 +831,7 @@ TEN_DISTINCT = "abcdefghij" * 4
         ("DEMO_ACCESS_TOKEN", Settings),
         ("TURN_SHARED_SECRET", Settings),
         ("AUDIT_HMAC_KEY", Settings),
+        ("IDENTITY_HASH_KEY", Settings),
     ],
 )
 def test_secrets_need_ten_distinct_characters_outside_dev(
@@ -993,30 +996,31 @@ def test_runtime_database_identity_rules(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.usefixtures("offline_env")
-def test_audit_key_rules(monkeypatch: pytest.MonkeyPatch) -> None:
-    placeholder = example_value("AUDIT_HMAC_KEY")
+@pytest.mark.parametrize("name", ["AUDIT_HMAC_KEY", "IDENTITY_HASH_KEY"])
+def test_hmac_key_rules(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    placeholder = example_value(name)
     # The placeholder is long enough to pass the length rule, so only its own check stops it.
     assert len(placeholder) >= 32
 
     # Required in every environment; an empty value is no key.
     for app_env in ("dev", "demo", "prod"):
         monkeypatch.setenv("APP_ENV", app_env)
-        monkeypatch.delenv("AUDIT_HMAC_KEY")
+        monkeypatch.delenv(name)
         with pytest.raises(ValidationError) as missing:
             Settings(_env_file=None)
         assert [(error["type"], error["loc"]) for error in missing.value.errors()] == [
-            ("missing", ("audit_hmac_key",))
+            ("missing", (name.lower(),))
         ]
 
-        monkeypatch.setenv("AUDIT_HMAC_KEY", "")
+        monkeypatch.setenv(name, "")
         with pytest.raises(ValidationError) as empty:
             Settings(_env_file=None)
-        assert [error["loc"] for error in empty.value.errors()] == [("audit_hmac_key",)]
+        assert [error["loc"] for error in empty.value.errors()] == [(name.lower(),)]
 
         # Passed directly, an empty key reaches the validator itself.
         with pytest.raises(ValidationError, match="must not be empty") as empty_argument:
-            Settings(_env_file=None, audit_hmac_key="")
-        assert [error["loc"] for error in empty_argument.value.errors()] == [("audit_hmac_key",)]
+            Settings.model_validate({"_env_file": None, name.lower(): ""})
+        assert [error["loc"] for error in empty_argument.value.errors()] == [(name.lower(),)]
 
     thirty_one = "boundary-audit-key-" + "x" * 12
     thirty_two = thirty_one + "y"
@@ -1031,12 +1035,12 @@ def test_audit_key_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     for app_env, key in refused:
         monkeypatch.setenv("APP_ENV", app_env)
-        monkeypatch.setenv("AUDIT_HMAC_KEY", key)
+        monkeypatch.setenv(name, key)
 
         with pytest.raises(ValidationError) as excinfo:
             Settings(_env_file=None)
 
-        assert [error["loc"] for error in excinfo.value.errors()] == [("audit_hmac_key",)]
+        assert [error["loc"] for error in excinfo.value.errors()] == [(name.lower(),)]
         assert key not in str(excinfo.value), (app_env, key)
 
     accepted = [
@@ -1048,18 +1052,18 @@ def test_audit_key_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     for app_env, key in accepted:
         monkeypatch.setenv("APP_ENV", app_env)
-        monkeypatch.setenv("AUDIT_HMAC_KEY", key)
+        monkeypatch.setenv(name, key)
 
         settings = Settings(_env_file=None)
 
-        assert settings.audit_hmac_key.get_secret_value() == key
+        assert getattr(settings, name.lower()).get_secret_value() == key
         if len(key) > 1:
             for rendered in (repr(settings), str(settings), repr(settings.model_dump())):
                 assert key not in rendered
 
     # A rejected setting next to a valid key does not echo the key either.
     monkeypatch.setenv("APP_ENV", "prod")
-    monkeypatch.setenv("AUDIT_HMAC_KEY", thirty_two)
+    monkeypatch.setenv(name, thirty_two)
     monkeypatch.setenv("LOG_LEVEL", "TRACE")
     with pytest.raises(ValidationError) as other:
         Settings(_env_file=None)
