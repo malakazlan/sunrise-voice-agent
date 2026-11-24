@@ -46,6 +46,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AUDIT_TEXT_PATTERN, AuditEvent
+from app.db.session import in_database_transaction
 
 CANONICAL_VERSION = "sunrise-audit-v1"
 ZERO_MAC = "0" * 64
@@ -225,7 +226,8 @@ class AuditLog:
         """Add `event` at the instant `now` inside the caller's open transaction and return
         its seq. Does not commit. If the event cannot be written, the caller's whole
         transaction is rolled back before the error is raised, so the action it records can
-        never commit without it, however the caller handles the error.
+        never commit without it, however the caller handles the error. A session in
+        autocommit mode is refused before anything is written.
         """
         if not isinstance(now, datetime):
             raise TypeError("now must be a datetime")
@@ -233,6 +235,11 @@ class AuditLog:
             raise ValueError("now must carry a time zone")
         try:
             await session.execute(select(func.pg_advisory_xact_lock(CHAIN_LOCK)))
+            if not await in_database_transaction(session):
+                raise RuntimeError(
+                    "append needs a database transaction to roll back; the session is in"
+                    " autocommit mode"
+                )
             head = await _chain_head(session)
             seq, prev_mac = (1, ZERO_MAC) if head is None else (head[0] + 1, head[1])
             row = ChainRow(

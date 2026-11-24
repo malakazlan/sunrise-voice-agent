@@ -3,7 +3,7 @@
 from typing import Any
 
 from psycopg import Error as DriverError
-from psycopg.pq import DiagnosticField
+from psycopg.pq import DiagnosticField, TransactionStatus
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import ExceptionContext
 from sqlalchemy.exc import DBAPIError, StatementError
@@ -146,3 +146,16 @@ def create_sync_engine(settings: Settings, **options: Any) -> Engine:
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def in_database_transaction(session: AsyncSession) -> bool:
+    """Whether the session's connection is inside a database transaction, as the server said
+    in its reply to the last statement (libpq keeps that status; no query is sent).
+
+    SQLAlchemy cannot answer this: its session and connection report a transaction in
+    autocommit mode too, because there the begin is only logical, and its isolation level
+    query never reports autocommit. Only meaningful after a statement on this transaction.
+    """
+    raw = await (await session.connection()).get_raw_connection()
+    driver = raw.driver_connection
+    return driver is not None and driver.info.transaction_status == TransactionStatus.INTRANS

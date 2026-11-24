@@ -569,6 +569,33 @@ async def test_event_rolls_back_with_the_action(audit: AuditLog, session: AsyncS
     assert await verified(audit, session) == intact(1)
 
 
+async def test_append_refuses_a_session_outside_a_transaction(
+    audit: AuditLog, database: Settings, sync_engine: Engine
+) -> None:
+    # In autocommit every statement commits on its own: the lock would end at once and the
+    # event could not roll back with its action. Set on the engine and on one connection.
+    engine = create_database_engine(database)
+    try:
+        autocommit_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with create_session_factory(autocommit_engine)() as session:
+            with pytest.raises(RuntimeError, match="transaction"):
+                await audit.append(session, call_started(), now=T0)
+
+        async with create_session_factory(engine)() as session:
+            await session.connection(execution_options={"isolation_level": "AUTOCOMMIT"})
+            with pytest.raises(RuntimeError, match="transaction"):
+                await audit.append(session, call_started(), now=T0)
+
+        # The same engine without autocommit appends as usual.
+        async with create_session_factory(engine)() as session:
+            assert await append_all(audit, session, [call_started()]) == [1]
+    finally:
+        await engine.dispose()
+
+    with sync_engine.connect() as connection:
+        assert connection.execute(COUNT).scalar_one() == 1
+
+
 def unwritable_event() -> Event:
     """An event the database refuses: free text forced past the API's own check."""
     item = call_started()
