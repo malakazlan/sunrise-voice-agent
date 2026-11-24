@@ -29,6 +29,22 @@ def _outside_dev(info: ValidationInfo) -> bool:
     return info.data.get("app_env") in ("demo", "prod")
 
 
+# Every secret setting, outside dev, on top of its own length and character rules. The same
+# count is checked for TURN_SHARED_SECRET by coturn's entrypoint (deploy/coturn/entrypoint.sh).
+MIN_DISTINCT_SECRET_CHARACTERS = 10
+
+
+def _check_strong_secret(name: str, value: SecretStr, info: ValidationInfo) -> None:
+    if not _outside_dev(info):
+        return
+    secret = value.get_secret_value()
+    if secret != secret.strip() or len(set(secret)) < MIN_DISTINCT_SECRET_CHARACTERS:
+        raise ValueError(
+            f"outside dev {name} must not start or end with whitespace and needs at least"
+            f" {MIN_DISTINCT_SECRET_CHARACTERS} different characters"
+        )
+
+
 # SIMULATED_NOW: a date and a time, never a bare number or a date alone.
 ISO_DATE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}"
@@ -109,6 +125,7 @@ class Settings(BaseSettings):
                 f"outside dev the password needs at least {MIN_PASSWORD_LENGTH} characters"
                 " and must not be the .env.example placeholder"
             )
+        _check_strong_secret("postgres_password", value, info)
         return value
 
     @field_validator("audit_hmac_key")
@@ -126,6 +143,7 @@ class Settings(BaseSettings):
                 f"outside dev the audit key needs at least {MIN_AUDIT_KEY_LENGTH} characters"
                 " and must not be the .env.example placeholder"
             )
+        _check_strong_secret("audit_hmac_key", value, info)
         return value
 
     @field_validator("max_concurrent_calls", mode="before")
@@ -145,6 +163,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "turn_shared_secret may contain only letters, digits and . _ ~ + / = -"
             )
+        if value is not None:
+            _check_strong_secret("turn_shared_secret", value, info)
         return value
 
     @field_validator("turn_host")
@@ -166,6 +186,8 @@ class Settings(BaseSettings):
                 raise ValueError("demo_access_token is required unless app_env is dev")
             if info.data.get("turn_shared_secret") is not None:
                 raise ValueError("demo_access_token is required when TURN is configured")
+        else:
+            _check_strong_secret("demo_access_token", value, info)
         return value
 
     @property

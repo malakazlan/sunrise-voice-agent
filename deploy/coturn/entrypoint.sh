@@ -23,6 +23,10 @@ case "$secret" in
   '' | *[!A-Za-z0-9._~+/=-]*) refuse TURN_SHARED_SECRET ;;
 esac
 [ "${#secret}" -ge 32 ] || refuse TURN_SHARED_SECRET
+# At least 10 different characters, as the app requires outside dev; the character rule above
+# already keeps out whitespace. One character per line, counted once each in the C locale.
+distinct=$(printf '%s' "$secret" | fold -w1 | LC_ALL=C sort -u | wc -l | tr -d ' ')
+[ "$distinct" -ge 10 ] || refuse TURN_SHARED_SECRET
 
 # Empty means the app's default, 3. Digits only; leading zeros are dropped, as the app does.
 calls=${MAX_CONCURRENT_CALLS:-3}

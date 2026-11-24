@@ -553,6 +553,41 @@ def test_app_and_coturn_accept_the_same_values(
             assert case["value"] not in str(excinfo.value)
 
 
+# Long enough and of allowed characters for every secret, so only the shared rule decides.
+NINE_DISTINCT = "abcdefghi" * 4
+TEN_DISTINCT = "abcdefghij" * 4
+
+
+@pytest.mark.usefixtures("offline_env")
+@pytest.mark.parametrize(
+    "name", ["POSTGRES_PASSWORD", "DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET", "AUDIT_HMAC_KEY"]
+)
+def test_secrets_need_ten_distinct_characters_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    assert (len(set(NINE_DISTINCT)), len(set(TEN_DISTINCT))) == (9, 10)
+    padded = [" " + TEN_DISTINCT, TEN_DISTINCT + " ", TEN_DISTINCT + "\n"]
+    refused = [NINE_DISTINCT, "ab" * 20, *padded]
+    for app_env in ("demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for value in refused:
+            monkeypatch.setenv(name, value)
+
+            with pytest.raises(ValidationError) as excinfo:
+                Settings(_env_file=None)
+
+            assert [error["loc"] for error in excinfo.value.errors()] == [(name.lower(),)], value
+            assert value.strip() not in str(excinfo.value)
+
+        monkeypatch.setenv(name, TEN_DISTINCT)
+        assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == TEN_DISTINCT
+
+    # In dev the shared rule does not apply; each setting's own rules still do.
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv(name, NINE_DISTINCT)
+    assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == NINE_DISTINCT
+
+
 @pytest.mark.usefixtures("offline_env")
 def test_audit_key_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     placeholder = example_value("AUDIT_HMAC_KEY")

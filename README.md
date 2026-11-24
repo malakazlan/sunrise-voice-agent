@@ -76,8 +76,9 @@ All data used by this project is synthetic. No real customer or personal data is
     at most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
   - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
     previous MAC and the event's canonical form, which is documented in the module.
-    `AuditLog(key).verify(session)` walks the whole chain in batches and reports every
-    break (the first 100, and whether there were more): an edited event, a removed or
+    `AuditLog(key).verify(session)` walks the whole chain in batches. Its result's
+    `checked` is the number of events it read, good or broken; `breaks` lists every break
+    (the first 100, and `truncated` says whether there were more): an edited event, a removed or
     duplicated one, a reordering, a forged event, the wrong key, or a stored value it cannot
     read. After a break it goes on from that row's stored MAC, so later tampering is still
     found. It never raises because of what is stored.
@@ -86,7 +87,11 @@ All data used by this project is synthetic. No real customer or personal data is
     the next position without the key; `verify` reports it as one break and checks the
     genuine events after it. The MAC does not bind a chain to one database, so every
     database gets its own `AUDIT_HMAC_KEY`: a chain copied from another database under the
-    same key is not detected.
+    same key is not detected. An appointment, medication or slot id is any number of up to 8
+    digits, so it cannot be told apart from a date written without hyphens (`20261124`).
+    Whoever can change the table's definition can add a rule that sends inserts to another
+    table while still answering with the event's seq; `append` then believes the event was
+    stored, and the chain cannot show it (like the removal of the newest events).
   - What the database enforces: triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on
     `audit_events`, and any `INSERT` out of chain position, for ordinary statements from
     every role, superusers included. Whoever owns the table, or a superuser, can still
@@ -160,6 +165,12 @@ database credentials.
 
 Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
 placeholder from `.env.example`; startup stops otherwise.
+
+Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `DEMO_ACCESS_TOKEN`,
+`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`) must also not start or end with whitespace and must
+contain at least 10 different characters, on top of its own rules. coturn's entrypoint
+refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
+of environment, so it applies the rule in dev as well.
 
 `AUDIT_HMAC_KEY` must be set and not empty in every environment. Unless `APP_ENV=dev` it must
 be at least 32 characters and must not be the placeholder from `.env.example`. Keep it outside
