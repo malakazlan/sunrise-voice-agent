@@ -392,6 +392,15 @@ def test_nine_digit_runs_are_ssns() -> None:
             (given, masker(given)) for given, expected in NINE_IN_A_RUN if masker(given) != expected
         ] == [], masker.__name__
         assert [given for given in NOT_NINE if masker(given) != given] == [], masker.__name__
+    # A line that masking makes longer than the limit is cut again; a run the cut would split
+    # goes with it, so a run cut down to nine digits is never left to be masked the next time.
+    grown = (SSN_PLAIN + " ") * 829 + "x" * 26 + " " + " ".join("1234567891234567")
+    assert len(grown) < 10_000
+    assert mask(grown).endswith(" [cut]")
+    assert mask(mask(grown)) == mask(grown)
+    # The run goes; the space before it stays, then the marker.
+    assert mask(grown).endswith("x" * 26 + "  [cut]")
+
     # A ten- or eleven-digit number is not an SSN: the message masker keeps it.
     for phone in (
         " ".join(["555", "201", "3344"]),

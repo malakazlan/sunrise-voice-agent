@@ -4,10 +4,10 @@ Text is masked line by line, each line in one pass of one pattern and then one p
 runs of digits and number words, masking any run that reads as exactly nine digits as an SSN;
 so the time taken grows with the length of the text: every alternative starts only where its
 lookbehind allows and has only bounded repeats, or possessive ones over a run that is scanned
-once. Masking is idempotent by construction: no alternative and no nine-digit run can consume a
-"*", start just after "*", "*-" or "*.", or end just before "*" or a letter or digit, so
-nothing a replacement writes or keeps can be part of a new match. Digits of any script count
-as digits; words and separators are matched in ASCII.
+once. Masking is idempotent by construction: no alternative can consume a "*", start just after "*",
+"*-" or "*.", or end just before "*" or a letter or digit, so nothing a replacement writes or
+keeps can be part of a new match; a nine-digit run is replaced by text with no digit. Digits
+of any script count as digits; words and separators are matched in ASCII.
 """
 
 import re
@@ -141,9 +141,14 @@ def _mask_line(line: str) -> str:
     masked = _mask_nine(_IDENTIFIER.sub(_replace, line))
     if len(masked) <= MAX_LENGTH:
         return masked
-    # Masking made the line longer. It is cut again, before any run of letters or digits that
-    # the cut would split, so that no match can end at the cut.
+    # Masking made the line longer. It is cut again, before any run of digits and number words
+    # and any run of letters or digits that the cut would split, so that no match can end at
+    # the cut and no run is left shorter than it was read.
     end = MAX_LENGTH - len(CUT_MARKER)
+    for run in _runs(masked):
+        if run[0].start < end < run[-1].end:
+            end = run[0].start
+            break
     while end and masked[end - 1].isalnum():
         end -= 1
     return masked[:end] + CUT_MARKER
@@ -366,21 +371,17 @@ def _replaced(line: str, spans: list[tuple[int, int, str]]) -> str:
 
 
 def _ssn_run_may_start(line: str, start: int) -> bool:
-    before = line[start - 1] if start else ""
-    after_mask = start >= 2 and line[start - 2] == "*" and before in "-."
-    return not (before.isalnum() or before == "*" or after_mask)
+    return not (start and line[start - 1].isalnum())
 
 
 def _ssn_run_may_end(line: str, end: int) -> bool:
-    after = line[end] if end < len(line) else ""
-    at_cut = end == len(line) - len(CUT_MARKER) and line.endswith(CUT_MARKER)
-    return not (after.isalnum() or after == "*" or at_cut)
+    return not (end < len(line) and line[end].isalnum())
 
 
 def _mask_nine(line: str) -> str:
     """The line with every run that reads as exactly nine digits masked as an SSN. A run that
-    starts or ends inside letters or digits, or next to masked output or the cut marker, is
-    left: so masking stays idempotent."""
+    starts or ends inside letters or digits is part of an id and is left. What it writes holds
+    no digit, and a run it leaves reads the same the next time, so masking stays idempotent."""
     spans = []
     for run in _runs(line):
         for group in _groups(run):
