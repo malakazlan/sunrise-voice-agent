@@ -89,6 +89,8 @@ services:
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
       TURN_HOST: ${TURN_HOST:-}
       DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     depends_on:
       startup:
         condition: service_completed_successfully
