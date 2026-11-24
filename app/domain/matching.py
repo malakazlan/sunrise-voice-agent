@@ -8,6 +8,7 @@ caller's own medication list.
 import re
 import unicodedata
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 import jellyfish
@@ -20,7 +21,8 @@ APOSTROPHES = str.maketrans("", "", "'’")
 LATIN_WORDS = re.compile(r"[a-z]+")
 # A letter (a word character that is not a digit or underscore) outside a-z.
 NON_LATIN_LETTER = re.compile(r"[^\W\d_a-z]")
-TITLES_AND_SUFFIXES = frozenset({"dr", "mr", "mrs", "ms", "miss", "jr", "sr", "ii", "iii", "iv"})
+TITLES = frozenset({"dr", "mr", "mrs", "ms", "miss"})
+SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv"})
 
 # A hyphen or slash between two letters or digits, at least one of them a digit, joins them:
 # "b-12" is "b12", "70/30" is "7030".
@@ -71,12 +73,21 @@ class NamedRecord(Protocol):
     def last_name(self) -> str: ...
 
 
-def normalize_name(full_name: str) -> tuple[str, ...] | None:
-    """The name's tokens once titles and suffixes are dropped; None if none are left.
+@dataclass(frozen=True)
+class NormalizedName:
+    """A name's tokens without titles and suffixes, and the one suffix it carries, if any."""
+
+    tokens: tuple[str, ...]
+    suffix: str | None
+
+
+def normalize_name(full_name: str) -> NormalizedName | None:
+    """The name's tokens and suffix; None if it is not a name.
 
     Lower-cased, accents folded, apostrophes removed ("O'Brien" is one token), anything else
-    outside a-z ends a token. More than MAX_NAME_LENGTH characters, or a letter that does not
-    fold to a-z, is not a name.
+    outside a-z ends a token. Titles are dropped; a suffix is set apart. More than
+    MAX_NAME_LENGTH characters, a letter that does not fold to a-z, two different suffixes,
+    or no tokens left, is not a name.
     """
     if len(full_name) > MAX_NAME_LENGTH:
         return None
@@ -85,18 +96,20 @@ def normalize_name(full_name: str) -> tuple[str, ...] | None:
     folded = folded.translate(APOSTROPHES)
     if NON_LATIN_LETTER.search(folded):
         return None
-    tokens = tuple(
-        token for token in LATIN_WORDS.findall(folded) if token not in TITLES_AND_SUFFIXES
-    )
-    return tokens or None
+    words = LATIN_WORDS.findall(folded)
+    suffixes = {word for word in words if word in SUFFIXES}
+    tokens = tuple(word for word in words if word not in TITLES and word not in SUFFIXES)
+    if len(suffixes) > 1 or not tokens:
+        return None
+    return NormalizedName(tokens, suffixes.pop() if suffixes else None)
 
 
 def name_key(full_name: str) -> str | None:
-    """The normalized tokens joined by single spaces."""
-    tokens = normalize_name(full_name)
-    if tokens is None:
+    """The name's letters with no separators: every spacing of one name has one key."""
+    name = normalize_name(full_name)
+    if name is None:
         return None
-    return " ".join(tokens)
+    return "".join(name.tokens)
 
 
 def _same_name(claimed: tuple[str, ...], first: tuple[str, ...], last: tuple[str, ...]) -> bool:
@@ -109,18 +122,27 @@ def _same_name(claimed: tuple[str, ...], first: tuple[str, ...], last: tuple[str
     )
 
 
+def _matches_record(claimed: NormalizedName, record: NamedRecord) -> bool:
+    first = normalize_name(record.first_name)
+    last = normalize_name(record.last_name)
+    if first is None or last is None:
+        return False
+    # The record's suffix may be stored with either name; two different ones is not a name.
+    suffixes = {suffix for suffix in (first.suffix, last.suffix) if suffix is not None}
+    if len(suffixes) > 1:
+        return False
+    # A suffix on one side only is ignored; on both sides it must be the same.
+    if claimed.suffix is not None and suffixes and claimed.suffix not in suffixes:
+        return False
+    return _same_name(claimed.tokens, first.tokens, last.tokens)
+
+
 def pick_patient[R: NamedRecord](claimed_full_name: str, candidates: Iterable[R]) -> R | None:
     """The one candidate whose name the claimed name is, or None (none, or more than one)."""
     claimed = normalize_name(claimed_full_name)
     if claimed is None:
         return None
-    matches = [
-        candidate
-        for candidate in candidates
-        if (first := normalize_name(candidate.first_name)) is not None
-        and (last := normalize_name(candidate.last_name)) is not None
-        and _same_name(claimed, first, last)
-    ]
+    matches = [candidate for candidate in candidates if _matches_record(claimed, candidate)]
     if len(matches) == 1:
         return matches[0]
     return None

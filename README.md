@@ -25,27 +25,34 @@ All data used by this project is synthetic. No real customer or personal data is
     time; `office_hours.clinic_now` gives the current or simulated time, in clinic time.
   - `matching.pick_patient`: which of the records already matched on date of birth and SSN
     last four the claimed name belongs to. Names are matched exactly, ignoring case, accents,
-    spacing, hyphens, apostrophes, titles (`Dr`, `Mr`, `Mrs`, `Ms`, `Miss`) and suffixes
-    (`Jr`, `Sr`, `II`, `III`, `IV`): `Mary Ann Lee`, `Maryann Lee` and `Mary-Ann Lee` are
-    the record Mary Ann / Lee. Any other difference, a middle name included, is a different
-    name; there is no sound-alike or spelling-variant matching. Zero or two matching records
-    is no match. `matching.name_key` is the normalized name, its words joined by spaces.
+    spacing, hyphens, apostrophes and titles (`Dr`, `Mr`, `Mrs`, `Ms`, `Miss`): `Mary Ann
+    Lee`, `Maryann Lee` and `Mary-Ann Lee` are the record Mary Ann / Lee. A suffix (`Jr`,
+    `Sr`, `II`, `III`, `IV`) said or stored on one side only is ignored; on both sides it
+    must be the same (`John Smith Sr` is not the record John / Smith Jr), and a name with two
+    different suffixes is not a name. Any other difference, a middle name included, is a
+    different name; there is no sound-alike or spelling-variant matching. Zero or two
+    matching records is no match. `matching.name_key` is the name's letters with nothing
+    between them and no suffix (`sarahjohnson`), so every spacing of a name has one key; it
+    is coarser than matching (`Jo Anderson` and `Joan Derson` share a key).
   - `matching.match_medication`: which of the caller's own medications a spoken name means.
-    It ignores case; form words (`tablet(s)`, `tab(s)`, `capsule(s)`, `cap(s)`, `pill(s)`,
-    `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`, `drops`, `spray`);
-    unit words (`mg`, `mcg`, `g`, `ml`, `milligram(s)`, `microgram(s)`, `gram(s)`,
-    `unit(s)`, `iu`, `percent`, `%`); and a number, which may have one decimal point
-    (`0.5`), only when it is a strength, with a unit attached (`10mg`, `0.5mg`, `1%`) or
-    right before a unit word (`10 mg`, `2000 IU`, `1 percent`). A decimal comma is not
-    understood. Every other number is kept and must
-    match: `Humulin R U-500`, `Humulin 70/30` and `Vitamin B-12` keep theirs. A hyphen or
-    slash next to a digit joins (`B-12` is `b12`, `70/30` is `7030`), and a single letter
-    followed by a number is one word (`b 12` is `b12`). The remaining words must match one
-    for one, in order; a word of only letters, seven or more of them, may differ by one
-    letter added, dropped, changed or swapped with its neighbour, never the first letter. A
-    spoken name split in two (`met formin`) is joined when the listed name is one word and
-    every spoken word has at least three letters and no digit. Zero or two matches is no
-    match. Filler words (`my albuterol`) are not removed.
+    It ignores case and form words (`tablet(s)`, `tab(s)`, `capsule(s)`, `cap(s)`,
+    `pill(s)`, `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`, `drops`,
+    `spray`), so a form never tells two entries apart (`nicotine patch` finds a listed
+    `Nicotine inhaler`). It also drops unit words (`mg`, `mcg`, `g`, `ml`, `milligram(s)`,
+    `microgram(s)`, `gram(s)`, `unit(s)`, `iu`, `percent`, `%`) and a number, which may have
+    one decimal point (`0.5`), when it is a strength: with a unit attached (`10mg`, `0.5mg`,
+    `1%`) or right before a unit word (`10 mg`, `2000 IU`, `1 percent`). A strength never
+    tells two entries apart either. A decimal comma is not understood. Every other number is
+    kept and must match: `Humulin R U-500`, `Humulin 70/30` and `Vitamin B-12` keep theirs.
+    A hyphen or slash next to a digit joins (`B-12` is `b12`, `70/30` is `7030`). After
+    strengths are dropped, a single letter followed by a number is one word (`b 12` is
+    `b12`, `u 500` is `u500`); a number followed by a unit word is a strength first, so
+    `Vitamin C 500 mg` is `vitamin c` and `Humulin R U 500 units/mL` is `humulin r u`. The
+    remaining words must match one for one, in order; a word of only letters, seven or more
+    of them, may differ by one letter added, dropped, changed or swapped with its neighbour,
+    never the first letter. A spoken name split in two (`met formin`) is joined when the
+    listed name is one word and every spoken word has at least three letters and no digit.
+    Zero or two matches is no match. Filler words (`my albuterol`) are not removed.
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at

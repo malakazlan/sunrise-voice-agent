@@ -1,7 +1,13 @@
 import time
 from dataclasses import dataclass
 
-from app.domain.matching import match_medication, name_key, normalize_name, pick_patient
+from app.domain.matching import (
+    NormalizedName,
+    match_medication,
+    name_key,
+    normalize_name,
+    pick_patient,
+)
 
 
 @dataclass(frozen=True)
@@ -35,40 +41,50 @@ def wrong_picks(rows: list[tuple[str, Record]], expect_match: bool) -> list[str]
     ]
 
 
-def test_names_that_match() -> None:
-    o_connor = person("Ann", "O'Connor")
-    smith_jones = person("Mary", "Smith-Jones")
-    de_la_cruz = person("Maria", "De La Cruz")
-    mary_ann = person("Mary Ann", "Lee")
-    mcdonald = person("John", "McDonald")
-    rows = [
-        ("Sarah Johnson", SARAH_JOHNSON),
-        ("sarah johnson", SARAH_JOHNSON),
-        ("  Sarah   Johnson ", SARAH_JOHNSON),
-        ("Sarah-Johnson.", SARAH_JOHNSON),
-        ("Dr Sarah Johnson", SARAH_JOHNSON),
-        ("Sarah Johnson Jr", SARAH_JOHNSON),
-        ("Mrs. Sarah Johnson", SARAH_JOHNSON),
-        ("John Smith", JOHN_SMITH_JR),
-        ("María García", MARIA_GARCIA),
-        ("Ann O'Connor", o_connor),
-        ("Ann O’Connor", o_connor),
-        ("Ann OConnor", o_connor),
-        ("Ann O Connor", o_connor),
-        ("Mary Smith-Jones", smith_jones),
-        ("Mary Smith Jones", smith_jones),
-        ("Mary SmithJones", smith_jones),
-        ("Maria De La Cruz", de_la_cruz),
-        ("Maria Delacruz", de_la_cruz),
-        ("Mary Ann Lee", mary_ann),
-        ("Maryann Lee", mary_ann),
-        ("Mary-Ann Lee", mary_ann),
-        ("John Mc Donald", mcdonald),
-        ("John McDonald", mcdonald),
-        (NAME_200, SARAH_JOHNSON),
-    ]
+O_CONNOR = person("Ann", "O'Connor")
+SMITH_JONES = person("Mary", "Smith-Jones")
+DE_LA_CRUZ = person("Maria", "De La Cruz")
+MARY_ANN = person("Mary Ann", "Lee")
+MCDONALD = person("John", "McDonald")
+NAMES_THAT_MATCH = [
+    ("Sarah Johnson", SARAH_JOHNSON),
+    ("sarah johnson", SARAH_JOHNSON),
+    ("  Sarah   Johnson ", SARAH_JOHNSON),
+    ("Sarah-Johnson.", SARAH_JOHNSON),
+    ("Dr Sarah Johnson", SARAH_JOHNSON),
+    ("Sarah Johnson Jr", SARAH_JOHNSON),
+    ("Mrs. Sarah Johnson", SARAH_JOHNSON),
+    ("John Smith", JOHN_SMITH_JR),
+    ("María García", MARIA_GARCIA),
+    ("Ann O'Connor", O_CONNOR),
+    ("Ann O\u2019Connor", O_CONNOR),
+    ("Ann OConnor", O_CONNOR),
+    ("Ann O Connor", O_CONNOR),
+    ("Mary Smith-Jones", SMITH_JONES),
+    ("Mary Smith Jones", SMITH_JONES),
+    ("Mary SmithJones", SMITH_JONES),
+    ("Maria De La Cruz", DE_LA_CRUZ),
+    ("Maria Delacruz", DE_LA_CRUZ),
+    ("Mary Ann Lee", MARY_ANN),
+    ("Maryann Lee", MARY_ANN),
+    ("Mary-Ann Lee", MARY_ANN),
+    ("John Mc Donald", MCDONALD),
+    ("John McDonald", MCDONALD),
+    (NAME_200, SARAH_JOHNSON),
+    ("S arah Johnson", SARAH_JOHNSON),
+    ("Sar ah John son", SARAH_JOHNSON),
+    ("Sar\u00adah Johnson", SARAH_JOHNSON),
+    ("John Smith Jr", JOHN_SMITH_JR),
+    ("John Smith Jr", JOHN_SMITH),
+    ("John Smith III", person("John", "Smith III")),
+    # A suffix stored with the first name is the same suffix.
+    ("John Smith Jr", person("John Jr", "Smith")),
+    ("John Smith", person("John Jr", "Smith")),
+]
 
-    assert wrong_picks(rows, expect_match=True) == []
+
+def test_names_that_match() -> None:
+    assert wrong_picks(NAMES_THAT_MATCH, expect_match=True) == []
 
 
 def test_names_that_must_not_match() -> None:
@@ -188,6 +204,15 @@ def test_names_that_must_not_match() -> None:
         ("Jo Smith", person("J", "Smith")),
         ("John Doe Jr", JOHN_SMITH_JR),
         ("John Jr", JOHN_SMITH_JR),
+        ("John Smith Sr", JOHN_SMITH_JR),
+        ("John Smith Jr", person("John", "Smith Sr")),
+        ("John Smith III", person("John", "Smith II")),
+        ("John Smith II", person("John", "Smith III")),
+        ("John Smith Jr Sr", JOHN_SMITH_JR),
+        ("John Smith Sr", person("John Jr", "Smith")),
+        # A record whose two fields carry different suffixes is not a name.
+        ("John Smith", person("John Jr", "Smith Sr")),
+        ("John Smith Jr", person("John Jr", "Smith Sr")),
         ("C Smith", person("K", "Smith")),
         ("Z Smith", person("S", "Smith")),
         ("Y Smith", person("I", "Smith")),
@@ -217,29 +242,45 @@ def test_ambiguous_candidates_return_nothing() -> None:
     assert pick_patient("Sarah", [person("Sarah", "Sarah")]) is None
 
 
-def test_strict_match_preferred() -> None:
+def test_one_match_among_several_is_that_match() -> None:
     sara = person("Sara", "Johnson")
     jonson = person("Sarah", "Jonson")
 
-    # One matching among three is that one.
     assert pick_patient("Sarah Johnson", [sara, SARAH_JOHNSON, jonson]) is SARAH_JOHNSON
     assert pick_patient("Sara Johnson", [SARAH_JOHNSON, jonson, sara]) is sara
     assert pick_patient("Sarah Jonson", [jonson, sara, SARAH_JOHNSON]) is jonson
 
 
-def test_name_key_is_the_normalized_name() -> None:
-    assert name_key("Sarah Johnson") == "sarah johnson"
-    assert name_key("Dr Sarah Marie Johnson Jr") == "sarah marie johnson"
-    assert name_key("  Mrs. María   O’Connor-Smith ") == "maria oconnor smith"
-    assert name_key("Sarah") == "sarah"
+def test_name_key_is_the_letters_without_separators() -> None:
+    for claimed in ("Sarah Johnson", "S arah Johnson", "Sar ah John son", "Sar\u00adah Johnson"):
+        assert name_key(claimed) == "sarahjohnson", claimed
+    assert name_key("Dr. Sarah Johnson Jr") == "sarahjohnson"
+    assert name_key("María García") == "mariagarcia"
+    assert name_key("Jo Anderson") == "joanderson"
+    assert name_key("Joan Derson") == "joanderson"
     assert name_key("Sara Johnson") != name_key("Sarah Johnson")
-    for not_a_name in ("", "   ", "Dr", "Jr Jr", NAME_201):
+    for not_a_name in ("", "   ", "Dr", "Jr Jr", NAME_201, "Søren Johnson", "John Smith Jr Sr"):
         assert name_key(not_a_name) is None, not_a_name
 
 
-def test_normalize_name_gives_every_token() -> None:
-    assert normalize_name("Mrs. Mary-Ann  O'Connor Jr") == ("mary", "ann", "oconnor")
-    assert normalize_name("Sarah") == ("sarah",)
+def test_a_matching_name_has_the_record_key() -> None:
+    different = [
+        claimed
+        for claimed, record in NAMES_THAT_MATCH
+        if name_key(claimed) != name_key(f"{record.first_name} {record.last_name}")
+    ]
+
+    assert different == []
+
+
+def test_normalize_name_gives_every_token_and_the_suffix() -> None:
+    assert normalize_name("Mrs. Mary-Ann  O'Connor Jr") == NormalizedName(
+        ("mary", "ann", "oconnor"), "jr"
+    )
+    assert normalize_name("Sarah") == NormalizedName(("sarah",), None)
+    assert normalize_name("John III Smith") == NormalizedName(("john", "smith"), "iii")
+    assert normalize_name("John Smith Jr Jr") == NormalizedName(("john", "smith"), "jr")
+    assert normalize_name("John Smith Jr Sr") is None
     assert normalize_name("Dr Jr") is None
 
 
@@ -254,7 +295,7 @@ def test_non_latin_and_empty_input_never_match() -> None:
 
 def test_long_input_returns_quickly() -> None:
     # One character that Unicode normalization expands eighteen-fold.
-    pathological = "ﷺ" * 200_000
+    pathological = "\ufdfa" * 200_000
     started = time.perf_counter()
     assert pick_patient(pathological, [SARAH_JOHNSON]) is None
     assert name_key(pathological) is None
@@ -319,6 +360,7 @@ def test_strength_and_form_words_are_ignored() -> None:
         ("vitamin d", ["Vitamin D 2000 IU"], "Vitamin D 2000 IU"),
         # The strength is dropped before a letter and a number merge.
         ("vitamin c", ["Vitamin C 500 mg"], "Vitamin C 500 mg"),
+        ("humulin r u 100 units", ["Humulin R U 500 units/mL"], "Humulin R U 500 units/mL"),
         ("10 mg", LISINOPRIL_AND_METFORMIN, None),
         ("tablet", LISINOPRIL_AND_METFORMIN, None),
     ]
