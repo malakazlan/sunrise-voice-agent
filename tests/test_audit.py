@@ -833,15 +833,15 @@ async def test_action_fails_when_event_cannot_be_written(
 
 @dataclass(frozen=True)
 class LookAlike:
-    """Has every field of an event and none of its checks."""
+    """Has every field of an event, each valid, but is not an event."""
 
     actor: str = "agent"
-    action: str = "call_started"
-    resource_type: str = "call"
-    outcome: str = "success"
+    action: Action = Action.CALL_STARTED
+    resource_type: ResourceType = ResourceType.CALL
+    outcome: Outcome = Outcome.SUCCESS
     call_id: str | None = None
     resource_id: str | None = None
-    reason: str | None = None
+    reason: Reason | None = None
 
 
 def ssn_shaped() -> str:
