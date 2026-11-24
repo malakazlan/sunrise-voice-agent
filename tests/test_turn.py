@@ -4,11 +4,10 @@ network. Expected lines and tool results are written by hand from the scripts, t
 (app/db/seed_data.json) and the spec."""
 
 import asyncio
-import copy
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, date, datetime
 from typing import Any, cast
 
@@ -38,6 +37,7 @@ from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
 from app.main import create_app
 from app.voice.calls import CallRegistry
+from evals.scripted import ScriptedModel, Step, calls, says
 
 pytestmark = pytest.mark.anyio
 
@@ -103,29 +103,7 @@ EVENTS_WITH_REASONS = text(
 )
 
 
-# --- the scripted model -----------------------------------------------------------------
-
-
-def says(words: str) -> ModelReply:
-    return ModelReply(
-        stop_reason="end_turn",
-        content=[{"type": "text", "text": words}],
-        text=words,
-        tool_calls=[],
-    )
-
-
-def calls(*tools: tuple[str, object], words: str = "") -> ModelReply:
-    """A reply that asks for tools, each with an id of its own."""
-    tool_calls = [
-        ToolCall(id=f"toolu_{index}", name=n, arguments=a) for index, (n, a) in enumerate(tools)
-    ]
-    content: list[dict[str, Any]] = [{"type": "text", "text": words}] if words else []
-    content += [
-        {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
-        for call in tool_calls
-    ]
-    return ModelReply(stop_reason="tool_use", content=content, text=words, tool_calls=tool_calls)
+# --- the scripted model's failures ------------------------------------------------------
 
 
 def refuses() -> ModelReply:
@@ -150,9 +128,6 @@ def cut_off() -> ModelReply:
     )
 
 
-Step = ModelReply | Callable[[asyncio.Event], Awaitable[ModelReply]]
-
-
 async def api_error(first_token: asyncio.Event) -> ModelReply:
     raise RuntimeError("the API answered 529")
 
@@ -166,26 +141,6 @@ async def stalls(first_token: asyncio.Event) -> ModelReply:
     first_token.set()
     await asyncio.sleep(5)
     raise AssertionError("a reply that stalls is not waited for")
-
-
-class ScriptedModel:
-    """Answers each request with the next step and keeps a copy of every request."""
-
-    def __init__(self, *steps: Step) -> None:
-        self.steps = list(steps)
-        self.requests: list[ModelRequest] = []
-
-    async def reply(self, request: ModelRequest, first_token: asyncio.Event) -> ModelReply:
-        self.requests.append(copy.deepcopy(request))
-        assert self.steps, "the model was asked more often than the test expected"
-        step = self.steps.pop(0)
-        if isinstance(step, ModelReply):
-            first_token.set()
-            return step
-        return await step(first_token)
-
-    def then(self, *steps: Step) -> None:
-        self.steps.extend(steps)
 
 
 def tool_names(request: ModelRequest) -> list[str]:
