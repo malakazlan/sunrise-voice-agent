@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from collections.abc import Awaitable
 from typing import Any
 
 import numpy as np
@@ -47,6 +48,8 @@ MAX_CALLS = 4
 SKIP_FRAMES = 25  # the first half second while the jitter buffers fill
 MIN_RMS = 500.0  # full-scale int16 is 32767; the tone is sent at half scale
 MAX_PEAK_ERROR_HZ = 10.0
+# Bound for each signaling step (gathering, answering, closing); HTTP requests have their own.
+STEP_TIMEOUT = 30.0
 
 
 class ToneTrack(MediaStreamTrack):
@@ -76,6 +79,18 @@ class ToneTrack(MediaStreamTrack):
         frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
         self._sent += SAMPLES_PER_FRAME
         return frame
+
+
+async def bounded[T](step: Awaitable[T], seconds: float) -> T:
+    """Wait for one step of the call for at most `seconds` (raises TimeoutError)."""
+    return await asyncio.wait_for(step, timeout=seconds)
+
+
+async def close(pc: RTCPeerConnection, label: str) -> None:
+    try:
+        await bounded(pc.close(), STEP_TIMEOUT)
+    except TimeoutError:
+        print(f"{label}: closing the peer connection took over {STEP_TIMEOUT:.0f} s; left open")
 
 
 def http(method: str, url: str, token: str | None, body: dict[str, str] | None = None) -> Any:
@@ -133,10 +148,12 @@ async def one_call(
 
         asyncio.ensure_future(read())
 
+    waiting_for = "gathering candidates"
     try:
         pc.addTransceiver(ToneTrack(frequency), direction="sendrecv")
-        await pc.setLocalDescription(await pc.createOffer())
+        await bounded(pc.setLocalDescription(await pc.createOffer()), STEP_TIMEOUT)
         print(f"{label}: offer candidates {candidate_types(pc.localDescription.sdp)}")
+        waiting_for = "the answer"
         started = time.monotonic()
         answer = await asyncio.to_thread(
             http,
@@ -146,14 +163,21 @@ async def one_call(
             {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
         )
         print(f"{label}: answer candidates {candidate_types(answer['sdp'])}")
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer"))
-        await asyncio.wait_for(enough.wait(), timeout=seconds + 30)
+        await bounded(
+            pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer")),
+            STEP_TIMEOUT,
+        )
+        waiting_for = f"{wanted} audio frames back"
+        await bounded(enough.wait(), seconds + 30)
         print(f"{label}: ice {pc.iceConnectionState}, {time.monotonic() - started:.1f}s to audio")
-    except (TimeoutError, urllib.error.URLError) as error:
-        print(f"{label}: FAILED {type(error).__name__} {error}; {len(received)} frames received")
+    except TimeoutError:
+        print(f"{label}: FAILED timed out waiting for {waiting_for}; {len(received)} frames back")
+        return False
+    except urllib.error.URLError as error:
+        print(f"{label}: FAILED {type(error).__name__} {error} while waiting for {waiting_for}")
         return False
     finally:
-        await pc.close()
+        await close(pc, label)
 
     if len(received) < wanted:
         print(f"{label}: FAILED the call ended after {len(received)} of {wanted} frames")
@@ -187,8 +211,9 @@ async def hoard_relays(url: str, token: str | None, count: int) -> list[RTCPeerC
 
     async def gather(pc: RTCPeerConnection) -> None:
         pc.addTransceiver("audio", direction="sendrecv")
-        await pc.setLocalDescription(await pc.createOffer())
+        await bounded(pc.setLocalDescription(await pc.createOffer()), STEP_TIMEOUT)
 
+    # A connection whose gathering failed or timed out simply has no relay candidate.
     await asyncio.gather(*(gather(pc) for pc in connections), return_exceptions=True)
     return connections
 
@@ -239,7 +264,7 @@ async def main() -> int:
             )
         )
     finally:
-        await asyncio.gather(*(pc.close() for pc in hoarded))
+        await asyncio.gather(*(close(pc, "hoarding connection") for pc in hoarded))
     print(f"{sum(results)}/{len(results)} calls heard their own tone back")
     return 0 if all(results) and hoard_ok else 1
 

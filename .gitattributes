@@ -1,2 +1,3 @@
 # Files read inside Linux containers keep LF line endings on every checkout.
 deploy/coturn/* text eol=lf
+.github/ci-wait.sh text eol=lf

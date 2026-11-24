@@ -8,9 +8,11 @@ on:
 permissions:
   contents: read
 
+# Every job has a timeout a few minutes above its normal run, so a hang fails quickly.
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,6 +26,7 @@ jobs:
 
   types:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,6 +39,7 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
@@ -68,6 +72,7 @@ jobs:
 
   gitleaks:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,7 +88,8 @@ jobs:
       - name: Scan the history of the checked-out commit
         run: |
           set -o pipefail
-          docker run --rm -v "$PWD:/repo" \
+          . .github/ci-wait.sh
+          bounded_run 300 "the gitleaks scan" ci-gitleaks --rm -v "$PWD:/repo" \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
             ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git /repo --redact --verbose --no-banner --no-color \
@@ -94,6 +100,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,10 +109,12 @@ jobs:
         run: |
           printf 'DECOY=1\n' > app/.env
           printf 'DECOY=1\n' > app/.env.local
-      - run: docker build -t sunrise-voice-agent:ci .
+      - run: timeout 900 docker build -t sunrise-voice-agent:ci .
       - name: No .env file in the image
         run: |
-          found=$(docker run --rm --entrypoint find sunrise-voice-agent:ci /app -name '.env*')
+          . .github/ci-wait.sh
+          found=$(bounded_run 60 "the image file listing" ci-find-env --rm --entrypoint find \
+            sunrise-voice-agent:ci /app -name '.env*')
           if [ -n "$found" ]; then
             echo ".env files found in the image:"
             echo "$found"
@@ -115,10 +124,11 @@ jobs:
       - name: Compose refuses to start without the database variables
         run: |
           code=0
-          output=$(docker compose -f deploy/docker-compose.yml config 2>&1) || code=$?
+          output=$(timeout 60 docker compose -f deploy/docker-compose.yml config 2>&1) || code=$?
           echo "$output" | tail -n 3
           echo "exit code: $code"
           test "$code" != "0"
+          test "$code" != "124"
           # Compose versions differ: some stop at the first missing variable, others list all.
           pattern="required variable (POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|APP_ENV) is missing a value"
           echo "$output" | grep -Eq "$pattern"
@@ -132,22 +142,18 @@ jobs:
             UNRELATED_DECOY=1 > .env
       - name: Smoke test through Compose
         run: |
-          docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
-          status=000
-          for _ in $(seq 1 60); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
-            [ "$status" = "200" ] && break
-            sleep 1
-          done
-          echo "GET /health -> $status"
-          test "$status" = "200"
-          docs=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
+          . .github/ci-wait.sh
+          # `timeout` runs programs, not shell functions, so each bounded call spells it out.
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          bounded 900 "the stack to build and start" $compose up -d --build
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health"
+          docs=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          uid=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T app id -u)
+          uid=$(bounded 30 "id -u in the app container" $compose exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
-          app=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q app)
+          app=$($compose ps -q app)
           health=none
           for _ in $(seq 1 30); do
             health=$(docker inspect --format '{{.State.Health.Status}}' "$app")
@@ -155,8 +161,11 @@ jobs:
             sleep 1
           done
           echo "HEALTHCHECK -> $health"
-          test "$health" = "healthy"
-          patients=$(docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
+          if [ "$health" != "healthy" ]; then
+            echo "gave up after 30s waiting for the app's HEALTHCHECK to report healthy"
+            exit 1
+          fi
+          patients=$(bounded 30 "the patient count from the db" $compose exec -T db \
             psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
           echo "patients: $patients"
           test "$patients" = "5"
@@ -184,10 +193,13 @@ jobs:
           echo "db environment holds only the database variables"
       - name: The app container receives exactly the settings variables
         run: |
+          set -o pipefail
+          . .github/ci-wait.sh
           # Compose's resolved configuration, read by the app's own Settings class inside the
           # image. Names only; values are never printed.
-          docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
-            | docker run -i --rm --entrypoint python sunrise-voice-agent:ci -c '
+          timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
+            | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
+              --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
           from app.config import Settings
           received = set(json.load(sys.stdin)["services"]["app"]["environment"])
@@ -215,13 +227,15 @@ jobs:
           fi
       - name: coturn runs from one config file, with quotas and deny rules, secret off its arguments
         run: |
+          . .github/ci-wait.sh
           coturn=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q coturn)
           state=$(docker inspect --format '{{.State.Status}} restarts={{.RestartCount}}' "$coturn")
           echo "coturn: $state"
           test "$state" = "running restarts=0"
           # The running process's arguments: one config file and nothing else, so neither a
           # second config source nor the secret.
-          docker exec "$coturn" cat /proc/1/cmdline > "$RUNNER_TEMP/coturn-cmdline"
+          bounded 30 "coturn's command line" docker exec "$coturn" cat /proc/1/cmdline \
+            > "$RUNNER_TEMP/coturn-cmdline"
           args=$(tr '\0' ' ' < "$RUNNER_TEMP/coturn-cmdline")
           echo "coturn command line: $args"
           test "$args" = "turnserver -c /tmp/turnserver.conf "
@@ -232,8 +246,11 @@ jobs:
             exit 1
           fi
           # The settings coturn started from, without the secret line, which is there once.
-          test "$(docker exec "$coturn" grep -c '^static-auth-secret=' /tmp/turnserver.conf)" = 1
-          docker exec "$coturn" grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
+          secret_lines=$(bounded 30 "coturn's config file" docker exec "$coturn" \
+            grep -c '^static-auth-secret=' /tmp/turnserver.conf)
+          test "$secret_lines" = 1
+          bounded 30 "coturn's config file" docker exec "$coturn" \
+            grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
             > "$RUNNER_TEMP/coturn-settings"
           cat "$RUNNER_TEMP/coturn-settings"
           for line in realm=127.0.0.1 user-quota=4 total-quota=27 max-bps=64000 \
@@ -250,47 +267,55 @@ jobs:
           echo "coturn settings checked"
       - name: coturn's entrypoint accepts and refuses the same values as the app
         run: |
+          . .github/ci-wait.sh
           # A stub turnserver shows what the entrypoint would start coturn with; the app side
-          # of the same table (deploy/coturn/validation-cases.json) is a pytest test.
+          # of the same table (deploy/coturn/validation-cases.json) is a pytest test. The
+          # checker bounds each container run itself; this bounds the whole table.
           coturn=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q coturn)
           image=$(docker inspect --format '{{.Config.Image}}' "$coturn")
-          python3 scripts/check_coturn_entrypoint.py --image "$image"
+          bounded 600 "the entrypoint check of all cases" \
+            python3 scripts/check_coturn_entrypoint.py --image "$image"
       - name: Forced-relay echo through coturn, and the per-credential relay quota
         run: |
+          . .github/ci-wait.sh
           # Only networking differs from the stack above: app and coturn join a network whose
           # addresses coturn does not deny, so no peer is allowed and every deny rule applies.
           echo "--- override used only by this step"
           cat deploy/docker-compose.relay-test.yml
           export TURN_HOST=203.0.113.10
-          relay() { docker compose --env-file .env -f deploy/docker-compose.yml \
-            -f deploy/docker-compose.relay-test.yml "$@"; }
-          relay up -d --build
-          status=000
-          for _ in $(seq 1 60); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
-            [ "$status" = "200" ] && break
-            sleep 1
-          done
-          test "$status" = "200"
-          coturn=$(relay ps -q coturn)
-          docker exec "$coturn" grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
+          # `timeout` runs programs, not shell functions, so the command is spelled out.
+          relay="docker compose --env-file .env -f deploy/docker-compose.yml"
+          relay="$relay -f deploy/docker-compose.relay-test.yml"
+          bounded 900 "the relay-test stack to build and start" $relay up -d --build
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health"
+          coturn=$($relay ps -q coturn)
+          bounded 30 "coturn's config file" docker exec "$coturn" \
+            grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
             > "$RUNNER_TEMP/relay-settings"
           echo "--- coturn settings here against the committed run (only the realm may differ)"
           diff "$RUNNER_TEMP/coturn-settings" "$RUNNER_TEMP/relay-settings" || true
           diff <(grep -v '^realm=' "$RUNNER_TEMP/coturn-settings") \
             <(grep -v '^realm=' "$RUNNER_TEMP/relay-settings")
           token=$(sed -n 's/^DEMO_ACCESS_TOKEN=//p' .env)
-          probe() { docker run --rm --network sunrise-voice-agent_relay-test \
-            -e PROBE_TOKEN="$token" -v "$PWD/scripts:/probe:ro" --entrypoint python \
-            sunrise-voice-agent:ci -I /probe/echo_probe.py --url http://app:8000 "$@"; }
+          # The probe bounds each of its own steps; this bounds each probe run as a whole.
+          probe() {
+            name=$1
+            shift
+            bounded_run 300 "the $name probe" "ci-probe-$name" --rm \
+              --network sunrise-voice-agent_relay-test -e PROBE_TOKEN="$token" \
+              -v "$PWD/scripts:/probe:ro" --entrypoint python sunrise-voice-agent:ci \
+              -I /probe/echo_probe.py --url http://app:8000 "$@"
+          }
           echo "--- three calls, relay candidates only"
-          probe --calls 3 --relay
+          probe relay --calls 3 --relay
           echo "--- one credential tries twelve relays; another caller still gets one"
-          probe --hoard 12 --expect-hoarded 4 --calls 1 --relay
+          probe quota --hoard 12 --expect-hoarded 4 --calls 1 --relay
       - name: Postgres logs no ERROR or WARNING lines, details or failing statements
         run: |
+          . .github/ci-wait.sh
           show() {
-            docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
+            bounded 30 "SHOW $1 from the db" \
+              docker compose --env-file .env -f deploy/docker-compose.yml exec -T db \
               psql -U sunrise -d sunrise -tAc "SHOW $1"
           }
           messages=$(show log_min_messages)
@@ -303,16 +328,20 @@ jobs:
           test "$statements" = "panic"
       - name: Container without APP_ENV must not start
         run: |
+          . .github/ci-wait.sh
           code=0
-          output=$(timeout 60 docker run --rm sunrise-voice-agent:ci 2>&1) || code=$?
+          output=$(bounded_run 60 "the app container to refuse to start" ci-no-app-env --rm \
+            sunrise-voice-agent:ci 2>&1) || code=$?
           echo "$output" | tail -n 5
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
       - name: Container without database or voice settings must not start
         run: |
+          . .github/ci-wait.sh
           code=0
-          output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
+          output=$(bounded_run 60 "the app container to refuse to start" ci-no-settings --rm \
+            -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
           echo "$output" | tail -n 12
           echo "exit code: $code"
           test "$code" = "1"
@@ -322,4 +351,4 @@ jobs:
           done
       - name: Compose logs
         if: always()
-        run: docker compose --env-file .env -f deploy/docker-compose.yml logs || true
+        run: timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml logs || true
