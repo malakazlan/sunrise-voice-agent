@@ -1,5 +1,8 @@
 """The admin API: read-only views of the requests, the messages, the calls and the audit log,
-behind HTTP Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is set.
+and the admin console's reads (app/audit/console.py): the calls in progress, a call's turns, the
+appointments, the slots and the summaries of the guardrails and the calls' numbers, behind HTTP
+Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is set. The calls in
+progress, the slots' default day and the summaries' days follow the clinic's clock.
 
 Every successful read appends one audit event naming the admin, in the transaction that read
 the rows, and the rows leave only once that transaction has committed. A call that is not
@@ -16,7 +19,7 @@ import logging
 import re
 from base64 import b64decode
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -26,12 +29,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.audit import console
 from app.audit.log import ADMIN_PREFIX, CALL_ID, Action, AuditLog, Event, Outcome, ResourceType
 from app.audit.read import MAX_PAGE, MAX_SEQ, recent_events
 from app.config import Settings
 from app.db import models
+from app.domain.office_hours import clinic_now
 from app.guard.mask import mask
 from app.guard.rate_limit import RateLimiter
 
@@ -51,6 +57,11 @@ CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
 # A verification asked for while another runs is refused; this is when to ask again.
 VERIFY_RETRY_SECONDS = 5
 DIGIT = re.compile(r"\d")
+ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# The days a summary or the slots cover: a week unless asked.
+DEFAULT_DAYS = 7
+MAX_SLOT_DAYS = 14
+MAX_SUMMARY_DAYS = 30
 
 REQUEST_COLUMNS = (
     models.Request.id,
@@ -113,6 +124,53 @@ class NoQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class RequestPage(Page):
+    """A page of requests, optionally of one known type."""
+
+    type: str | None = None
+
+    @field_validator("type")
+    @classmethod
+    def _known_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in models.REQUEST_TYPES:
+            raise ValueError("type is not a request type")
+        return value
+
+
+class TurnPage(BaseModel):
+    """A page of one call's turns, in order, after a turn number."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(default=DEFAULT_PAGE, ge=1, le=MAX_PAGE)
+    after: int | None = Field(default=None, ge=1, le=MAX_ROW_ID)
+
+
+class SlotQuery(BaseModel):
+    """The slots of 1 to MAX_SLOT_DAYS days from a date at the clinic (YYYY-MM-DD; today if
+    not given)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: date | None = Field(default=None, alias="from")
+    days: int = Field(default=DEFAULT_DAYS, ge=1, le=MAX_SLOT_DAYS)
+
+    @field_validator("start", mode="before")
+    @classmethod
+    def _a_date(cls, value: object) -> object:
+        if value is not None and not (isinstance(value, str) and ISO_DATE.fullmatch(value)):
+            raise ValueError("from must be a date: YYYY-MM-DD")
+        return value
+
+
+class SummaryQuery(BaseModel):
+    """A summary of the last 1 to MAX_SUMMARY_DAYS days at the clinic, today included."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    days: int = Field(default=DEFAULT_DAYS, ge=1, le=MAX_SUMMARY_DAYS)
+
+
 def _supplied_credentials(header: str | None) -> tuple[bytes, bytes] | None:
     """The user name and password of a Basic header, as bytes; None for anything else."""
     if header is None or len(header) > MAX_AUTHORIZATION_LENGTH:
@@ -171,8 +229,11 @@ async def _newest(
     columns: Sequence[InstrumentedAttribute[Any]],
     row_id: InstrumentedAttribute[int],
     page: Page,
+    condition: ColumnElement[bool] | None = None,
 ) -> list[dict[str, Any]]:
     statement = select(*columns)
+    if condition is not None:
+        statement = statement.where(condition)
     if page.before is not None:
         statement = statement.where(row_id < page.before)
     rows = await session.execute(statement.order_by(row_id.desc()).limit(page.limit))
@@ -306,11 +367,12 @@ def build_admin_app(
     )
 
     @app.get("/requests")
-    async def read_requests(page: Annotated[Page, Query()]) -> dict[str, Any]:
+    async def read_requests(page: Annotated[RequestPage, Query()]) -> dict[str, Any]:
+        of_type = None if page.type is None else models.Request.type == page.type
         rows = await read_and_audit(
             Action.ADMIN_READ_REQUESTS,
             ResourceType.REQUEST,
-            lambda session: _newest(session, REQUEST_COLUMNS, models.Request.id, page),
+            lambda session: _newest(session, REQUEST_COLUMNS, models.Request.id, page, of_type),
         )
         return {"requests": [_masked(row) for row in rows]}
 
@@ -336,6 +398,82 @@ def build_admin_app(
             lambda session: _newest(session, CALL_COLUMNS, models.CallSession.id, page),
         )
         return {"calls": [_masked(row) for row in rows]}
+
+    # Before /calls/{call_id}, which would take "live" for a call id.
+    @app.get("/calls/live")
+    async def read_live_calls(_query: Annotated[NoQuery, Query()]) -> dict[str, Any]:
+        now = clinic_now(settings)
+        rows = await read_and_audit(
+            Action.ADMIN_READ_LIVE_CALLS,
+            ResourceType.CALL,
+            lambda session: console.live_calls(
+                session, now=now, max_call_seconds=settings.max_call_seconds
+            ),
+        )
+        return {"calls": [_masked(row) for row in rows]}
+
+    @app.get("/calls/{call_id}/turns")
+    async def read_call_turns(call_id: str, page: Annotated[TurnPage, Query()]) -> dict[str, Any]:
+        if not CALL_ID.fullmatch(call_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
+        rows = await read_and_audit(
+            Action.ADMIN_READ_CALL_TURNS,
+            ResourceType.CALL,
+            lambda session: console.call_turns(
+                session, call_id, limit=page.limit, after=page.after
+            ),
+            resource_id=call_id,
+        )
+        return {"turns": [_masked(row) for row in rows]}
+
+    @app.get("/appointments")
+    async def read_appointments(page: Annotated[Page, Query()]) -> dict[str, Any]:
+        rows = await read_and_audit(
+            Action.ADMIN_READ_APPOINTMENTS,
+            ResourceType.APPOINTMENT,
+            lambda session: console.appointments(session, limit=page.limit, before=page.before),
+        )
+        return {"appointments": [_masked(row) for row in rows]}
+
+    @app.get("/slots")
+    async def read_slots(query: Annotated[SlotQuery, Query()]) -> dict[str, Any]:
+        start = query.start or clinic_now(settings).date()
+        rows, truncated = await read_and_audit(
+            Action.ADMIN_READ_SLOTS,
+            ResourceType.SLOT,
+            lambda session: console.slots(session, start=start, days=query.days),
+        )
+        return {"slots": [_masked(row) for row in rows], "truncated": truncated}
+
+    @app.get("/guardrails/summary")
+    async def read_guardrails(query: Annotated[SummaryQuery, Query()]) -> dict[str, Any]:
+        since = console.window_start(clinic_now(settings), query.days)
+        rows = await read_and_audit(
+            Action.ADMIN_READ_GUARDRAILS,
+            ResourceType.AUDIT_EVENT,
+            lambda session: console.guardrail_counts(session, since=since),
+        )
+        return {
+            "days": query.days,
+            "since": since.isoformat(),
+            "counts": [_masked(row) for row in rows],
+        }
+
+    @app.get("/metrics/summary")
+    async def read_metrics(query: Annotated[SummaryQuery, Query()]) -> dict[str, Any]:
+        since = console.window_start(clinic_now(settings), query.days)
+        summary = await read_and_audit(
+            Action.ADMIN_READ_METRICS,
+            ResourceType.CALL,
+            lambda session: console.metrics(session, since=since),
+        )
+        lists = ("calls_per_day", "ended", "latency")
+        return {
+            "days": query.days,
+            "since": since.isoformat(),
+            **{name: [_masked(row) for row in summary[name]] for name in lists},
+            **_masked({name: value for name, value in summary.items() if name not in lists}),
+        }
 
     @app.get("/calls/{call_id}")
     async def read_call(call_id: str, _query: Annotated[NoQuery, Query()]) -> dict[str, Any]:

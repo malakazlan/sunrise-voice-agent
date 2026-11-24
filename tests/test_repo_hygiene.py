@@ -1002,7 +1002,7 @@ def test_no_print_in_app() -> None:
 # a session's add, raw SQL text) and hold no string with a writing SQL keyword; every other
 # `.append` call is refused, so the one there is is the audit log's. Docstrings are prose and
 # are not read. Like the scans above, a lint against accidents.
-ADMIN_MODULES = ("app/api/admin.py", "app/audit/read.py")
+ADMIN_MODULES = ("app/api/admin.py", "app/audit/read.py", "app/audit/console.py")
 WRITE_NAMES = {
     "insert",
     "update",
@@ -1108,7 +1108,7 @@ def test_admin_is_read_only() -> None:
         name: sum(1 for node in ast.walk(ast.parse(source)) if is_audit_append(node))
         for name, source in sources.items()
     }
-    assert appends == {"app/api/admin.py": 1, "app/audit/read.py": 0}
+    assert appends == {"app/api/admin.py": 1, "app/audit/read.py": 0, "app/audit/console.py": 0}
 
 
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last
