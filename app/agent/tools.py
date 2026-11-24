@@ -27,6 +27,9 @@ from app.audit.log import Action, Outcome, ResourceType
 
 _SUBMIT_GRANT = Grant()
 
+# Whoever is in intake: nobody known yet, a claim pending, or verification locked.
+INTAKE_CALLERS = frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED})
+
 VERIFY_IDENTITY = Tool(
     name="verify_identity",
     arguments=VerifyIdentityArguments,
@@ -38,7 +41,7 @@ VERIFY_IDENTITY = Tool(
     writes=False,
     may_verify=False,
     takes_date_of_birth=DobKind.IDENTITY_CLAIM,
-    callers=frozenset({Caller.UNIDENTIFIED}),
+    callers=INTAKE_CALLERS,
     audit_action=Action.IDENTITY_CLAIMED,
     outcome_actions={Action.IDENTITY_LOCKED: Outcome.REFUSED},
     resource_type=ResourceType.TOOL,
@@ -55,7 +58,7 @@ SUBMIT_IDENTITY = Tool(
     writes=True,
     may_verify=True,
     takes_date_of_birth=None,
-    callers=frozenset({Caller.UNIDENTIFIED}),
+    callers=INTAKE_CALLERS,
     audit_action=Action.IDENTITY_VERIFIED,
     outcome_actions={
         Action.IDENTITY_REFUSED: Outcome.REFUSED,

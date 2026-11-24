@@ -695,7 +695,7 @@ CLAIMER = valid(
     phi=False,
     phases=frozenset({INTAKE}),
     takes_date_of_birth=DobKind.IDENTITY_CLAIM,
-    callers=frozenset({Caller.UNIDENTIFIED}),
+    callers=frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED}),
     resource_type=ResourceType.TOOL,
 )
 NEW_PATIENTS = frozenset({Caller.NEW_PATIENT, Caller.NEW_PATIENT_WITH_DETAILS})
@@ -920,6 +920,7 @@ def test_registration_rules() -> None:
                 {"phases": frozenset({SERVING})},
                 {"callers": frozenset(Caller)},
                 {"callers": NEW_PATIENTS},
+                {"callers": frozenset({Caller.UNIDENTIFIED})},
                 {"office_open_only": False},
                 {"model_callable": False},
                 {"may_verify": True},
@@ -1048,7 +1049,8 @@ def test_registration_rules() -> None:
 
 
 # Who the caller is, written by hand from the spec: a verified patient, a new patient's call with
-# or without the details collected, or nobody known yet; nobody, for a state no transition makes.
+# or without the details collected, a locked call, one with a claim pending, or nobody known
+# yet; nobody, for a state no transition makes.
 def caller_in(state: CallState) -> Caller | None:
     if state.verified:
         consistent = state.patient_id is not None and not state.is_new_patient
@@ -1057,6 +1059,10 @@ def caller_in(state: CallState) -> Caller | None:
         if state.new_patient_details is None:
             return Caller.NEW_PATIENT
         return Caller.NEW_PATIENT_WITH_DETAILS
+    if state.verify_locked:
+        return Caller.LOCKED
+    if state.pending_claim is not None:
+        return Caller.CLAIMANT
     return Caller.UNIDENTIFIED
 
 
@@ -1095,6 +1101,17 @@ def gate_violations(registry: Registry) -> list[str]:
         state.model_copy(update={"is_new_patient": True, "new_patient_details": details})
         for state in every_combination()
         for details in (None, SOME_DETAILS)
+    ]
+    # An unverified call with a claim pending, and one whose verification is locked.
+    claim = IdentityClaim(full_name="Ann Lee", dob=date(1990, 1, 1))
+    states += [
+        state.model_copy(update=update)
+        for state in every_combination()
+        if not state.verified
+        for update in (
+            {"pending_claim": claim, "expecting_ssn4": True},
+            {"verify_attempts": 3, "verify_locked": True},
+        )
     ]
     for state in states:
         offered = {description.name for description in registry.tools_for(state)}

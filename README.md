@@ -383,9 +383,13 @@ model. Code decides; the model only relays the name and the date.
   again (`ssn_too_long`); the third armed turn without four submits what there is.
   **Redaction**, always: digits after an SSN cue, SSN-shaped numbers, and any run of digits
   or number words that reads as exactly nine digits, whatever its grouping (spaces, hyphens,
-  dots, the word "dash"). In `greeting` and `intake`, before verification, every other digit
-  and number word is hidden too, except inside a date the mask module recognises, a year from
-  1900 to 2099 (numerals or words) or a run of ten or eleven digits (a callback number). Once
+  dots, the word "dash"). Before verification, in every phase but a new patient's `booking`,
+  every other digit and number word is hidden too, except inside a date the mask module
+  recognises, a year from 1900 to 2099 (numerals or words) or a run of ten or eleven digits (a
+  callback number); in `booking` a new patient gives times and member numbers, and only SSNs
+  are hidden. While a claim is pending (the step armed, or its digits awaiting the submit) and
+  once verification is locked, the call cannot move to `booking`, and `start_new_patient` is
+  not offered: the step cannot be left for the phase where numbers pass. Once
   verified, any group that reads as the caller's own last four is hidden; a phone number that
   ends in those digits is not. **Flags**: an attempt to override the instructions, and a
   request about someone else; the text still passes. The decision carries the state change as
@@ -499,8 +503,9 @@ name, message text, balance or status reaches the audit log or the logs.
 Five tools in `app/agent/booking.py`, registered by `register_tools()`, book an appointment
 for a verified patient and for a first-time caller. All need the office open.
 
-- `start_new_patient` (intake, nobody verified): the call moves to `booking` as a new patient's
-  call, which can never be verified and never reaches a patient-data tool.
+- `start_new_patient` (intake, nobody verified, no identity claim pending, verification not
+  locked): the call moves to `booking` as a new patient's call, which can never be verified
+  and never reaches a patient-data tool. A locked call is offered staff, not a booking.
 - `collect_new_patient` (booking, a new patient's call): `full_name` (a first and a last name,
   no digits), `dob` (ISO, not in the future), `phone` (ten digits once spaces, dots, dashes and
   brackets are removed; stored as `555-410-2233`), `email` (one `@`, a dot in the domain, at

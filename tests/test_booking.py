@@ -24,7 +24,17 @@ from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.agent.claims import ClaimKeys
-from app.agent.state import CallState, IllegalTransitionError, Phase, move, new_call, verify
+from app.agent.state import (
+    CallState,
+    FailedAttempt,
+    IdentityClaim,
+    IllegalTransitionError,
+    Phase,
+    apply,
+    move,
+    new_call,
+    verify,
+)
 from app.agent.tool_registry import Deps, Registry, Status, ToolOutcome
 from app.agent.tools import register_tools
 from app.audit.log import AuditLog, Event, Outcome
@@ -32,6 +42,7 @@ from app.config import StartupSettings
 from app.db.roles import runtime_role_differences
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_session_factory
+from app.guard.input import GuardAction, guard_input
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -1301,3 +1312,60 @@ async def test_concurrent_booking_gives_one_winner(
     # The earliest slot went first, and no dispatch failed.
     assert rows(owner_engine, APPOINTMENTS)[0][3] == at(11, 25, 9, 30)
     assert first.tool_errors == second.tool_errors == 0
+
+
+# --- Rework M1: the SSN step cannot be left for a booking ------------------------------------
+
+# Last four digits as a caller might give them, built from pieces so no file holds them.
+SAID_DIGITS = ["44" + "21", "4 4 2 1", "four four two one"]
+
+
+async def test_armed_step_cannot_start_a_new_patient(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    claim = {"full_name": "Ann Example", "dob": "1990-02-03"}
+    claimed, _ = await done(registry, deps, intake(), "verify_identity", claim)
+    assert (claimed.expecting_ssn4, claimed.pending_claim is not None) == (True, True)
+    # Armed, then partly answered, then with the digits complete and the submit still to come.
+    first_half = guard_input("four four", claimed).change
+    assert first_half is not None
+    partly = apply(claimed, first_half)
+    second_half = guard_input("two one", partly).change
+    assert second_half is not None
+    complete = apply(partly, second_half)
+    assert (partly.pending_ssn4, complete.expecting_ssn4) == ("44", False)
+    for state in (claimed, partly, complete):
+        assert START not in offered(registry, state)
+        after, outcome = await run(registry, deps, state, START)
+        assert outcome == REFUSED
+        assert (after.phase, after.expecting_ssn4, after.pending_claim, after.pending_ssn4) == (
+            Phase.INTAKE,
+            state.expecting_ssn4,
+            state.pending_claim,
+            state.pending_ssn4,
+        )
+        with pytest.raises(IllegalTransitionError, match="claim"):
+            move(state, Phase.BOOKING)
+    # So the caller's digits are still taken by the step, never shown to the model.
+    for said in SAID_DIGITS:
+        decision = guard_input(said, claimed)
+        assert (decision.action, decision.text) == (GuardAction.SWALLOW, None), said
+    refused = ["tool_refused"] * 3
+    assert [row[0] for row in rows(owner_engine, EVENTS)] == ["identity_claimed", *refused]
+
+
+async def test_locked_call_cannot_start_a_new_patient(
+    registry: Registry, deps: Deps, seeded: None
+) -> None:
+    claim = IdentityClaim(full_name="Ann Example", dob=date(1990, 2, 3))
+    locked = intake()
+    for _ in range(3):
+        locked = apply(apply(locked, claim), FailedAttempt())
+    assert (locked.verify_locked, locked.pending_claim) == (True, None)
+    assert START not in offered(registry, locked)
+    after, outcome = await run(registry, deps, locked, START)
+    assert (outcome, after.phase, after.is_new_patient) == (REFUSED, Phase.INTAKE, False)
+    with pytest.raises(IllegalTransitionError, match="locked"):
+        move(locked, Phase.BOOKING)
+    # Staff is still open to it.
+    assert move(locked, Phase.HANDOFF).phase is Phase.HANDOFF

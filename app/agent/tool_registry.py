@@ -129,7 +129,7 @@ DOB_RULES: Mapping[DobKind, DobRule] = MappingProxyType(
         DobKind.IDENTITY_CLAIM: DobRule(
             description="an identity claim",
             phases=frozenset({Phase.INTAKE}),
-            callers=frozenset({Caller.UNIDENTIFIED}),
+            callers=frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED}),
             transition=IdentityClaim,
         ),
         DobKind.NEW_PATIENT_DETAILS: DobRule(

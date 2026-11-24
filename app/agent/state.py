@@ -15,8 +15,9 @@ claim ends with `verify` or a failed attempt, or with any phase change. The SSN 
 declaration; validation errors never show input.
 
 A new patient's call is the intake -> booking move: `is_new_patient` is set and the call can
-never be verified. Its details (`new_patient_details`, the draft) are stored by `collect`, in
-booking only, and are hidden like the SSN digits. `offer` remembers the slots a caller was
+never be verified. The move is refused while an identity claim is pending and for a locked
+call, so the SSN step can never be left for a booking. Its details (`new_patient_details`, the
+draft) are stored by `collect`, in booking only, and are hidden like the SSN digits. `offer` remembers the slots a caller was
 offered (`offered_slots`): a verified caller in serving or booking, or a new patient with the
 details. Every phase change ends the draft and the offered slots.
 
@@ -66,7 +67,10 @@ class Caller(StrEnum):
     # A first-time caller, booking, before and after their details are collected.
     NEW_PATIENT = "new_patient"
     NEW_PATIENT_WITH_DETAILS = "new_patient_with_details"
-    # Nobody known yet.
+    # Not verified: with an identity claim pending (the SSN step armed or awaiting submit), with
+    # verification locked, or neither.
+    CLAIMANT = "claimant"
+    LOCKED = "locked"
     UNIDENTIFIED = "unidentified"
 
 
@@ -224,6 +228,10 @@ def caller_of(state: CallState) -> Caller | None:
         if state.new_patient_details is None:
             return Caller.NEW_PATIENT
         return Caller.NEW_PATIENT_WITH_DETAILS
+    if state.verify_locked:
+        return Caller.LOCKED
+    if state.pending_claim is not None:
+        return Caller.CLAIMANT
     return Caller.UNIDENTIFIED
 
 
@@ -275,8 +283,10 @@ def _refuse(state: CallState, to: Phase, why: str = "not a legal move") -> Illeg
 
 def move(state: CallState, to: Phase) -> CallState:
     """Every legal move except intake -> serving. Hand-off needs the office open; intake ->
-    booking is a new patient's booking, and booking -> serving needs a verified caller. Every
-    move ends the identity claim and the SSN step, the new patient's draft and the slots
+    booking is a new patient's booking, refused while an identity claim is pending (the SSN
+    step is armed, or its digits await the submit: leaving would let them reach the model) and
+    for a call whose verification is locked; booking -> serving needs a verified caller.
+    Every move ends the identity claim and the SSN step, the new patient's draft and the slots
     offered."""
     if to not in _MOVES[state.phase]:
         raise _refuse(state, to)
@@ -285,6 +295,10 @@ def move(state: CallState, to: Phase) -> CallState:
     if to is Phase.SERVING and not state.verified:
         raise _refuse(state, to, "refused for a caller who is not verified")
     if state.phase is Phase.INTAKE and to is Phase.BOOKING:
+        if state.pending_claim is not None:
+            raise _refuse(state, to, "refused while an identity claim is pending")
+        if state.verify_locked:
+            raise _refuse(state, to, "refused for a locked call")
         return _next(state, phase=to, is_new_patient=True, **_NO_STEP, **_NO_BOOKING)
     return _next(state, phase=to, **_NO_STEP, **_NO_BOOKING)
 
