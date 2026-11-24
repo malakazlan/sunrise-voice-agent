@@ -149,7 +149,8 @@ All data used by this project is synthetic. No real customer or personal data is
     a table, function, trigger, role or schema in the application's database, nor a temporary
     table or function there, and it cannot connect to any database that existed at set-up time.
   - Anything else it holds is taken away: grants the owner made it in this database and on
-    databases, membership in other roles, settings attached to the role, parameter privileges,
+    databases, memberships the owner granted it (one another role granted is left in place,
+    and the start refuses it), settings attached to the role, parameter privileges,
     and what it can make itself own and Postgres cannot forbid: default privileges, and large
     objects (one may remain from before their creation was closed). `PUBLIC` loses every
     privilege on the tables, sequences and functions, `CREATE` on the schema, `CREATE` and

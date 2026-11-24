@@ -14,8 +14,9 @@ declares, and nothing else:
   and the old one stops working; so is a password the role set for itself. It is sent as a
   SCRAM-SHA-256 verifier made by the driver, never as the password itself, in a statement no
   log, event or error message sees (app/db/session.py).
-- What it holds besides is taken away: membership in other roles, settings attached to it, and,
-  through DROP OWNED, every privilege the owner granted it in this database and on shared
+- What it holds besides is taken away: the memberships the owner granted it (a membership
+  another role granted is left, and the comparison below refuses it), settings attached to
+  it, and, through DROP OWNED, every privilege the owner granted it in this database and on shared
   objects (databases, parameters). DROP OWNED also drops what the role can make itself own and
   Postgres cannot forbid: default privileges, and large objects (whose creation it is refused,
   but one may remain from before). If it owns anything else, anywhere on the server, set-up
@@ -69,10 +70,17 @@ KIND = text(
 # What a role can make itself own in a database it can connect to, and DROP OWNED removes.
 REMOVABLE = ("pg_default_acl", "pg_largeobject")
 MEMBERSHIPS = text(
-    "SELECT granted.rolname, grantor.rolname FROM pg_auth_members m"
+    "SELECT granted.rolname FROM pg_auth_members m"
+    " JOIN pg_roles granted ON granted.oid = m.roleid WHERE m.member = :role ORDER BY 1"
+)
+# The memberships of the role this session's user granted: the ones an ordinary REVOKE by it
+# removes (Postgres 16 records who granted each membership, and REVOKE takes away only the
+# revoking role's own grant).
+OWN_MEMBERSHIP_GRANTS = text(
+    "SELECT granted.rolname FROM pg_auth_members m"
     " JOIN pg_roles granted ON granted.oid = m.roleid"
-    " JOIN pg_roles grantor ON grantor.oid = m.grantor"
-    " WHERE m.member = :role ORDER BY 1, 2"
+    " WHERE m.member = :role"
+    " AND m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user) ORDER BY 1"
 )
 ROLE_SETTINGS = text(
     "SELECT d.datname FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid = s.setdatabase"
@@ -365,7 +373,7 @@ def runtime_role_differences(connection: Connection, role_name: str) -> list[str
     ]
     differences += [
         f"member of {granted}"
-        for granted, _grantor in connection.execute(MEMBERSHIPS, {"role": role})
+        for granted in connection.execute(MEMBERSHIPS, {"role": role}).scalars()
     ]
     differences += [
         f"role {member} is a member of the runtime role"
@@ -412,8 +420,10 @@ def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> N
         )
     )
 
-    for granted, grantor in connection.execute(MEMBERSHIPS, {"role": oid}).all():
-        connection.execute(text(f"REVOKE {quote(granted)} FROM {role} GRANTED BY {quote(grantor)}"))
+    # Only the owner's own grants, never in another grantor's name; any other membership is
+    # left, and the comparison below refuses the start naming it.
+    for granted in connection.execute(OWN_MEMBERSHIP_GRANTS, {"role": oid}).scalars().all():
+        connection.execute(text(f"REVOKE {quote(granted)} FROM {role}"))
     for in_database in connection.execute(ROLE_SETTINGS, {"role": oid}).scalars().all():
         where = "" if in_database is None else f" IN DATABASE {quote(in_database)}"
         connection.execute(text(f"ALTER ROLE {role}{where} RESET ALL"))
@@ -421,7 +431,6 @@ def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> N
 
     connection.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC"))
     connection.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC"))
-    connection.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC"))
     # The declaration's function names are SQL signatures.
     for signature in grants.FUNCTION_PRIVILEGES:
         connection.execute(text(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC"))

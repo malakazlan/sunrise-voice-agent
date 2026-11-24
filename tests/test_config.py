@@ -21,6 +21,7 @@ from app.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
+COMPOSE = REPO_ROOT / "deploy" / "docker-compose.yml"
 
 # The application's settings, written out by hand: the runtime role, where the database is,
 # and nothing of the owner.
@@ -161,18 +162,8 @@ STARTUP_COMMAND = (
 
 
 def compose_service(name: str) -> list[str]:
-    """The lines of one service in deploy/docker-compose.yml, its own header excluded."""
-    lines = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8").splitlines()
-    start = lines.index(f"  {name}:") + 1
-    end = next(
-        (
-            index
-            for index in range(start, len(lines))
-            if lines[index] and not lines[index].startswith("    ")
-        ),
-        len(lines),
-    )
-    return [line.strip() for line in lines[start:end]]
+    """The lines of one service in deploy/docker-compose.yml, stripped."""
+    return [line.strip() for line in compose_service_lines(name)]
 
 
 def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
@@ -188,6 +179,81 @@ def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
     # The app waits for the start-up service to have exited with 0; a failure keeps it down.
     depends = app[app.index("depends_on:") :]
     assert depends[:3] == ["depends_on:", "startup:", "condition: service_completed_successfully"]
+
+
+def compose_service_lines(name: str) -> list[str]:
+    """The raw lines of one service in deploy/docker-compose.yml, its own header excluded."""
+    lines = COMPOSE.read_text(encoding="utf-8").splitlines()
+    start = lines.index(f"  {name}:") + 1
+    end = next(
+        (
+            index
+            for index in range(start, len(lines))
+            if lines[index] and not lines[index].startswith("    ")
+        ),
+        len(lines),
+    )
+    return lines[start:end]
+
+
+ANCHOR = re.compile(r"^x-[a-z-]+: &(?P<anchor>[a-z-]+)$")
+MAPPING_KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Z_]+):")
+MERGE = re.compile(r"^ *<<: *(?P<anchors>.+)$")
+
+
+def compose_anchors() -> dict[str, set[str]]:
+    """The variable names each top-level `x-…: &anchor` mapping of the Compose file holds."""
+    anchors: dict[str, set[str]] = {}
+    current: set[str] | None = None
+    for line in COMPOSE.read_text(encoding="utf-8").splitlines():
+        if match := ANCHOR.match(line):
+            current = anchors.setdefault(match["anchor"], set())
+        elif current is not None and line.startswith("  ") and (key := MAPPING_KEY.match(line)):
+            current.add(key["key"])
+        elif line and not line.startswith(" "):
+            current = None
+    return anchors
+
+
+def compose_environment(name: str) -> set[str]:
+    """The variable names a service's environment gets, by direct entry or merged anchors."""
+    anchors = compose_anchors()
+    lines = compose_service_lines(name)
+    names: set[str] = set()
+    inside = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("environment:"):
+            inline = stripped.removeprefix("environment:").strip()
+            if inline:
+                names |= anchors[inline.removeprefix("*")]
+            inside = not inline
+            continue
+        if inside and line.startswith("      "):
+            if merge := MERGE.match(line):
+                for anchor in merge["anchors"].strip("[]").split(","):
+                    names |= anchors[anchor.strip().removeprefix("*")]
+            elif key := MAPPING_KEY.match(line):
+                names.add(key["key"])
+        else:
+            inside = False
+    return names
+
+
+def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
+    owner = {name.upper() for name in OWNER_FIELDS}
+    assert compose_anchors().keys() >= {"database-credentials", "runtime-database"}
+
+    assert compose_environment("app") == {name.upper() for name in Settings.model_fields}
+    assert compose_environment("startup") == {name.upper() for name in StartupSettings.model_fields}
+    assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+
+    # No other route either: no env_file anywhere in the app service, and the owner's names
+    # nowhere in its text (not even inside another variable's value).
+    app = compose_service_lines("app")
+    assert not any(line.strip().startswith("env_file") for line in app)
+    assert not any(name in line for line in app for name in owner)
+    assert not owner & compose_environment("app")
 
 
 @pytest.mark.usefixtures("offline_env")

@@ -568,6 +568,101 @@ def test_a_parameter_grant_cannot_switch_the_triggers_off(
     assert type(excinfo.value.orig) is errors.InsufficientPrivilege
 
 
+# --- Memberships: set-up removes only what the owner granted ------------------------------
+
+
+@pytest.fixture
+def group_role(server_settings: StartupSettings, fresh_role: StartupSettings) -> Iterator[str]:
+    """An ordinary role a membership can be granted in. Dropped after the test database."""
+    name = new_role_name("group")
+    engine = create_owner_sync_engine(fresh_role, poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f'CREATE ROLE "{name}"'))
+    finally:
+        engine.dispose()
+    try:
+        yield name
+    finally:
+        drop_database(server_settings, fresh_role.postgres_db)
+        drop_role(server_settings, name)
+
+
+MEMBER_OF = text(
+    "SELECT granted.rolname, grantor.rolname FROM pg_auth_members m"
+    " JOIN pg_roles granted ON granted.oid = m.roleid"
+    " JOIN pg_roles grantor ON grantor.oid = m.grantor"
+    " WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = :name) ORDER BY 1, 2"
+)
+
+
+def memberships(engine: Engine, role: str) -> list[tuple[str, str]]:
+    with engine.connect() as connection:
+        return [tuple(row) for row in connection.execute(MEMBER_OF, {"name": role})]
+
+
+def test_a_membership_the_owner_granted_is_removed(
+    fresh_role: StartupSettings, group_role: str, owner_engine: Engine
+) -> None:
+    set_up_roles(fresh_role)
+    role = f'"{fresh_role.app_db_user}"'
+    grant_as_owner(
+        owner_engine, f'GRANT "{group_role}" TO {role}', f"GRANT pg_read_all_data TO {role}"
+    )
+    assert len(memberships(owner_engine, fresh_role.app_db_user)) == 2
+
+    set_up_roles(fresh_role)
+
+    assert memberships(owner_engine, fresh_role.app_db_user) == []
+
+
+@pytest.mark.parametrize("granted", ["group", "pg_read_all_data"])
+def test_a_membership_another_role_granted_stops_the_setup(
+    fresh_role: StartupSettings,
+    helper: StartupSettings,
+    group_role: str,
+    owner_engine: Engine,
+    granted: str,
+) -> None:
+    # The verifier's case: a role with ADMIN OPTION grants the membership. Set-up does not
+    # revoke it in that role's name; it leaves it and refuses to start, naming it.
+    set_up_roles(fresh_role)
+    name = group_role if granted == "group" else granted
+    grant_as_owner(owner_engine, f'GRANT "{name}" TO "{helper.postgres_user}" WITH ADMIN OPTION')
+    grant_as(helper, f'GRANT "{name}" TO "{fresh_role.app_db_user}"')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        set_up_roles(fresh_role)
+
+    # pg_read_all_data also lets the role read what the declaration does not.
+    reads = (
+        "; sequence appointments_id_seq: SELECT not declared"
+        "; sequence available_slots_id_seq: SELECT not declared"
+        "; sequence medications_id_seq: SELECT not declared"
+        "; table alembic_version: SELECT not declared"
+    )
+    reported = f"member of {name}" + (reads if name == "pg_read_all_data" else "")
+    assert str(excinfo.value) == f"the runtime role does not match the declaration: {reported}"
+    assert memberships(owner_engine, fresh_role.app_db_user) == [(name, helper.postgres_user)]
+
+
+def test_a_public_grant_on_another_database_by_another_role_stops_the_setup(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    # Set-up takes PUBLIC's privileges on the other databases away, but only those the owner
+    # gave; one another role gave stays, and the comparison of what the role can effectively
+    # do (it reaches the role through PUBLIC) refuses the start.
+    case = (
+        "GRANT CONNECT ON DATABASE postgres TO {helper} WITH GRANT OPTION",
+        "GRANT CONNECT ON DATABASE postgres TO PUBLIC",
+        "",
+    )
+    refusal = granted_by_helper(fresh_role, helper, owner_engine, [case])
+    assert refusal == (
+        "the runtime role does not match the declaration: database postgres: CONNECT not declared"
+    )
+
+
 # --- F5: concurrent set-ups ------------------------------------------------------------------
 
 

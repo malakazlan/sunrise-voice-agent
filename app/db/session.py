@@ -240,8 +240,10 @@ def set_role_password(connection: Connection, role: str, password: SecretStr) ->
     libpq's PQencryptPasswordConn: with the algorithm named it computes the verifier on this
     side (a fresh random salt each time, the iteration count the server reported) and sends
     nothing; without one it would ask the server for its `password_encryption` setting, which
-    may be md5. A verifier cannot be used to log in, but it allows guessing the password
-    offline, so the statement goes straight to the driver connection, past SQLAlchemy: its
+    may be md5. A verifier alone does not log in, but whoever holds it can guess the password
+    offline, can pose as the server to a client of this role, and with one recorded login
+    exchange of the role can log in as it. So the statement goes straight to the driver
+    connection, past SQLAlchemy: its
     statement log, events and error messages never see it, psycopg logs no statements, and a
     driver error does not quote the statement. The error is scrubbed like the engines' errors.
     """
