@@ -9,14 +9,14 @@ import logging
 import re
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, VOICE_SECRETS, offline_settings
 from httpx2 import AsyncClient, MockTransport, Request, Response
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.claims import ClaimKeys
 from app.agent.endings import drain_call_events
@@ -30,11 +30,12 @@ from app.agent.prompts import SYSTEM_PROMPT, TOOL_DESCRIPTIONS
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry
 from app.agent.tools import register_tools
-from app.agent.turn import CALL_CONNECTED, CallAgent, start_call
+from app.agent.turn import CALL_CONNECTED, CallAgent, drain_guard_audits, start_call
 from app.audit.log import CHAIN_LOCK, AuditLog
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
+from app.main import create_app
 from app.voice.calls import CallRegistry
 from evals.scripted import ScriptedModel, Step, calls, says
 
@@ -62,6 +63,7 @@ EMERGENCY = (
     " nearest emergency room right away."
 )
 FALLBACK = "I'm sorry, I can't help with that. I can take a message for our staff instead."
+ADVICE_REFUSAL = "I'm not able to give medical advice. I can send a message to your doctor instead."
 
 CLAIM_TURN = "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
 SARAH_CLAIM = {"full_name": "Sarah Johnson", "dob": "1985-03-14"}
@@ -96,6 +98,9 @@ SERVING_TOOLS = [
 CLOSED_TOOLS = ["take_message", "report_emergency", "close_call"]
 
 EVENTS = text("SELECT action, resource_type, resource_id, outcome FROM audit_events ORDER BY seq")
+EVENTS_WITH_REASONS = text(
+    "SELECT action, resource_type, resource_id, outcome, reason FROM audit_events ORDER BY seq"
+)
 
 
 # --- the scripted model's failures ------------------------------------------------------
@@ -729,6 +734,256 @@ async def test_prompt_is_static(deps: Deps, registry: Registry) -> None:
 def test_every_offered_tool_is_described() -> None:
     registry = register_tools()
     assert sorted(t.name for t in registry.tools if t.model_callable) == sorted(TOOL_DESCRIPTIONS)
+
+
+# --- the output guard (spec 12: R9, R10) --------------------------------------------------
+
+
+def rows_with_reasons(engine: Engine) -> list[tuple[Any, ...]]:
+    with engine.connect() as connection:
+        return [tuple(row) for row in connection.execute(EVENTS_WITH_REASONS)]
+
+
+async def test_blocked_text_goes_nowhere(
+    deps: Deps, registry: Registry, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    marker = "marker-blocked-words"
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry, FIXED_CALL_ID)
+    await verified(agent, model)
+    model.then(
+        says(f"Let me see. You should stop taking {marker} today. Then call us back."),
+        says("Is there anything else?"),
+    )
+
+    result = await agent.handle("Should I keep taking my pills?")
+
+    # What came before the blocked sentence is said; the sentence is replaced by its line and
+    # the rest of the reply is dropped.
+    assert result.lines == ("Let me see.", ADVICE_REFUSAL)
+    assert result.withheld == "medical_advice"
+    assert result.hand_off is False
+
+    await agent.handle("No, thanks.")
+    await drain_guard_audits()
+    # The conversation has what was said, never the blocked text or what came after it.
+    sent = everything_sent(model)
+    for blocked in (marker, "stop taking", "Then call us back"):
+        assert blocked not in sent, blocked
+    assert model.requests[-1].messages[-3:] == [
+        {"role": "assistant", "content": "Let me see."},
+        {"role": "assistant", "content": ADVICE_REFUSAL},
+        {"role": "user", "content": "No, thanks."},
+    ]
+    assert_well_formed(model.requests[-1].messages)
+    # The log has the rule's name, the call id and the count, never the text.
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
+        f"guard_block call_id={FIXED_CALL_ID} rule=medical_advice blocks=1 hand_off=False"
+    ]
+    for blocked in (marker, "stop taking", "Then call us back", "Let me see"):
+        assert blocked not in caplog.text, blocked
+    # One audit event, the rule its reason; no text in it.
+    events = rows_with_reasons(owner_engine)
+    assert events[-1] == ("guard_block", "call", FIXED_CALL_ID, "refused", "medical_advice")
+    assert [event[0] for event in events].count("guard_block") == 1
+    assert marker not in json.dumps([[str(value) for value in event] for event in events])
+
+
+async def test_two_blocks_hand_off(
+    deps: Deps, registry: Registry, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    model = ScriptedModel(
+        says("It's probably just a cold."),
+        says("Our staff can help with that."),
+        says("You should skip your next dose."),
+        says("That's nothing to worry about."),
+        says("I can take a message."),
+    )
+    agent = agent_for(model, deps, registry)
+
+    turns = [
+        await agent.handle(caller)
+        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?", "Okay.")
+    ]
+
+    assert [(turn.lines, turn.withheld, turn.hand_off) for turn in turns] == [
+        ((ADVICE_REFUSAL,), "medical_advice", False),
+        # An allowed reply in between: the count starts again.
+        (("Our staff can help with that.",), None, False),
+        ((ADVICE_REFUSAL,), "medical_advice", False),
+        # Two blocks in a row.
+        ((ADVICE_REFUSAL,), "medical_advice", True),
+        # The hand-off, once asked for, stays asked for.
+        (("I can take a message.",), None, True),
+    ]
+    call_id = agent.state.call_id
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
+        f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
+        f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
+        f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
+    ]
+    await drain_guard_audits()
+    assert (
+        rows_with_reasons(owner_engine)
+        == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
+    )
+
+
+QUESTION = "Should I stop taking my Lisinopril because of the headaches?"
+
+
+async def test_a_message_read_back_is_said(deps: Deps, registry: Registry) -> None:
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry)
+    await verified(agent, model)
+    read_back = f"Your message to Dr. Patel reads: {QUESTION} Shall I send it?"
+    model.then(
+        calls(("send_message_to_doctor", {"summary_short": QUESTION})),
+        says(read_back),
+        says(read_back),
+    )
+
+    first = await agent.handle("Ask my doctor if I should stop my Lisinopril for the headaches.")
+
+    # The tool returned the caller's own words to be read back: they are said.
+    assert (first.lines, first.withheld, first.hand_off) == ((read_back,), None, False)
+    assert tool_results(model.requests[-1])[0]["content"]["data"] == {
+        "status": "needs_confirmation",
+        "message": QUESTION,
+    }
+    # In a later turn, with no read-back from a tool, the same words are the model's own.
+    second = await agent.handle("Sorry, what was that?")
+    assert (second.lines, second.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
+    await drain_guard_audits()
+
+
+async def test_a_callback_reason_read_back_is_said(deps: Deps, registry: Registry) -> None:
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry)
+    await verified(agent, model)
+    arguments = {
+        "name": "Sarah Johnson",
+        "callback_number": "555-410-2233",
+        "reason_short": QUESTION,
+    }
+    read_back = f"I'll leave a message for a callback about: {QUESTION} Is that right?"
+    model.then(calls(("take_message", arguments)), says(read_back))
+
+    said = await agent.handle("Can someone call me back about my Lisinopril?")
+
+    # take_message returned the caller's reason to be read back: it is said.
+    assert tool_results(model.requests[-1])[0]["content"]["data"]["reason_short"] == QUESTION
+    assert (said.lines, said.withheld) == ((read_back,), None)
+
+
+async def test_a_first_sentence_over_the_bound_falls_back(
+    offline_deps: Deps, registry: Registry, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    model = ScriptedModel(says("A" * 600 + ". Short one."))
+    agent = agent_for(model, offline_deps, registry)
+
+    result = await agent.handle("Hello.")
+
+    assert (result.lines, result.withheld, result.hand_off) == ((FALLBACK,), None, False)
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("model_")] == [
+        f"model_fallback call_id={agent.state.call_id} reason=reply_too_long failures=1"
+        " hand_off=False"
+    ]
+
+
+class Unreachable:
+    """Sessions from a database that cannot be reached."""
+
+    def __call__(self) -> AsyncSession:
+        raise ConnectionRefusedError("the database is down")
+
+
+class Hanging:
+    """Sessions that never open."""
+
+    def __call__(self) -> "Hanging":
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        await asyncio.Event().wait()
+        raise AssertionError("a session that never opens does not open")
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class Slow:
+    """Sessions that take a moment, then cannot be had; `ended` says the attempt is over."""
+
+    def __init__(self) -> None:
+        self.ended = False
+
+    def __call__(self) -> "Slow":
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        await asyncio.sleep(0.2)
+        self.ended = True
+        raise ConnectionRefusedError("the database is down")
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def test_shutdown_waits_for_guard_audits(registry: Registry) -> None:
+    sessions = Slow()
+    deps = Deps(
+        sessions=cast("async_sessionmaker[AsyncSession]", sessions),
+        audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
+        now=lambda: T0,
+        claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+    )
+    state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
+    app = create_app(offline_settings())
+
+    # The loop stays up after the app's shutdown, so only the shutdown can have waited.
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            model = ScriptedModel(says("It's probably just a cold."))
+            await CallAgent(state, deps, model, registry).handle("I feel sick.")
+            assert sessions.ended is False
+        assert sessions.ended is True
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("sessions", [Unreachable, Hanging], ids=["failed", "cancelled"])
+async def test_guard_audit_failures_are_logged(
+    registry: Registry, caplog: pytest.LogCaptureFixture, sessions: type[Unreachable | Hanging]
+) -> None:
+    caplog.set_level(logging.INFO)
+    deps = Deps(
+        sessions=cast("async_sessionmaker[AsyncSession]", sessions()),
+        audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
+        now=lambda: T0,
+        claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+    )
+    state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
+    agent = CallAgent(state, deps, ScriptedModel(says("It's probably just a cold.")), registry)
+
+    result = await agent.handle("I feel sick.")
+    # The block stands whatever becomes of its audit event.
+    assert (result.lines, result.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
+
+    # At the end of the call: a write that cannot finish in time is cancelled, and logged.
+    await drain_guard_audits(timeout=0.05)
+    expected = {
+        Unreachable: "guard_audit_failed call_id={} rule=medical_advice"
+        " error=ConnectionRefusedError",
+        Hanging: "guard_audit_cancelled call_id={} rule=medical_advice",
+    }[sessions].format(FIXED_CALL_ID)
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_audit")] == [
+        expected
+    ]
+    assert "database is down" not in caplog.text
 
 
 # --- R10 --------------------------------------------------------------------------------

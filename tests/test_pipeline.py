@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection
 from aiortc.mediastreams import AudioStreamTrack
-from conftest import VOICE_SECRETS, offline_settings
+from conftest import REPO_ROOT, VOICE_SECRETS, offline_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pipecat.frames.frames import (
@@ -28,15 +28,17 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
-from test_turn import deps_on
+from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
 import app.voice.transport
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import CallAgent, TurnResult
+from app.agent.turn import CallAgent, TurnResult, TurnTimings
 from app.db.session import create_database_engine
+from app.guard.input import GuardAction
+from app.guard.output import OutputRule
 from app.main import create_app
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import AgentProcessor, deepgram_stt, open_agent_call
@@ -120,6 +122,7 @@ async def test_finished_utterances_become_turns(
             "action": "pass",
             "shown": "I have a question about my appointment.",
             "lines": ["How can I help with your appointment?"],
+            "withheld": None,
             "hand_off": False,
             "timings": {
                 # One clock, read in turn: speech end 100.1, transcript final 100.2, the turn's
@@ -184,6 +187,35 @@ async def test_turns_wait_for_the_finalized_transcript(offline_deps: Deps) -> No
 
     assert [m["shown"] for m in messages(list(down))] == ["first part still first", "second"]
     assert [m["timings"]["stt_ms"] for m in messages(list(down))] == [None, None]
+
+
+class Withheld:
+    """A turn whose reply the output guard blocked."""
+
+    async def handle(self, transcript: str) -> TurnResult:
+        return TurnResult(
+            action=GuardAction.PASS,
+            shown=transcript,
+            lines=(ADVICE_REFUSAL,),
+            hand_off=False,
+            timings=TurnTimings(first_token_ms=1, last_token_ms=2, tool_rounds=0),
+            withheld=OutputRule.MEDICAL_ADVICE,
+        )
+
+
+@pytest.mark.anyio
+async def test_a_withheld_reply_reaches_the_page_by_its_rule() -> None:
+    processor = AgentProcessor(CALL_ID, Withheld(), OPENING, Clock())
+
+    down, _up = await run_test(
+        processor,
+        frames_to_send=[transcript("Is it serious?", finalized=True), SleepFrame(sleep=0.3)],
+    )
+
+    (turn,) = messages(list(down))
+    assert (turn["lines"], turn["withheld"]) == ([ADVICE_REFUSAL], "medical_advice")
+    page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert "(a reply was withheld: ${message.withheld})" in page
 
 
 class Broken:

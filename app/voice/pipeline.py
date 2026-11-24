@@ -7,7 +7,8 @@ the speech-to-text service says the utterance is finalized, and queues it. One t
 takes the queue in order, one turn at a time, so the audio path never waits on the model, a
 tool or the database. The raw transcript goes to the agent and nowhere else: not downstream,
 not to the page, not to a log. The page gets what the model was given (the guard's text, or
-nothing for a swallowed turn), the lines said and the timings.
+nothing for a swallowed turn), the lines said, the name of the output guard's rule when it
+withheld part of the reply (never the withheld text) and the timings.
 
 Logs carry event names, the call id, counts and milliseconds; never text.
 """
@@ -208,6 +209,7 @@ class AgentProcessor(FrameProcessor):
                 "action": result.action.value,
                 "shown": result.shown,
                 "lines": list(result.lines),
+                "withheld": None if result.withheld is None else result.withheld.value,
                 "hand_off": result.hand_off,
                 "timings": timings,
             }

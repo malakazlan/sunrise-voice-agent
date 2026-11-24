@@ -29,6 +29,8 @@ class ScriptId(StrEnum):
     AFTER_HOURS_CLOSE = "after_hours_close"
     FALLBACK = "fallback"
     BOOKING_INSTRUCTIONS = "booking_instructions"
+    ADVICE_REFUSAL = "advice_refusal"
+    REFILL_NO_PROMISE = "refill_no_promise"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +91,9 @@ SCRIPTS = MappingProxyType(
             " 911. Have a good {part_of_day}.",
             interruptible=True,
         ),
-        # For a model turn that failed or ran too long (app/agent/turn.py), and for the
-        # automatic hand-off with the office closed (app/agent/tools.py).
+        # For a model turn that failed or ran too long (app/agent/turn.py), for the
+        # automatic hand-off with the office closed (app/agent/tools.py), and in place of a
+        # sentence the output guard blocks for SSN digits or patient data (app/guard/output.py).
         ScriptId.FALLBACK: Script(
             "I'm sorry, I can't help with that. I can take a message for our staff instead.",
             interruptible=True,
@@ -98,6 +101,18 @@ SCRIPTS = MappingProxyType(
         ScriptId.BOOKING_INSTRUCTIONS: Script(
             "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
             " receive a confirmation by email.",
+            interruptible=True,
+        ),
+        # In place of a sentence the output guard blocks as medical advice.
+        ScriptId.ADVICE_REFUSAL: Script(
+            "I'm not able to give medical advice. I can send a message to your doctor instead.",
+            interruptible=True,
+        ),
+        # In place of a sentence the output guard blocks as a refill promise. It claims no
+        # action: nothing has been sent when it is said.
+        ScriptId.REFILL_NO_PROMISE: Script(
+            "I'm not able to confirm that a refill is approved. I can send the request to our"
+            " team.",
             interruptible=True,
         ),
     }
