@@ -1,0 +1,11 @@
+{% extends "frame.html" %}
+{% block title %}Requests{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Requests</h1>
+    <p class="page-head__sub">Everything the agent took for staff to act on: refills, bookings, callbacks, messages for a doctor and transfers.</p>
+  </div>
+</div>
+{% include "_requests_card.html" %}
+{% endblock %}

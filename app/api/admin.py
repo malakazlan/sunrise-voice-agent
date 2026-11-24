@@ -1,46 +1,61 @@
 """The admin API: read-only views of the requests, the messages, the calls and the audit log,
-behind HTTP Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is set.
+behind HTTP Basic sign-in. app/console/service.py mounts it at PREFIX, beside the console, only
+when ADMIN_PASSWORD is set.
 
 Every successful read appends one audit event naming the admin, in the transaction that read
 the rows, and the rows leave only once that transaction has committed. A call that is not
 there, or an id that is not a call id, is answered as an unknown path is, and not audited. The
 list of calls carries no transcript; only the read of one call does. Every text value from the
 database passes `mask` on its way out, transcripts included, and a callback number shows only
-its last four digits, whatever its shape. Every response carries `Cache-Control: no-store`,
-errors included. One verification of the chain runs at a time.
+its last four digits, whatever its shape (app/api/reads.py, which the console reads with too).
+Every response carries `Cache-Control: no-store`, errors included. One verification of the
+chain runs at a time, across the API and the console.
 """
 
 import hashlib
 import hmac
 import logging
-import re
 from base64 import b64decode
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import InstrumentedAttribute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.audit.log import ADMIN_PREFIX, CALL_ID, Action, AuditLog, Event, Outcome, ResourceType
-from app.audit.read import MAX_PAGE, MAX_SEQ, recent_events
+from app.api.reads import (
+    CALL_COLUMNS,
+    MESSAGE_COLUMNS,
+    REQUEST_COLUMNS,
+    AuditPage,
+    Page,
+    call,
+    masked,
+    newest,
+    shown_callback,
+)
+from app.audit.log import (
+    ADMIN_PREFIX,
+    CALL_ID,
+    Action,
+    AuditLog,
+    Event,
+    Outcome,
+    ResourceType,
+    Verification,
+)
+from app.audit.read import recent_events
 from app.config import Settings
 from app.db import models
-from app.guard.mask import mask
 from app.guard.rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 PREFIX = "/admin/api"
-DEFAULT_PAGE = 50
-# The largest value of a Postgres integer, the type of request and message ids.
-MAX_ROW_ID = 2**31 - 1
 # A Basic header for a 32-character user name and a long password is well under this. A longer
 # header is refused before it is decoded or hashed.
 MAX_AUTHORIZATION_LENGTH = 1024
@@ -50,67 +65,21 @@ MAX_TRACKED_ADDRESSES = 10_000
 CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
 # A verification asked for while another runs is refused; this is when to ask again.
 VERIFY_RETRY_SECONDS = 5
-DIGIT = re.compile(r"\d")
-
-REQUEST_COLUMNS = (
-    models.Request.id,
-    models.Request.created_at,
-    models.Request.call_id,
-    models.Request.type,
-    models.Request.summary,
-    models.Request.patient_id,
-)
-MESSAGE_COLUMNS = (
-    models.Message.id,
-    models.Message.created_at,
-    models.Message.call_id,
-    models.Message.kind,
-    models.Message.name,
-    models.Message.callback_number,
-    models.Message.body,
-    models.Message.patient_id,
-)
-CALL_COLUMNS = (
-    models.CallSession.id,
-    models.CallSession.call_id,
-    models.CallSession.started_at,
-    models.CallSession.ended_at,
-    models.CallSession.office_open,
-    models.CallSession.verified,
-    models.CallSession.patient_id,
-    models.CallSession.end_reason,
-    models.CallSession.turn_count,
-)
 # The same body as a path that does not exist.
 NOT_FOUND = "Not Found"
 
-
-class Page(BaseModel):
-    """A page of requests or messages: ids are Postgres integers."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    limit: int = Field(default=DEFAULT_PAGE, ge=1, le=MAX_PAGE)
-    before: int | None = Field(default=None, ge=1, le=MAX_ROW_ID)
-
-
-class AuditPage(Page):
-    """A page of audit events: seqs are bigints."""
-
-    before: int | None = Field(default=None, ge=1, le=MAX_SEQ)
-    call_id: str | None = None
-    action: Action | None = None
-
-    @field_validator("call_id")
-    @classmethod
-    def _call_id_shape(cls, value: str | None) -> str | None:
-        if value is not None and not CALL_ID.fullmatch(value):
-            raise ValueError("call_id does not have the shape of a call id")
-        return value
+# Where the reads run, and a read: one of app/api/reads.py's functions given all but its
+# session. None means it found nothing.
+type SessionFactory = async_sessionmaker[AsyncSession]
+type Reader[T] = Callable[[AsyncSession], Awaitable[T | None]]
 
 
 class NoQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class VerificationRunningError(Exception):
+    """Another verification of the chain is running."""
 
 
 def _supplied_credentials(header: str | None) -> tuple[bytes, bytes] | None:
@@ -142,53 +111,124 @@ def _credentials_match(
 
 
 def _masked(row: Mapping[str, Any]) -> dict[str, Any]:
-    """A row as the API shows it: text masked, instants as ISO 8601 text, numbers and nulls as
-    they are. Any other type stops the response."""
-    shown: dict[str, Any] = {}
-    for name, value in row.items():
-        if isinstance(value, str):
-            shown[name] = mask(value)
-        elif isinstance(value, datetime):
-            shown[name] = value.isoformat()
-        elif value is None or isinstance(value, int):
-            shown[name] = value
-        else:
-            raise TypeError(f"{name} has a type the admin API does not show")
-    return shown
+    """A row as the API shows it: masked (app/api/reads.py), instants as ISO 8601 text."""
+    return {
+        name: value.isoformat() if isinstance(value, datetime) else value
+        for name, value in masked(row).items()
+    }
 
 
-def _shown_callback(value: str | None) -> str | None:
-    """A callback number as `***-***-` and its last four digits, however it was written;
-    with fewer than four digits, nothing of it."""
-    if value is None:
-        return None
-    digits = DIGIT.findall(value)
-    return "***-***-" + ("".join(digits[-4:]) if len(digits) >= 4 else "****")
+async def _audited[T](
+    sessions: SessionFactory,
+    audit: AuditLog,
+    event: Event,
+    read: Reader[T],
+) -> T | None:
+    """The read and its audit event in one transaction; nothing is returned unless both
+    committed. A read that finds nothing (None) writes no event."""
+    async with sessions() as session:
+        result = await read(session)
+        if result is not None:
+            await audit.append(session, event, now=datetime.now(UTC))
+            await session.commit()
+    return result
 
 
-async def _newest(
-    session: AsyncSession,
-    columns: Sequence[InstrumentedAttribute[Any]],
-    row_id: InstrumentedAttribute[int],
-    page: Page,
-) -> list[dict[str, Any]]:
-    statement = select(*columns)
-    if page.before is not None:
-        statement = statement.where(row_id < page.before)
-    rows = await session.execute(statement.order_by(row_id.desc()).limit(page.limit))
-    return [dict(row._mapping) for row in rows]
+async def _nothing_read(_session: AsyncSession) -> bool:
+    """For an event that records an act and reads no row: the admin signing in or out."""
+    return True
 
 
-async def _call(session: AsyncSession, call_id: str) -> dict[str, Any] | None:
-    """The stored call with its transcript, or None."""
-    statement = select(
-        *CALL_COLUMNS,
-        models.CallSession.transcript,
-        models.CallSession.transcript_truncated,
-        models.CallSession.names_masked,
-    ).where(models.CallSession.call_id == call_id)
-    row = (await session.execute(statement)).first()
-    return None if row is None else dict(row._mapping)
+class AdminAccess:
+    """What the admin API and the console share, built once per application: the admin's
+    sign-in check with its failed-sign-in limiter, the reads with their audit events, and the
+    one verification of the chain that may run at a time."""
+
+    def __init__(self, settings: Settings, sessions: SessionFactory, audit: AuditLog) -> None:
+        if settings.admin_user is None or settings.admin_password is None:
+            raise ValueError("the admin's pages need admin_user and admin_password")
+        self.user = settings.admin_user
+        self.actor = f"{ADMIN_PREFIX}{settings.admin_user}"
+        self._expected_user = hashlib.sha256(settings.admin_user.encode("utf-8")).digest()
+        self._expected_password = hashlib.sha256(
+            settings.admin_password.get_secret_value().encode("utf-8")
+        ).digest()
+        self._limiter = RateLimiter(
+            limit=SIGN_IN_FAILURES,
+            window_seconds=SIGN_IN_WINDOW_SECONDS,
+            max_addresses=MAX_TRACKED_ADDRESSES,
+        )
+        self._sessions = sessions
+        self._audit = audit
+        self._verifying = False
+
+    def limited(self, address: str) -> bool:
+        """Whether the address has failed too often to be let try again yet."""
+        if self._limiter.blocked(address):
+            logger.warning("admin_sign_in_limited")
+            return True
+        return False
+
+    def signs_in(self, address: str, credentials: tuple[bytes, bytes] | None) -> bool:
+        """Whether the user name and password are the admin's. Anything else, missing
+        credentials included, counts as a failure of the address and is logged by its count."""
+        if credentials is not None and _credentials_match(
+            *credentials, self._expected_user, self._expected_password
+        ):
+            return True
+        failures = self._limiter.record_failure(address)
+        logger.warning("admin_sign_in_failed failures=%d", failures)
+        return False
+
+    def _event(self, action: Action, resource_type: ResourceType, resource_id: str | None) -> Event:
+        return Event(
+            actor=self.actor,
+            action=action,
+            resource_type=resource_type,
+            outcome=Outcome.SUCCESS,
+            resource_id=resource_id,
+        )
+
+    async def read[T](
+        self,
+        action: Action,
+        resource_type: ResourceType,
+        read: Reader[T],
+        resource_id: str | None = None,
+    ) -> T | None:
+        """The read with its audit event, in one transaction; None, and no event, when it
+        found nothing. Any failure is raised, and nothing was read."""
+        return await _audited(
+            self._sessions, self._audit, self._event(action, resource_type, resource_id), read
+        )
+
+    async def record(self, action: Action) -> None:
+        """An act of the admin on the console that reads nothing, audited."""
+        await _audited(
+            self._sessions,
+            self._audit,
+            self._event(action, ResourceType.CONSOLE, None),
+            _nothing_read,
+        )
+
+    async def verify(self) -> Verification:
+        """The whole chain, verified and audited. The whole chain is read, on the worker that
+        may carry the calls: one run at a time, here and in the console, and another asked
+        for meanwhile raises VerificationRunningError. The check and the claim have no await
+        between them, so two requests cannot both pass."""
+        if self._verifying:
+            logger.warning("admin_verify_busy")
+            raise VerificationRunningError
+        self._verifying = True
+        try:
+            verification = await self.read(
+                Action.ADMIN_VERIFY_AUDIT, ResourceType.AUDIT_EVENT, self._audit.verify
+            )
+        finally:
+            self._verifying = False
+        if verification is None:
+            raise RuntimeError("a verification always reports")
+        return verification
 
 
 class _NoStore:
@@ -224,37 +264,19 @@ def _one_value_each(request: Request) -> None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid query")
 
 
-def build_admin_app(
-    settings: Settings, sessions: async_sessionmaker[AsyncSession], audit: AuditLog
-) -> ASGIApp:
-    if settings.admin_user is None or settings.admin_password is None:
-        raise ValueError("the admin API needs admin_user and admin_password")
-    expected_user = hashlib.sha256(settings.admin_user.encode("utf-8")).digest()
-    expected_password = hashlib.sha256(
-        settings.admin_password.get_secret_value().encode("utf-8")
-    ).digest()
-    actor = f"{ADMIN_PREFIX}{settings.admin_user}"
-    limiter = RateLimiter(
-        limit=SIGN_IN_FAILURES,
-        window_seconds=SIGN_IN_WINDOW_SECONDS,
-        max_addresses=MAX_TRACKED_ADDRESSES,
-    )
-
+def build_admin_app(access: AdminAccess) -> ASGIApp:
     async def require_admin(request: Request) -> None:
         address = request.client.host if request.client is not None else ""
         # A limited address is refused before its credentials are looked at.
-        if limiter.blocked(address):
-            logger.warning("admin_sign_in_limited")
+        if access.limited(address):
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many failed sign-ins",
                 headers={"Retry-After": str(SIGN_IN_WINDOW_SECONDS)},
             )
         supplied = _supplied_credentials(request.headers.get("authorization"))
-        if supplied is not None and _credentials_match(*supplied, expected_user, expected_password):
+        if access.signs_in(address, supplied):
             return
-        failures = limiter.record_failure(address)
-        logger.warning("admin_sign_in_failed failures=%d", failures)
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             detail="Sign-in required",
@@ -264,27 +286,13 @@ def build_admin_app(
     async def read_and_audit[T](
         action: Action,
         resource_type: ResourceType,
-        read: Callable[[AsyncSession], Awaitable[T | None]],
+        read: Reader[T],
         resource_id: str | None = None,
     ) -> T:
-        """The read and its audit event in one transaction; nothing is returned unless both
-        committed. A read that finds nothing (None) writes no event and is answered 404."""
+        """The read and its audit event (AdminAccess.read); a read that finds nothing is
+        answered 404, and any failure 503."""
         try:
-            async with sessions() as session:
-                result = await read(session)
-                if result is not None:
-                    await audit.append(
-                        session,
-                        Event(
-                            actor=actor,
-                            action=action,
-                            resource_type=resource_type,
-                            outcome=Outcome.SUCCESS,
-                            resource_id=resource_id,
-                        ),
-                        now=datetime.now(UTC),
-                    )
-                    await session.commit()
+            result = await access.read(action, resource_type, read, resource_id)
         except Exception as error:
             logger.error("admin_read_failed action=%s error=%s", action.value, type(error).__name__)
             raise HTTPException(
@@ -294,8 +302,6 @@ def build_admin_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
         logger.info("admin_read action=%s", action.value)
         return result
-
-    verifying = False
 
     app = FastAPI(
         openapi_url=None,
@@ -310,7 +316,7 @@ def build_admin_app(
         rows = await read_and_audit(
             Action.ADMIN_READ_REQUESTS,
             ResourceType.REQUEST,
-            lambda session: _newest(session, REQUEST_COLUMNS, models.Request.id, page),
+            lambda session: newest(session, REQUEST_COLUMNS, models.Request.id, page),
         )
         return {"requests": [_masked(row) for row in rows]}
 
@@ -319,11 +325,11 @@ def build_admin_app(
         rows = await read_and_audit(
             Action.ADMIN_READ_MESSAGES,
             ResourceType.MESSAGE,
-            lambda session: _newest(session, MESSAGE_COLUMNS, models.Message.id, page),
+            lambda session: newest(session, MESSAGE_COLUMNS, models.Message.id, page),
         )
         return {
             "messages": [
-                {**_masked(row), "callback_number": _shown_callback(row["callback_number"])}
+                {**_masked(row), "callback_number": shown_callback(row["callback_number"])}
                 for row in rows
             ]
         }
@@ -333,7 +339,7 @@ def build_admin_app(
         rows = await read_and_audit(
             Action.ADMIN_READ_CALLS,
             ResourceType.CALL,
-            lambda session: _newest(session, CALL_COLUMNS, models.CallSession.id, page),
+            lambda session: newest(session, CALL_COLUMNS, models.CallSession.id, page),
         )
         return {"calls": [_masked(row) for row in rows]}
 
@@ -344,7 +350,7 @@ def build_admin_app(
         row = await read_and_audit(
             Action.ADMIN_READ_CALL,
             ResourceType.CALL,
-            lambda session: _call(session, call_id),
+            lambda session: call(session, call_id),
             resource_id=call_id,
         )
         return {"call": _masked(row)}
@@ -366,23 +372,24 @@ def build_admin_app(
 
     @app.get("/audit/verify")
     async def verify_audit(_query: Annotated[NoQuery, Query()]) -> dict[str, Any]:
-        # The whole chain is read, on the worker that carries the calls: one run at a time.
-        # The check and the claim have no await between them, so two requests cannot both pass.
-        nonlocal verifying
-        if verifying:
-            logger.warning("admin_verify_busy")
+        try:
+            verification = await access.verify()
+        except VerificationRunningError:
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="A verification is already running",
                 headers={"Retry-After": str(VERIFY_RETRY_SECONDS)},
+            ) from None
+        except Exception as error:
+            logger.error(
+                "admin_read_failed action=%s error=%s",
+                Action.ADMIN_VERIFY_AUDIT.value,
+                type(error).__name__,
             )
-        verifying = True
-        try:
-            verification = await read_and_audit(
-                Action.ADMIN_VERIFY_AUDIT, ResourceType.AUDIT_EVENT, audit.verify
-            )
-        finally:
-            verifying = False
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable"
+            ) from None
+        logger.info("admin_read action=%s", Action.ADMIN_VERIFY_AUDIT.value)
         return {
             "ok": verification.ok,
             "checked": verification.checked,

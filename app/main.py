@@ -15,11 +15,10 @@ from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import drain_guard_audits
-from app.api.admin import PREFIX as ADMIN_PREFIX
-from app.api.admin import build_admin_app
 from app.api.offer import OpenCall, build_router
 from app.audit.log import AuditLog
 from app.config import Settings
+from app.console.service import mount_admin
 from app.db.session import create_database_engine, create_session_factory
 from app.domain.office_hours import clinic_now
 from app.guard.logging import configure_logging
@@ -34,6 +33,8 @@ CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 def build_deps(settings: Settings, engine: AsyncEngine) -> Deps:
     """What tool dispatch needs, built once from the settings: sessions as the runtime role,
     the audit log, the clinic clock (simulated in dev and demo when set) and the claim hasher."""
+    if settings.identity_hash_key is None:
+        raise ValueError("the calls need identity_hash_key")
     return Deps(
         sessions=create_session_factory(engine),
         audit=AuditLog(settings.audit_hmac_key),
@@ -45,6 +46,9 @@ def build_deps(settings: Settings, engine: AsyncEngine) -> Deps:
 def create_app(settings: Settings | None = None, open_call: OpenCall | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # The console role never loads the calls: app/server.py builds it without this module.
+    if settings.app_role == "console":
+        raise ValueError("the console role is served by app.server, not the calls' application")
 
     configure_logging(settings)
     register_tools()
@@ -96,12 +100,10 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
 
     app.include_router(build_router(settings, calls, open_call))
 
-    if settings.admin_password is None:
+    # The voice role serves no admin page, whatever it is given.
+    if settings.app_role == "voice" or settings.admin_password is None:
         logger.warning("admin_api_off")
     else:
-        app.mount(
-            ADMIN_PREFIX,
-            build_admin_app(settings, deps.sessions, deps.audit),
-        )
+        mount_admin(app, settings, deps.sessions, deps.audit)
 
     return app

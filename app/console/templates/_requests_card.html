@@ -1,0 +1,63 @@
+{% from "_macros.html" import icon, pill, marked, call_link, empty, unavailable, paging %}
+{% set filtered = "/admin/requests" ~ ("?type=" ~ kind if kind else "") %}
+<section class="card" id="requests-card" aria-labelledby="queue-title" aria-live="polite" hx-target="this" hx-swap="outerHTML" hx-push-url="true" hx-indicator="this">
+  <div class="card__head">
+    <div>
+      <h2 class="card__title" id="queue-title">Queue</h2>
+      <p class="card__desc">Newest first. Patients appear as ids. A callback shows the last four digits of its number, never the caller's name.</p>
+    </div>
+  </div>
+  <div class="filters">
+    <div class="chips" role="group" aria-label="Type of request">
+      <a class="chip" id="type-all" href="/admin/requests" hx-get="/admin/requests"{% if not kind %} aria-current="true"{% endif %}>All types</a>
+      {% for value, words in REQUEST_FILTERS.items() %}
+      <a class="chip" id="type-{{ value }}" href="/admin/requests?type={{ value }}" hx-get="/admin/requests?type={{ value }}"{% if kind == value %} aria-current="true"{% endif %}>{{ icon(REQUEST_TYPES[value].icon) }}{{ words }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="loading" aria-hidden="true"><span></span></div>
+  {% if not ok %}
+  {{ unavailable("requests", filtered) }}
+  {% elif not rows %}
+    {% if paged %}
+  {{ empty("inbox", "No older requests", "Every request that matches has been shown.") }}
+    {% elif kind %}
+  {{ empty("search", "No requests match this filter", "The agent has taken no request of this type.") }}
+    {% else %}
+  {{ empty("inbox", "No requests yet", "When a caller asks for a refill, a booking, a callback or a message, it is listed here.") }}
+    {% endif %}
+  {% else %}
+  <div class="table-wrap" role="region" aria-label="Requests" tabindex="0">
+    <table class="data data--tight">
+      <thead>
+        <tr><th scope="col">Received</th><th scope="col">Type</th><th scope="col">Patient</th><th scope="col">Summary</th><th scope="col">Call</th><th scope="col">Mark handled<small>coming next</small></th></tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td class="nowrap">{{ row.created_at | when }}</td>
+          <td>{{ pill(REQUEST_TYPES[row.type]) }}</td>
+          <td>{% if row.patient_id %}<span class="mono">{{ row.patient_id }}</span>{% else %}<span class="muted">Not verified</span>{% endif %}</td>
+          <td class="wrap">
+            {% if row.type == "transfer" %}
+            Caller passed to staff<span class="sub">Reason: <span class="mono">{{ marked(row.summary) }}</span></span>
+            {% else %}
+            {{ marked(row.summary) }}
+            {% endif %}
+            {% if row.callbacks or row.after_hours %}
+            <span class="sub">{% if row.callbacks %}Call back {% for number in row.callbacks %}<span class="mono">{{ number }}</span>{{ ", " if not loop.last }}{% endfor %}{% endif %}{% if row.callbacks and row.after_hours %} · {% endif %}{% if row.after_hours %}left after hours{% endif %}{% if row.type == "callback" %} · caller's name hidden{% endif %}</span>
+            {% endif %}
+          </td>
+          <td>{{ call_link(row.call_id) }}</td>
+          <td><button type="button" class="btn" disabled aria-describedby="handled-note">Mark handled</button></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if ok and (rows or paged) %}
+  {{ paging(older, paged, filtered, "/admin/requests?" ~ ("type=" ~ kind ~ "&" if kind else "") ~ "before=" ~ older, "requests") }}
+  {% endif %}
+  <p class="card__note" id="handled-note">{{ icon("info") }}<span>Marking a request handled comes in the next version: pressing it will record who handled it and when in the audit log. Showing a full callback number will be a separate, audited action.</span></p>
+</section>

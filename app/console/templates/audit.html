@@ -1,0 +1,12 @@
+{% extends "frame.html" %}
+{% block title %}Audit log{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Audit log</h1>
+    <p class="page-head__sub">Who did what, to which record, and how it ended. The log holds action names and outcomes only. It never holds what was said or any patient detail.</p>
+  </div>
+</div>
+{% include "_chain.html" %}
+{% include "_audit_card.html" %}
+{% endblock %}

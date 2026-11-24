@@ -1,0 +1,34 @@
+{% from "_macros.html" import icon %}
+{% if check is none %}
+{% set tone, glyph, title = "warn", "shield-check", "Chain not checked yet" %}
+{% elif check.outcome == "intact" %}
+{% set tone, glyph, title = "ok", "shield-check", "Chain intact" %}
+{% elif check.outcome == "broken" %}
+{% set tone, glyph, title = "danger", "alert", "Chain broken" %}
+{% elif check.outcome == "running" %}
+{% set tone, glyph, title = "warn", "clock", "A check is already running" %}
+{% else %}
+{% set tone, glyph, title = "danger", "x", "The check could not run" %}
+{% endif %}
+<section class="banner banner--{{ tone }}" id="chain-panel" aria-labelledby="chain-title" aria-live="polite">
+  <span class="banner__icon">{{ icon(glyph, " icon--lg") }}</span>
+  <div class="banner__text">
+    <h2 class="banner__title" id="chain-title">{{ title }}</h2>
+    {% if check is none %}
+    <p class="banner__body">Check the chain to see whether any event was changed, removed or added out of place. The check reads the whole log, so it takes longer as the log grows.</p>
+    {% elif check.outcome == "intact" %}
+    <p class="banner__body">{{ "{:,}".format(check.checked) }} events checked at {{ check.at | clock }}. None was changed, removed or put out of place.</p>
+    {% elif check.outcome == "broken" %}
+    <p class="banner__body">{{ "{:,}".format(check.checked) }} events checked at {{ check.at | clock }}. The first break is at {% if check.first_seq is not none %}event {{ check.first_seq }}{% else %}an event whose position cannot be read{% endif %} (<span class="mono">{{ check.first_kind }}</span>){% if check.breaks > 1 %}, and {{ check.breaks - 1 }}{{ " or more" if check.truncated }} more after it{% endif %}.</p>
+    {% elif check.outcome == "running" %}
+    <p class="banner__body">Only one check runs at a time. Try again in a few seconds.</p>
+    {% else %}
+    <p class="banner__body">The database did not answer at {{ check.at | clock }}. Nothing was checked; try again.</p>
+    {% endif %}
+    <p class="banner__body">Each event is sealed to the one before it, so an edit or a deletion anywhere shows as a break.</p>
+  </div>
+  <form method="post" action="/admin/audit/check" hx-post="/admin/audit/check" hx-target="#chain-panel" hx-swap="outerHTML" hx-disabled-elt="find button">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit" class="btn btn--primary">{{ icon("link") }}<span class="when-idle">Check the chain now</span><span class="when-busy">Checking…</span></button>
+  </form>
+</section>

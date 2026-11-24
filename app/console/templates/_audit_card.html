@@ -1,0 +1,71 @@
+{% from "_macros.html" import icon, nothing, call_link, empty, unavailable %}
+{% set query = ("call_id=" ~ call_id ~ "&" if call_id else "") ~ ("action=" ~ action ~ "&" if action else "") %}
+<section class="card" id="audit-card" aria-labelledby="events-title" aria-live="polite" hx-target="this" hx-swap="outerHTML" hx-push-url="true" hx-indicator="this">
+  <div class="card__head">
+    <div>
+      <h2 class="card__title" id="events-title">Events</h2>
+      <p class="card__desc">Newest first. Opening this page added an event of its own: <span class="mono">admin_read_audit</span>.</p>
+    </div>
+  </div>
+  <form class="filters" method="get" action="/admin/audit" hx-get="/admin/audit" role="search" aria-label="Filter the events">
+    <label class="field">Call id
+      <input class="input input--mono input--id" type="text" name="call_id" value="{{ call_id or '' }}" placeholder="32 letters and digits" autocomplete="off" spellcheck="false" maxlength="32">
+    </label>
+    <label class="field">Action
+      <select class="select" name="action">
+        <option value="">All actions</option>
+        {% for name in ACTIONS %}
+        <option{% if name == action %} selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit" class="btn">Apply</button>
+    {% if call_id or action %}<a class="btn btn--quiet" href="/admin/audit" hx-get="/admin/audit">Clear</a>{% endif %}
+  </form>
+  <div class="loading" aria-hidden="true"><span></span></div>
+  {% if not ok %}
+  {{ unavailable("events", "/admin/audit" ~ ("?" ~ query[:-1] if query else "")) }}
+  {% elif not rows %}
+    {% if paged %}
+  {{ empty("shield-check", "No older events", "Every event that matches has been shown.") }}
+    {% elif call_id or action %}
+  {{ empty("search", "No events match these filters", "No event in the log has this call id or action.") }}
+    {% else %}
+  {{ empty("shield-check", "No events yet", "Events appear as calls are taken and pages are viewed.") }}
+    {% endif %}
+  {% else %}
+  <div class="table-wrap" role="region" aria-label="Audit events" tabindex="0">
+    <table class="data">
+      <thead>
+        <tr><th scope="col" class="num">Event</th><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Record</th><th scope="col">Outcome</th><th scope="col">Reason</th><th scope="col">Call</th></tr>
+      </thead>
+      <tbody>
+        {% for event in rows %}
+        <tr{% if event.action == "emergency_detected" %} class="is-emergency"{% endif %}>
+          <td class="num">{{ event.seq }}</td>
+          <td class="nowrap">{{ event.ts | when }}</td>
+          <td>{% if event.actor == "agent" %}agent{% else %}<span class="pill pill--plain">{{ event.actor }}</span>{% endif %}</td>
+          <td>{% if event.action == "emergency_detected" %}<span class="pill pill--emergency pill--code">{{ icon("alert") }}{{ event.action }}</span>{% else %}<span class="mono">{{ event.action }}</span>{% endif %}</td>
+          <td>{{ event.resource_type | replace("_", " ") }}{% if event.resource_id and event.resource_type not in ("call",) %} <span class="mono">{{ event.resource_id }}</span>{% endif %}</td>
+          <td>
+            {% if event.outcome == "success" %}<span class="pill pill--ok">{{ icon("check") }}success</span>
+            {% elif event.outcome == "failure" %}<span class="pill pill--danger">{{ icon("x") }}failure</span>
+            {% else %}<span class="pill">{{ icon("minus") }}{{ event.outcome }}</span>{% endif %}
+          </td>
+          <td>{% if event.reason %}<span class="mono">{{ event.reason }}</span>{% else %}<span class="muted">{{ nothing() }}</span>{% endif %}</td>
+          <td>{% if event.call_id %}{{ call_link(event.call_id) }}{% else %}<span class="muted">{{ nothing() }}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if ok and (rows or paged) %}
+  <div class="card__foot">
+    <span>{% if paged %}Older events, newest first. <a href="/admin/audit{{ '?' ~ query[:-1] if query else '' }}" hx-get="/admin/audit{{ '?' ~ query[:-1] if query else '' }}">Back to the newest</a>{% else %}The newest events first.{% endif %}</span>
+    {% if older is not none %}
+    <a class="btn" href="/admin/audit?{{ query }}before={{ older }}" hx-get="/admin/audit?{{ query }}before={{ older }}">Show older events{{ icon("arrow-right") }}</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>

@@ -1,0 +1,11 @@
+{% extends "frame.html" %}
+{% block title %}Call history{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Call history</h1>
+    <p class="page-head__sub">Every call that has ended, newest first. Open a call to read its masked transcript and see what the agent did.</p>
+  </div>
+</div>
+{% include "_calls_card.html" %}
+{% endblock %}

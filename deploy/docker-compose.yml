@@ -5,7 +5,9 @@ name: sunrise-voice-agent
 # Every value is interpolated from --env-file .env (or the shell), and each container receives
 # only the variables it needs: db its three credentials (the owner); startup, a one-shot run of
 # the start-up steps, the start-up settings (the owner and the runtime role it sets up); app
-# the application's settings, which hold no part of the owner's identity; coturn its own.
+# the voice role's settings, which hold no part of the owner's identity and no admin sign-in;
+# console the console role's (the database as the runtime role, the audit key, the clock and
+# the admin's sign-in); coturn its own.
 # Compose refuses to start without the owner's credentials or APP_ENV. The services check the
 # rest themselves and stop when a value they need is missing; an empty value counts as unset,
 # so the app's own defaults apply. CI checks each service's variables against app/config.py.
@@ -14,6 +16,7 @@ name: sunrise-voice-agent
 # (a server's own dashboard, for one). It is Compose's alone, reaches no container and is not an
 # application setting, so set it in the shell, not in .env, whose unknown keys the app refuses:
 #   APP_HOST_PORT=8100 docker compose --env-file .env -f deploy/docker-compose.yml up --build
+# CONSOLE_HOST_PORT (default 8001) is the console's, in the same way.
 x-database-credentials: &database-credentials
   POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
   POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set; pass --env-file .env}
@@ -77,10 +80,11 @@ services:
     # Loopback only: on a server the app is reached through the HTTPS proxy, not this port.
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-8000}:8000"
-    # Exactly the application settings' fields (Settings in app/config.py): the runtime role,
-    # never the owner.
+    # Exactly the voice role's fields (VOICE_FIELDS in app/config.py): the runtime role, never
+    # the owner, and not the admin's sign-in, which only the console holds.
     environment:
       <<: *runtime-database
+      APP_ROLE: voice
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
       SIMULATED_NOW: ${SIMULATED_NOW:-}
       AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
@@ -90,8 +94,6 @@ services:
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
       TURN_HOST: ${TURN_HOST:-}
       DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
-      ADMIN_USER: ${ADMIN_USER:-}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -100,6 +102,29 @@ services:
       TTS_MODEL: ${TTS_MODEL:-}
       VAD_STOP_SECONDS: ${VAD_STOP_SECONDS:-}
       IDLE_SECONDS: ${IDLE_SECONDS:-}
+    depends_on:
+      startup:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+
+  # The admin console and the admin API, from the same image: no call route, no voice pipeline,
+  # and no key of a vendor, TURN secret, access token or identity key, so it starts without
+  # them. Without ADMIN_PASSWORD it does not start. Loopback only, like the app: on a server it
+  # is reached through the HTTPS proxy, on a domain of its own.
+  console:
+    build: *app-image
+    ports:
+      - "127.0.0.1:${CONSOLE_HOST_PORT:-8001}:8000"
+    # Exactly the console role's fields (CONSOLE_FIELDS in app/config.py).
+    environment:
+      <<: *runtime-database
+      APP_ROLE: console
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
+      SIMULATED_NOW: ${SIMULATED_NOW:-}
+      AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     depends_on:
       startup:
         condition: service_completed_successfully

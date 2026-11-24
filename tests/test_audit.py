@@ -1382,6 +1382,10 @@ def test_only_registry_members_are_accepted() -> None:
         "admin_verify_audit",
         "admin_read_calls",
         "admin_read_call",
+        "admin_signed_in",
+        "admin_signed_out",
+        "admin_read_call_detail",
+        "admin_read_queue",
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
@@ -1411,6 +1415,7 @@ def test_only_registry_members_are_accepted() -> None:
         "request",
         "message",
         "audit_event",
+        "console",
     }
     assert {member.value for member in Outcome} == {"success", "failure", "refused"}
     assert {member.value for member in Reason} == {

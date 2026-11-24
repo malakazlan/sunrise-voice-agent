@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% macro nav_link(page, href, label, glyph) %}
+<li><a class="nav__link" href="{{ href }}"{% if current == page %} aria-current="page"{% endif %}>{{ icon(glyph) }}<span>{{ label }}</span></a></li>
+{% endmacro %}
+{% macro nav_soon(label, glyph) %}
+<li><span class="nav__link is-disabled" aria-disabled="true">{{ icon(glyph) }}<span>{{ label }}</span><span class="nav__tag">Soon</span></span></li>
+{% endmacro %}
+{% block body %}
+<div class="app">
+  <aside class="side">
+    <a class="brand" href="/admin/calls">
+      <span class="brand__mark">{{ icon("sun", " icon--lg") }}</span>
+      <span><span class="brand__name">Sunrise Family Clinic</span><span class="brand__sub">Voice agent console</span></span>
+    </a>
+    <nav class="nav" aria-label="Console pages">
+      <div class="nav__group">
+        <p class="nav__label" id="nav-calls">Calls</p>
+        <ul class="nav__list" aria-labelledby="nav-calls">
+          {{ nav_soon("Live calls", "phone") }}
+          {{ nav_link("calls", "/admin/calls", "Call history", "clock") }}
+        </ul>
+      </div>
+      <div class="nav__group">
+        <p class="nav__label" id="nav-staff">Work for staff</p>
+        <ul class="nav__list" aria-labelledby="nav-staff">
+          {{ nav_link("requests", "/admin/requests", "Requests", "inbox") }}
+          {{ nav_soon("Appointments", "calendar") }}
+          {{ nav_soon("Patients", "users") }}
+        </ul>
+      </div>
+      <div class="nav__group">
+        <p class="nav__label" id="nav-oversight">Oversight</p>
+        <ul class="nav__list" aria-labelledby="nav-oversight">
+          {{ nav_link("audit", "/admin/audit", "Audit log", "shield-check") }}
+          {{ nav_soon("Guardrails", "shield") }}
+          {{ nav_soon("Metrics", "chart") }}
+        </ul>
+      </div>
+      <div class="nav__group">
+        <p class="nav__label" id="nav-settings">Settings</p>
+        <ul class="nav__list" aria-labelledby="nav-settings">
+          {{ nav_soon("Config", "sliders") }}
+        </ul>
+      </div>
+    </nav>
+    <p class="side__note">{{ icon("shield-check") }}<span>Page views and actions on this console are recorded in the audit log.</span></p>
+  </aside>
+  <div class="main">
+    <header class="top">
+      <div class="top__group">
+        {% if office_open %}
+        <span class="state"><span class="state__dot">{{ icon("check") }}</span><span><strong>Office open</strong> · Mon to Fri, 9 AM to 5 PM Eastern</span></span>
+        {% else %}
+        <span class="state"><span class="state__dot state__dot--closed">{{ icon("moon") }}</span><span><strong>Office closed</strong> · open Mon to Fri, 9 AM to 5 PM Eastern</span></span>
+        {% endif %}
+      </div>
+      <div class="top__group">
+        <span class="user"><span class="user__avatar">{{ icon("user") }}</span><span><span class="user__as">Signed in as </span><strong>{{ user }}</strong></span></span>
+        <form class="top__form" method="post" action="/admin/logout">
+          <input type="hidden" name="token" value="{{ token }}">
+          <button type="submit" class="top__link">{{ icon("logout") }}Sign out</button>
+        </form>
+      </div>
+    </header>
+    <main id="main" class="page">
+{% block content %}{% endblock %}
+    </main>
+    <footer class="foot">
+      <span>{{ icon("shield-check") }}Page views and actions are recorded in the audit log.</span>
+      <span>{{ icon("clock") }}Times are clinic time, {{ ZONE }}.</span>
+    </footer>
+  </div>
+</div>
+{% endblock %}

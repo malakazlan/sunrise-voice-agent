@@ -1,0 +1,39 @@
+{% macro icon(name, extra="") %}<svg class="icon{{ extra }}" aria-hidden="true"><use href="#i-{{ name }}"></use></svg>{% endmacro %}
+
+{% macro pill(label) %}<span class="pill{% if label.tone != 'plain' %} pill--{{ label.tone }}{% endif %}">{{ icon(label.icon) }}{{ label.words }}</span>{% endmacro %}
+
+{# Text from the database, with each value masking left in its place shown as a chip. #}
+{% macro marked(value) %}{% for piece in pieces(value) %}{% if piece.masked %}<mark>{{ piece.value }}</mark>{% else %}{{ piece.value }}{% endif %}{% endfor %}{% endmacro %}
+
+{% macro nothing() %}<span aria-hidden="true">–</span><span class="sr-only">None</span>{% endmacro %}
+
+{% macro call_link(call_id) %}<a class="id-link" href="/admin/calls/{{ call_id }}" aria-label="Call {{ call_id[:8] }}">{{ call_id | short_id }}</a>{% endmacro %}
+
+{# A list's empty, filtered-empty and failed states, inside its card. #}
+{% macro empty(glyph, title, body) %}
+<div class="empty">
+  <span class="empty__icon">{{ icon(glyph, " icon--lg") }}</span>
+  <p class="empty__title">{{ title }}</p>
+  <p>{{ body }}</p>
+  {{ caller() if caller is defined else "" }}
+</div>
+{% endmacro %}
+
+{% macro unavailable(what, again) %}
+<div class="empty empty--failed" role="alert">
+  <span class="empty__icon">{{ icon("x", " icon--lg") }}</span>
+  <p class="empty__title">The {{ what }} could not be loaded</p>
+  <p>The database or the audit log did not answer, so nothing was read and nothing is shown. Nothing was lost.</p>
+  <a class="btn" href="{{ again }}">Try again</a>
+</div>
+{% endmacro %}
+
+{# The card's foot: where the rows are in the list, and the way to the next page. #}
+{% macro paging(older, paged, first_href, older_href, noun) %}
+<div class="card__foot">
+  <span>{% if paged %}Older {{ noun }}, newest first. <a href="{{ first_href }}">Back to the newest</a>{% else %}The newest {{ noun }} first.{% endif %}</span>
+  {% if older is not none %}
+  <a class="btn" href="{{ older_href }}" hx-get="{{ older_href }}">Show older {{ noun }}{{ icon("arrow-right") }}</a>
+  {% endif %}
+</div>
+{% endmacro %}

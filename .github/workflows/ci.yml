@@ -149,7 +149,11 @@ jobs:
             ANTHROPIC_API_KEY=ci-compose-only-fake-anthropic-key-0001 \
             DEEPGRAM_API_KEY=ci-compose-only-fake-deepgram-key-00001 \
             ELEVENLABS_API_KEY=ci-compose-only-fake-elevenlabs-key-0001 \
-            ELEVENLABS_VOICE_ID=cicomposeonlyfakevoice UNRELATED_DECOY=1 > .env
+            ELEVENLABS_VOICE_ID=cicomposeonlyfakevoice ADMIN_USER=ci_admin \
+            UNRELATED_DECOY=1 > .env
+          # The console's sign-in; only the console service is given it.
+          console_pass="ci-compose-only-console-0001"
+          printf 'ADMIN_PASSWORD=%s\n' "$console_pass" >> .env
       - name: Smoke test through Compose
         run: |
           . .github/ci-wait.sh
@@ -160,10 +164,32 @@ jobs:
           docs=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          # No ADMIN_PASSWORD in the env file: the admin API is not mounted.
-          admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/admin/api/requests)
-          echo "GET /admin/api/requests -> $admin"
-          test "$admin" = "404"
+          # The app runs the voice role: no admin page and no admin API, though the env file
+          # holds the admin's sign-in (only the console is given it).
+          for path in /admin/api/requests /admin/login /admin/calls; do
+            admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "app GET $path -> $admin"
+            test "$admin" = "404"
+          done
+          # The console runs the console role, without any key of the calls: its pages and
+          # the admin API, and no call route.
+          wait_for_status 120 http://127.0.0.1:8001/health 200 "the console to answer /health"
+          for check in "/admin/login 200" "/admin/calls 303" "/admin/api/requests 401" "/ 404" \
+            "/ice-servers 404"; do
+            set -- $check
+            status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8001$1")
+            echo "console GET $1 -> $status"
+            test "$status" = "$2"
+          done
+          console=$($compose ps -q console)
+          health=none
+          for _ in $(seq 1 30); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$console")
+            [ "$health" = "healthy" ] && break
+            sleep 1
+          done
+          echo "console HEALTHCHECK -> $health"
+          test "$health" = "healthy"
           uid=$(bounded 30 "id -u in the app container" $compose exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
@@ -245,14 +271,16 @@ jobs:
           }
           {
             echo "app $(configured app)"
+            echo "console $(configured console)"
             echo "startup $(configured startup)"
           } | tee "$RUNNER_TEMP/configured-env"
           bounded_run 60 "the configured-environment comparison" ci-configured-env -i --rm \
             --entrypoint python sunrise-voice-agent:ci -c '
           import sys
-          from app.config import Settings, StartupSettings
+          from app.config import CONSOLE_FIELDS, VOICE_FIELDS, StartupSettings
           expected = {
-              "app": {name.upper() for name in Settings.model_fields},
+              "app": {name.upper() for name in VOICE_FIELDS},
+              "console": {name.upper() for name in CONSOLE_FIELDS},
               "startup": {name.upper() for name in StartupSettings.model_fields},
           }
           found = {}
@@ -377,23 +405,27 @@ jobs:
             grep -qx "$name" "$RUNNER_TEMP/db-env"
           done
           echo "db environment holds only the database variables"
-      - name: Compose gives app and startup exactly their settings variables
+      - name: Compose gives app, console and startup exactly their settings variables
         run: |
           set -o pipefail
           . .github/ci-wait.sh
           # Compose's resolved configuration, read by the app's own settings classes inside the
           # image. Names only; values are never printed. The running containers are checked
-          # against the same classes above.
+          # against the same fields above.
           timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
             | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
               --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
-          from app.config import Settings, StartupSettings
+          from app.config import CONSOLE_FIELDS, VOICE_FIELDS, StartupSettings
           services = json.load(sys.stdin)["services"]
           failed = False
-          for service, settings_class in (("app", Settings), ("startup", StartupSettings)):
+          for service, expected in (
+              ("app", VOICE_FIELDS),
+              ("console", CONSOLE_FIELDS),
+              ("startup", frozenset(StartupSettings.model_fields)),
+          ):
               received = set(services[service]["environment"])
-              fields = {name.upper() for name in settings_class.model_fields}
+              fields = {name.upper() for name in expected}
               print(service, "environment names:", " ".join(sorted(received)))
               if received != fields:
                   print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))

@@ -1,0 +1,57 @@
+{% from "_macros.html" import icon, pill, call_link, empty, unavailable, paging %}
+{% set filtered = "/admin/calls" ~ ("?ended=" ~ ended if ended else "") %}
+<section class="card" id="calls-card" aria-labelledby="calls-title" aria-live="polite" hx-target="this" hx-swap="outerHTML" hx-push-url="true" hx-indicator="this">
+  <div class="card__head">
+    <div>
+      <h2 class="card__title" id="calls-title">Ended calls</h2>
+      <p class="card__desc">Filter by how the call ended.</p>
+    </div>
+  </div>
+  <div class="filters">
+    <div class="chips" role="group" aria-label="How the call ended">
+      <a class="chip" id="ended-all" href="/admin/calls" hx-get="/admin/calls"{% if not ended %} aria-current="true"{% endif %}>All</a>
+      {% for value, label in END_REASONS.items() %}
+      <a class="chip" id="ended-{{ value }}" href="/admin/calls?ended={{ value }}" hx-get="/admin/calls?ended={{ value }}"{% if ended == value %} aria-current="true"{% endif %}>{{ label.words }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="loading" aria-hidden="true"><span></span></div>
+  {% if not ok %}
+  {{ unavailable("calls", filtered) }}
+  {% elif not rows %}
+    {% if paged %}
+  {{ empty("clock", "No older calls", "Every call that matches has been shown.") }}
+    {% elif ended %}
+  {{ empty("search", "No calls match this filter", "No call that has ended so far ended that way.") }}
+    {% else %}
+  {{ empty("clock", "No calls yet", "A call appears here once it has ended and its record is stored.") }}
+    {% endif %}
+  {% else %}
+  <div class="table-wrap" role="region" aria-label="Ended calls" tabindex="0">
+    <table class="data">
+      <thead>
+        <tr><th scope="col">Call</th><th scope="col">Started</th><th scope="col">Length</th><th scope="col">Caller</th><th scope="col" class="num">Turns</th><th scope="col">How it ended</th><th scope="col"><span class="sr-only">Open</span></th></tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr{% if row.end_reason == "emergency" %} class="is-emergency"{% endif %}>
+          <td>{{ call_link(row.call_id) }}</td>
+          <td class="nowrap">{{ row.started_at | when }}</td>
+          <td class="nowrap">{{ length(row.started_at, row.ended_at) }}</td>
+          <td>
+            {% if row.verified %}<span class="pill pill--ok">{{ icon("check") }}Verified</span> <span class="mono">{{ row.patient_id }}</span>{% else %}<span class="pill">{{ icon("minus") }}Not verified</span>{% endif %}
+            {% if not row.office_open %} <span class="pill">{{ icon("moon") }}After hours</span>{% endif %}
+          </td>
+          <td class="num">{{ row.turn_count }}</td>
+          <td>{{ pill(END_REASONS[row.end_reason]) }}</td>
+          <td><a class="cell-link" href="/admin/calls/{{ row.call_id }}" aria-label="Open call {{ row.call_id[:8] }}">Open {{ icon("arrow-right") }}</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% if ok and (rows or paged) %}
+  {{ paging(older, paged, filtered, "/admin/calls?" ~ ("ended=" ~ ended ~ "&" if ended else "") ~ "before=" ~ older, "calls") }}
+  {% endif %}
+</section>

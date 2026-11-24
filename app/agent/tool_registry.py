@@ -142,7 +142,8 @@ DOB_RULES: Mapping[DobKind, DobRule] = MappingProxyType(
     }
 )
 
-# The actions dispatch, the call itself, the admin API and the output guard's turn loop write;
+# The actions dispatch, the call itself, the admin API, the console and the output guard's turn
+# loop write;
 # no tool may declare one as its own.
 RESERVED_ACTIONS = frozenset(
     {
@@ -157,6 +158,10 @@ RESERVED_ACTIONS = frozenset(
         Action.ADMIN_READ_CALLS,
         Action.ADMIN_READ_CALL,
         Action.ADMIN_VERIFY_AUDIT,
+        Action.ADMIN_SIGNED_IN,
+        Action.ADMIN_SIGNED_OUT,
+        Action.ADMIN_READ_CALL_DETAIL,
+        Action.ADMIN_READ_QUEUE,
     }
 )
 

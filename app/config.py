@@ -13,12 +13,16 @@ from pydantic import (
     model_validator,
 )
 from pydantic.fields import FieldInfo
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from sqlalchemy import URL
 
 from app.domain.clinic import CLINIC_TZ
 
 AppEnv = Literal["dev", "demo", "prod"]
+# What one process serves (app/server.py): everything, for development and tests; the calls
+# alone; or the admin pages and the admin API alone.
+AppRole = Literal["all", "voice", "console"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 HostName = Annotated[str, Field(pattern=r"^[A-Za-z0-9.-]+$")]
 
@@ -61,6 +65,17 @@ HMAC_KEY_PLACEHOLDERS = {
 
 def _outside_dev(info: ValidationInfo) -> bool:
     return info.data.get("app_env") in ("demo", "prod")
+
+
+def _console(info: ValidationInfo) -> bool:
+    """Whether the settings are the console role's. A role that did not validate is not."""
+    return info.data.get("app_role") == "console"
+
+
+def _refused_in_console(name: str, value: object, info: ValidationInfo) -> None:
+    """The console holds no secret of the calls: one given to it stops startup."""
+    if value is not None and _console(info):
+        raise ValueError(f"{name} is not given to the console role")
 
 
 # Every secret setting, outside dev, on top of its own length and character rules. The same
@@ -195,10 +210,15 @@ class Settings(DatabaseSettings):
     """The application's settings. They hold no part of the owner's identity, and the app
     container is never given the owner's variables (deploy/docker-compose.yml)."""
 
+    # What this process serves. First, since the rules of the fields after it depend on it: the
+    # console role holds no secret of the calls and needs the admin's sign-in; the voice role
+    # holds no admin sign-in.
+    app_role: AppRole = "all"
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
     # The key of the identity claims' hashes in verification_attempts (app/agent/claims.py).
-    identity_hash_key: SecretStr
+    # Required, but never given to the console role.
+    identity_hash_key: SecretStr | None = Field(default=None, validate_default=True)
 
     # A fixed clock for dev and demo. Set together with app_env=prod, startup stops.
     simulated_now: datetime | None = None
@@ -244,9 +264,9 @@ class Settings(DatabaseSettings):
     demo_access_token: SecretStr | None = Field(
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
-    # The admin API's sign-in (app/api/admin.py). Without a password it is not mounted. The
-    # password comes first: the user's check reads it.
-    admin_password: SecretStr | None = None
+    # The admin's sign-in, for the admin API (app/api/admin.py) and the console (app/console/).
+    # Without a password neither is mounted. The password comes first: the user's check reads it.
+    admin_password: SecretStr | None = Field(default=None, validate_default=True)
     admin_user: str | None = Field(default=None, validate_default=True)
     # The vendors of a call: the model (app/agent/model.py) and speech-to-text
     # (app/voice/pipeline.py). Without both keys a call is refused at set-up.
@@ -272,8 +292,9 @@ class Settings(DatabaseSettings):
         cls, value: SecretStr | None, info: ValidationInfo
     ) -> SecretStr | None:
         name = info.field_name or ""
+        _refused_in_console(name, value, info)
         if value is None:
-            if _outside_dev(info):
+            if _outside_dev(info) and not _console(info):
                 raise ValueError(f"{name} is required unless app_env is dev")
             return None
         _check_strong_secret(name, value, info)
@@ -282,15 +303,27 @@ class Settings(DatabaseSettings):
     @field_validator("elevenlabs_voice_id")
     @classmethod
     def _voice_outside_dev(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if value is None and _outside_dev(info):
+        if value is None and _outside_dev(info) and not _console(info):
             raise ValueError("elevenlabs_voice_id is required unless app_env is dev")
+        return value
+
+    @field_validator("identity_hash_key")
+    @classmethod
+    def _identity_key_unless_console(
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        _refused_in_console("identity_hash_key", value, info)
+        if value is None and not _console(info):
+            raise PydanticCustomError("missing", "Field required")
         return value
 
     @field_validator("audit_hmac_key", "identity_hash_key")
     @classmethod
     def hmac_key_is_set_and_strong_outside_dev(
-        cls, value: SecretStr, info: ValidationInfo
-    ) -> SecretStr:
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        if value is None:
+            return None
         name = info.field_name or ""
         key = value.get_secret_value()
         if not key:
@@ -307,9 +340,15 @@ class Settings(DatabaseSettings):
 
     @field_validator("identity_hash_key")
     @classmethod
-    def identity_key_is_not_the_audit_key(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+    def identity_key_is_not_the_audit_key(
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
         audit_key = info.data.get("audit_hmac_key")
-        if audit_key is not None and value.get_secret_value() == audit_key.get_secret_value():
+        if (
+            value is not None
+            and audit_key is not None
+            and value.get_secret_value() == audit_key.get_secret_value()
+        ):
             raise ValueError("identity_hash_key must differ from audit_hmac_key")
         return value
 
@@ -324,7 +363,8 @@ class Settings(DatabaseSettings):
     @field_validator("turn_shared_secret")
     @classmethod
     def _secret_outside_dev(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
-        if value is None and _outside_dev(info):
+        _refused_in_console("turn_shared_secret", value, info)
+        if value is None and _outside_dev(info) and not _console(info):
             raise ValueError("turn_shared_secret is required unless app_env is dev")
         if value is not None and not TURN_SECRET_CHARACTERS.fullmatch(value.get_secret_value()):
             raise ValueError(
@@ -337,7 +377,7 @@ class Settings(DatabaseSettings):
     @field_validator("turn_host")
     @classmethod
     def _host_with_secret(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if value is None and _outside_dev(info):
+        if value is None and _outside_dev(info) and not _console(info):
             raise ValueError("turn_host is required unless app_env is dev")
         if "turn_shared_secret" in info.data:
             has_secret = info.data["turn_shared_secret"] is not None
@@ -348,8 +388,9 @@ class Settings(DatabaseSettings):
     @field_validator("demo_access_token")
     @classmethod
     def _token_when_needed(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
+        _refused_in_console("demo_access_token", value, info)
         if value is None:
-            if _outside_dev(info):
+            if _outside_dev(info) and not _console(info):
                 raise ValueError("demo_access_token is required unless app_env is dev")
             if info.data.get("turn_shared_secret") is not None:
                 raise ValueError("demo_access_token is required when TURN is configured")
@@ -363,7 +404,11 @@ class Settings(DatabaseSettings):
         cls, value: SecretStr | None, info: ValidationInfo
     ) -> SecretStr | None:
         if value is None:
+            if _console(info):
+                raise ValueError("admin_password is required for the console role")
             return None
+        if info.data.get("app_role") == "voice":
+            raise ValueError("admin_password is not given to the voice role")
         password = value.get_secret_value()
         if not password:
             raise ValueError("admin_password must not be empty")
@@ -442,6 +487,28 @@ class StartupSettings(DatabaseSettings):
 
 # Every variable of either class, so that each can leave the other's in the shared .env file.
 _EVERY_SETTING = frozenset(Settings.model_fields) | frozenset(StartupSettings.model_fields)
+
+# The settings each role's container is given, and no other (deploy/docker-compose.yml; CI
+# compares the running containers with these). The voice role: every application setting but
+# the admin's sign-in. The console: the database as the runtime role, the audit key, the clock,
+# the admin's sign-in; no key of a vendor, no TURN secret, no access token, no identity key.
+VOICE_FIELDS = frozenset(Settings.model_fields) - {"admin_user", "admin_password"}
+CONSOLE_FIELDS = frozenset(
+    {
+        "app_env",
+        "log_level",
+        "app_role",
+        "postgres_host",
+        "postgres_port",
+        "postgres_db",
+        "app_db_user",
+        "app_db_password",
+        "audit_hmac_key",
+        "simulated_now",
+        "admin_user",
+        "admin_password",
+    }
+)
 
 
 def main() -> None:

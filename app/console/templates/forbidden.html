@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Request refused{% endblock %}
+{% block body %}
+<main id="main" class="lone">
+  <section class="card lone__card" aria-labelledby="refused-title">
+    <div class="empty">
+      <span class="empty__icon">{{ icon("lock", " icon--lg") }}</span>
+      <h1 class="empty__title" id="refused-title">This request was refused</h1>
+      <p>It did not come from a page of this console, or the page it came from has expired. Nothing was changed. Open the page again and repeat what you were doing.</p>
+      <a class="btn" href="/admin/calls">Open the console</a>
+    </div>
+  </section>
+</main>
+{% endblock %}

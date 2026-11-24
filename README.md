@@ -792,8 +792,9 @@ number of caller turns, and the transcript. Audio is never stored.
 
 A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages,
 call records and audit log can be read and the chain checked without opening the database. It
-is off unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
-answer `404` and the app logs `admin_api_off` once at start.
+is off unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`, beside the admin
+console; without it, and always with `APP_ROLE=voice`, those paths answer `404` and the app logs
+`admin_api_off` once at start.
 
 | Route (all `GET`) | Returns |
 |---|---|
@@ -856,6 +857,93 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
   - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
     number written another way (spelled out without a cue, for example) is shown as written.
   - A read event records which list was read, not which rows.
+
+### Admin console
+
+Pages for clinic staff and reviewers, in `app/console/`, server-rendered with FastAPI, Jinja
+and htmx under `/admin`: what the agent did on each call, what staff need to act on, and the
+audit log with its chain check. It is on wherever the admin API is (`ADMIN_PASSWORD` set), and
+it can run as a container of its own (below). Open `/admin` and sign in with `ADMIN_USER` and
+`ADMIN_PASSWORD`.
+
+| Page | Shows |
+|---|---|
+| `/admin/calls` | Call history: every ended call, newest first: started, length, verified or not and the patient id, after hours, turns, how it ended. Filter by how it ended; "Show older calls" pages back 50 at a time |
+| `/admin/calls/{call_id}` | Call detail: the summary, the masked transcript with withheld turns marked, and "What happened": the call's audit events in order. A record whose names were not masked by the second pass shows a notice in place of its transcript. An unknown id gets the console's 404 page |
+| `/admin/requests` | Requests: refills, bookings, callbacks, doctor messages and transfers, newest first, filtered by type. A callback shows its number masked to its last four digits and never the caller's name. "Mark handled" is shown, disabled: it comes next |
+| `/admin/audit` | Audit log: every event, filtered by call id and action, paged. "Check the chain now" verifies the whole chain and says intact, broken with the first break, or that a check is already running |
+
+The menu lists every page planned; Live calls, Appointments, Patients, Guardrails, Metrics and
+Config are marked "Soon" and are not links yet. The top bar shows whether the office is open, by
+the same clock the agent uses (`SIMULATED_NOW` included), and who is signed in. Times are clinic
+time, US Eastern, as each page's footer says. The pages work with JavaScript off; with it, htmx
+swaps a filtered or older page of a table in place instead of reloading the page.
+
+- Sign-in: a form, checked by the admin API's own comparison (both halves as SHA-256 digests in
+  constant time) and limited by its own failed-sign-in limit, shared with the API: five failures
+  a minute from one address, then "Too many failed sign-ins" for both. Every failure gets the
+  same message, "The user name or password is not right."; failures are logged as
+  `admin_sign_in_failed failures=<n>` and not audited. A sign-in is audited (`admin_signed_in`),
+  and so is a sign-out (`admin_signed_out`); if the sign-in's event cannot be written, there is
+  no session.
+- Sessions: a random 32-byte id, held in memory with an 8-hour absolute and a 30-minute idle
+  limit, at most 32 at a time (the one used longest ago makes room). The cookie
+  `console_session` holds only the id: `HttpOnly`, `SameSite=Strict`, `Path=/admin`, and `Secure`
+  outside `APP_ENV=dev`. A page without a live session redirects to the sign-in page; an htmx
+  request gets `HX-Redirect`.
+- Forged requests: every form that changes something (sign-in, sign-out, "Check the chain now")
+  carries an anti-forgery token, compared in constant time: the session's, or for the sign-in
+  form one paired with a cookie of its own. A missing or wrong token, or a request the browser
+  marks as coming from another site (`Sec-Fetch-Site`), gets `403` and changes nothing. `GET`
+  changes nothing but its own audit event.
+- Every page view reads through the admin's data functions (`app/api/reads.py`), the same ones
+  the admin API reads with, and writes one audit event with the admin as actor in the
+  transaction that read: `admin_read_calls`, `admin_read_call_detail` (with the call id),
+  `admin_read_queue`, `admin_read_audit`, and `admin_verify_audit` for a check of the chain. If
+  the event cannot be written, the page shows its error state and no data. The console writes no
+  query of its own (a repo hygiene test).
+- Masking: every text value passes `mask`, as in the API, and the pages also hide the names their
+  rows know (each message's caller name, and the first and last names of the patients the calls
+  and requests name) wherever they appear. A callback number shows only its last four digits.
+  Caller-provided text is escaped in every template.
+- Headers on every console response, errors and static files included: `Cache-Control:
+  no-store`, a Content-Security-Policy of `'self'` only with no inline script or style,
+  `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`. htmx is configured to keep no copy of a page in the browser's
+  storage.
+- Vendored files, in `app/console/static/`, none loaded from another origin: htmx 2.0.11
+  (`htmx-2.0.11.min.js`, 0BSD licence, SHA-256
+  `d6fdc75f204e6bdefa99b69bf1e6d4ac69b8a364f77929f45c13476b4000f717`, from the npm package
+  whose integrity hash matched the registry's), and the Latin subsets of Inter (400, 500, 600)
+  and Space Grotesk (500, 600) from Fontsource 5.3.0, under the SIL Open Font License. The
+  licences are in `app/console/static/licences/`.
+
+#### The console as its own container
+
+`APP_ROLE` picks what a process serves, from the same image and the same command
+(`uvicorn app.server:create_app --factory`):
+
+| `APP_ROLE` | Serves |
+|---|---|
+| `all` (default) | the calls, and the admin API and the console when `ADMIN_PASSWORD` is set: for development and tests |
+| `voice` | the calls only; no admin page and no admin API. It refuses `ADMIN_PASSWORD` |
+| `console` | the admin API, the console and `/health` only: no call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It needs `ADMIN_USER` and `ADMIN_PASSWORD` and starts without any key of a vendor; it refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` and the vendors' keys |
+
+In Compose, `app` runs `APP_ROLE=voice` and the `console` service runs `APP_ROLE=console`,
+published on `127.0.0.1:${CONSOLE_HOST_PORT:-8001}`. The console's rendering then never shares a
+process with the calls, and its process holds no key of the calls. On a server, give the console
+its own domain through the HTTPS proxy, pointing at the container's port 8000.
+
+Limits:
+- Sessions are held in memory: restarting the console signs everyone out, and the console runs
+  as one process (one worker), as the image starts it.
+- Names are hidden where the database knows them; a name the caller said that no row holds is
+  hidden only by the transcript's second masking pass, and request summaries and messages have
+  no such pass.
+- The chain check reads the whole log in the console's process. With `APP_ROLE=all` that is the
+  process that carries the calls, as with the API.
+- The sign-in limit is per client address; behind the HTTPS proxy everyone shares the proxy's
+  address, as for the API.
 
 ### Output guard
 
@@ -1088,6 +1176,7 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | Variable            | Allowed values                      | Default        |
 |---------------------|-------------------------------------|----------------|
 | `APP_ENV`           | `dev`, `demo`, `prod`               | none, required |
+| `APP_ROLE`          | `all`, `voice`, `console` (see Admin console) | `all` |
 | `LOG_LEVEL`         | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO`         |
 | `SIMULATED_NOW`     | ISO date and time, or empty         | empty (unset)  |
 | `POSTGRES_HOST`     | host name                           | none, required |
@@ -1098,14 +1187,14 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | `APP_DB_USER`       | runtime role: `a-z 0-9 _`, up to 63, not `pg_...`, not `POSTGRES_USER` | none, required |
 | `APP_DB_PASSWORD`   | runtime role's password, never logged, not `POSTGRES_PASSWORD` | none, required |
 | `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
-| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required |
+| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required; refused by the console role |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
 | `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
-| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off) |
+| `ADMIN_PASSWORD`    | the admin API's and the console's password, never logged | empty (both off); required by the console role, refused by the voice role |
 | `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
 | `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
 | `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
@@ -1149,6 +1238,10 @@ application's settings: every secret field of `Settings`, found from the class, 
 added later is covered too. A clash is reported by field name only. The owner's
 `POSTGRES_PASSWORD` never reaches the app, so it cannot be compared there: choose another.
 
+With `APP_ROLE=console` none of the calls' settings is required, in any environment, and the
+calls' secrets (`IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`,
+`ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`) stop startup if given.
+
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
 token. Generate the two secrets with `openssl rand -hex 32`.
@@ -1170,10 +1263,13 @@ docker compose --env-file .env -f deploy/docker-compose.yml up --build
 curl http://127.0.0.1:8000/health
 ```
 
-Four services start: `db`; `startup`, a one-shot run from the app's image that checks its
+Five services start: `db`; `startup`, a one-shot run from the app's image that checks its
 settings (`python -m app.config`), then, as the owner, runs `alembic upgrade head`, the role
-set-up (`python -m app.db.roles`) and the seed, and exits; `app`, the server, which starts only
-after `startup` has exited with 0 and connects as the runtime role; and `coturn`. A failure in
+set-up (`python -m app.db.roles`) and the seed, and exits; `app`, the server of the calls
+(`APP_ROLE=voice`), which starts only after `startup` has exited with 0 and connects as the
+runtime role; `console`, the admin console and admin API (`APP_ROLE=console`), from the same
+image, started the same way and published on `127.0.0.1:8001`; and `coturn`. The console does
+not start without `ADMIN_USER` and `ADMIN_PASSWORD`. A failure in
 any start-up step ends `startup` with a non-zero code and `app` is not started (`docker
 compose up` reports it and exits non-zero). `startup` shows as exited once it is done; that is
 its normal state. The database is not published to the host.
@@ -1193,7 +1289,8 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD` |
+| `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
+| `console` | `APP_ENV`, `APP_ROLE` (`console`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the
@@ -1208,7 +1305,8 @@ When port 8000 is taken on the host, as on a server whose own dashboard uses it,
 `APP_HOST_PORT` in the shell: `APP_HOST_PORT=8100 docker compose --env-file .env -f
 deploy/docker-compose.yml up --build` publishes the app on `127.0.0.1:8100`. It is a Compose
 variable only, not an application setting, and no container receives it, so it does not go in
-`.env`, whose unknown keys the app refuses.
+`.env`, whose unknown keys the app refuses. `CONSOLE_HOST_PORT` (default 8001) does the same for
+the console.
 
 ## Run locally with uv
 
@@ -1222,9 +1320,12 @@ docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-com
 uv run alembic upgrade head
 uv run python -m app.db.roles
 uv run python -m app.db.seed
-uv run uvicorn app.main:create_app --factory --port 8000 --no-access-log
+uv run uvicorn app.server:create_app --factory --port 8000 --no-access-log
 curl http://127.0.0.1:8000/health
 ```
+
+With `ADMIN_USER` and `ADMIN_PASSWORD` set in `.env`, the console is at
+`http://127.0.0.1:8000/admin` (the default role, `all`).
 
 Checks:
 

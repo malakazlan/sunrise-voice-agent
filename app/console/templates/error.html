@@ -1,0 +1,20 @@
+{% extends "frame.html" %}
+{% from "_macros.html" import icon %}
+{% set pages = {
+  "not_found": ("search", "This page does not exist", "The address does not lead to a page of the console. Use the menu to find what you were looking for.", "/admin/calls", "Go to call history"),
+  "no_call": ("search", "No call with this id", "No stored call has this id. A call appears once it has ended and its record is stored.", "/admin/calls", "Back to call history"),
+  "bad_query": ("x", "The console cannot show this", "The address asks for a filter or a page the console does not know, so nothing was read.", "/admin/calls", "Go to call history"),
+  "unavailable": ("x", "The call could not be loaded", "The database or the audit log did not answer, so nothing was read and nothing is shown. Nothing was lost.", "", "Try again"),
+} %}
+{% set glyph, title, body, href, action = pages[kind] %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card error-card" aria-labelledby="error-title">
+  <div class="empty{% if kind == 'unavailable' %} empty--failed{% endif %}" role="{{ 'alert' if kind == 'unavailable' else 'status' }}">
+    <span class="empty__icon">{{ icon(glyph, " icon--lg") }}</span>
+    <h1 class="empty__title" id="error-title">{{ title }}</h1>
+    <p>{{ body }}</p>
+    <a class="btn" href="{{ href }}">{{ action }}</a>
+  </div>
+</section>
+{% endblock %}

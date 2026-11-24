@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings, StartupSettings
+from app.config import CONSOLE_FIELDS, VOICE_FIELDS, Settings, StartupSettings
 from app.db.session import create_owner_sync_engine
 from app.main import create_app
 
@@ -27,6 +27,7 @@ COMPOSE = REPO_ROOT / "deploy" / "docker-compose.yml"
 # and nothing of the owner.
 APPLICATION_FIELDS = {
     "app_env",
+    "app_role",
     "log_level",
     "postgres_host",
     "postgres_port",
@@ -65,6 +66,27 @@ STARTUP_FIELDS = {
     "postgres_password",
 }
 OWNER_FIELDS = {"postgres_user", "postgres_password"}
+# Without a default, but required by a rule rather than by having none: not given to the
+# console role.
+REQUIRED_BUT_BY_THE_CONSOLE = {"identity_hash_key"}
+# The admin's sign-in: the console's, never the voice role's.
+ADMIN_FIELDS = {"admin_user", "admin_password"}
+# The console role's settings: the database as the runtime role, the audit key, the clock, the
+# admin's sign-in. No key of a vendor, no TURN secret, no access token, no identity key.
+CONSOLE_ROLE_FIELDS = {
+    "app_env",
+    "app_role",
+    "log_level",
+    "postgres_host",
+    "postgres_port",
+    "postgres_db",
+    "app_db_user",
+    "app_db_password",
+    "audit_hmac_key",
+    "simulated_now",
+    "admin_user",
+    "admin_password",
+}
 
 
 def every_variable() -> set[str]:
@@ -162,7 +184,7 @@ def test_settings_check_reports_the_startup_settings(tmp_path: Path) -> None:
 
 # The image serves: uvicorn, started straight by Docker, so it is PID 1 and receives signals.
 SERVE_COMMAND = (
-    'CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",'
+    'CMD ["uvicorn", "app.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",'
     ' "--workers", "1", "--no-access-log"]'
 )
 # The start-up steps, which the one-shot start-up service runs; any failure stops it there.
@@ -194,6 +216,16 @@ def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
     published = app[app.index("ports:") + 1 :]
     entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
     assert entries == ['- "127.0.0.1:${APP_HOST_PORT:-8000}:8000"']
+
+    # The console: the same image and command, after the start-up too, on its own loopback port.
+    console = compose_service("console")
+    assert "build: *app-image" in console
+    assert not any(line.startswith("command:") for line in console)
+    depends = console[console.index("depends_on:") :]
+    assert depends[:3] == ["depends_on:", "startup:", "condition: service_completed_successfully"]
+    published = console[console.index("ports:") + 1 :]
+    entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
+    assert entries == ['- "127.0.0.1:${CONSOLE_HOST_PORT:-8001}:8000"']
 
 
 def compose_service_lines(name: str) -> list[str]:
@@ -259,20 +291,44 @@ def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
     owner = {name.upper() for name in OWNER_FIELDS}
     assert compose_anchors().keys() >= {"database-credentials", "runtime-database"}
 
-    assert compose_environment("app") == {name.upper() for name in Settings.model_fields}
+    # The roles' fields, as app/config.py declares them, and as they are written out here.
+    assert VOICE_FIELDS == APPLICATION_FIELDS - ADMIN_FIELDS
+    assert CONSOLE_FIELDS == CONSOLE_ROLE_FIELDS
+    assert CONSOLE_FIELDS <= set(Settings.model_fields)
+
+    assert compose_environment("app") == {name.upper() for name in VOICE_FIELDS}
+    assert compose_environment("console") == {name.upper() for name in CONSOLE_FIELDS}
     assert compose_environment("startup") == {name.upper() for name in StartupSettings.model_fields}
     assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
-    # The app's host port is Compose's alone: in no container and no settings class.
-    for service in ("db", "startup", "app", "coturn"):
-        assert "APP_HOST_PORT" not in compose_environment(service), service
-    assert "APP_HOST_PORT" not in every_variable()
+    # Each service runs the role it is given the fields of.
+    assert "APP_ROLE: voice" in compose_service("app")
+    assert "APP_ROLE: console" in compose_service("console")
+    # The host ports are Compose's alone: in no container and no settings class.
+    for service in ("db", "startup", "app", "console", "coturn"):
+        for port in ("APP_HOST_PORT", "CONSOLE_HOST_PORT"):
+            assert port not in compose_environment(service), (service, port)
+    assert not {"APP_HOST_PORT", "CONSOLE_HOST_PORT"} & every_variable()
 
-    # No other route either: no env_file anywhere in the app service, and the owner's names
-    # nowhere in its text (not even inside another variable's value).
-    app = compose_service_lines("app")
-    assert not any(line.strip().startswith("env_file") for line in app)
-    assert not any(name in line for line in app for name in owner)
-    assert not owner & compose_environment("app")
+    # No other route either: no env_file anywhere in the app or the console service, and the
+    # owner's names nowhere in their text (not even inside another variable's value).
+    for service in ("app", "console"):
+        lines = compose_service_lines(service)
+        assert not any(line.strip().startswith("env_file") for line in lines), service
+        assert not any(name in line for line in lines for name in owner), service
+        assert not owner & compose_environment(service), service
+
+
+def test_ci_checks_each_service_against_its_role() -> None:
+    # CI compares the running containers, and Compose's resolved configuration, with the
+    # fields of each role (.github/workflows/ci.yml): the console's too.
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert 'echo "console $(configured console)"' in workflow
+    assert '"console": {name.upper() for name in CONSOLE_FIELDS}' in workflow
+    assert '("console", CONSOLE_FIELDS)' in workflow
+    assert '"app": {name.upper() for name in VOICE_FIELDS}' in workflow
+    assert '("app", VOICE_FIELDS)' in workflow
+    # Not the application settings' fields as a whole any more: no service is given all.
+    assert not re.search(r"(?<!Startup)Settings\.model_fields", workflow)
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -379,8 +435,12 @@ def test_env_example_loads_and_carries_defaults() -> None:
         example = settings_class(_env_file=ENV_EXAMPLE)
 
         for name, field in settings_class.model_fields.items():
-            if not field.is_required():
+            if not field.is_required() and name not in REQUIRED_BUT_BY_THE_CONSOLE:
                 assert getattr(example, name) == field.default, name
+    # Required by every role but the console's, which never holds it: the example sets it.
+    identity_key = Settings(_env_file=ENV_EXAMPLE).identity_hash_key
+    assert identity_key is not None
+    assert identity_key.get_secret_value() == example_value("IDENTITY_HASH_KEY")
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -1497,4 +1557,6 @@ def test_identity_key_differs_from_the_audit_key(monkeypatch: pytest.MonkeyPatch
         assert shared not in str(excinfo.value)
         assert "audit_hmac_key" in str(excinfo.value)
         monkeypatch.setenv("IDENTITY_HASH_KEY", shared + "z")
-        assert Settings(_env_file=None).identity_hash_key.get_secret_value() == shared + "z"
+        identity_key = Settings(_env_file=None).identity_hash_key
+        assert identity_key is not None
+        assert identity_key.get_secret_value() == shared + "z"

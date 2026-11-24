@@ -1002,7 +1002,7 @@ def test_no_print_in_app() -> None:
 # a session's add, raw SQL text) and hold no string with a writing SQL keyword; every other
 # `.append` call is refused, so the one there is is the audit log's. Docstrings are prose and
 # are not read. Like the scans above, a lint against accidents.
-ADMIN_MODULES = ("app/api/admin.py", "app/audit/read.py")
+ADMIN_MODULES = ("app/api/admin.py", "app/api/reads.py", "app/audit/read.py")
 WRITE_NAMES = {
     "insert",
     "update",
@@ -1108,7 +1108,7 @@ def test_admin_is_read_only() -> None:
         name: sum(1 for node in ast.walk(ast.parse(source)) if is_audit_append(node))
         for name, source in sources.items()
     }
-    assert appends == {"app/api/admin.py": 1, "app/audit/read.py": 0}
+    assert appends == {"app/api/admin.py": 1, "app/api/reads.py": 0, "app/audit/read.py": 0}
 
 
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last
@@ -1213,3 +1213,120 @@ def test_ssn_patterns_have_one_owner() -> None:
         "says_a_number",
         "says_digits",
     }
+
+
+# The console (app/console/) shows what the admin's data functions in app/api/reads.py read, the
+# functions the admin API reads with too, so masking, bounds and the audit event are one code:
+# it builds no statement, runs none, and imports no SQL or model. Like the scans above, a lint
+# against accidents.
+CONSOLE_DIR = REPO_ROOT / "app" / "console"
+CONSOLE_PACKAGE = "app.console"
+QUERY_MODULES = ("sqlalchemy", "psycopg", "app.db.models")
+QUERY_NAMES = {
+    "select",
+    "text",
+    "execute",
+    "scalar",
+    "scalars",
+    "insert",
+    "update",
+    "delete",
+    "exec_driver_sql",
+    "where",
+}
+# What the console must read with, and the API with it.
+SHARED_READS = {"newest", "call", "masked"}
+
+
+def console_query_uses(source: str) -> list[str]:
+    uses = [
+        f"import {module}"
+        for module in imported_modules(source, CONSOLE_PACKAGE)
+        if any(module == banned or module.startswith(f"{banned}.") for banned in QUERY_MODULES)
+    ]
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            # A module imported by name from its package: from app.db import models.
+            uses += [
+                f"import {node.module}.{alias.name}"
+                for alias in node.names
+                if f"{node.module}.{alias.name}" in QUERY_MODULES
+            ]
+        if isinstance(node, ast.Name) and node.id in QUERY_NAMES:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in QUERY_NAMES:
+            uses.append(f".{node.attr}")
+    return uses
+
+
+def console_sources() -> dict[str, str]:
+    return {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(CONSOLE_DIR.rglob("*.py"))
+    }
+
+
+def test_console_has_no_queries_of_its_own() -> None:
+    for sample in (
+        "from sqlalchemy import select\n",
+        "import sqlalchemy.orm\n",
+        "from app.db.models import CallSession\n",
+        "from app.db import models\n",
+        "await session.execute(statement)\n",
+        "rows = await session.scalars(statement)\n",
+        "statement = select(CallSession).where(CallSession.id < 5)\n",
+        "await connection.exec_driver_sql('SELECT 1')\n",
+    ):
+        assert console_query_uses(sample), sample
+    assert not console_query_uses(
+        "from app.api import reads\nrows = await access.read(action, kind, reads.newest)\n"
+    )
+
+    sources = console_sources()
+    assert "app/console/pages.py" in sources
+    assert {
+        name: found for name, source in sources.items() if (found := console_query_uses(source))
+    } == {}
+
+    # The pages read through the shared module, and the API reads through the same functions.
+    shared = REPO_ROOT / "app" / "api" / "reads.py"
+    assert "reads" in imports_from(sources["app/console/pages.py"], "app.api")
+    admin = (REPO_ROOT / "app" / "api" / "admin.py").read_text(encoding="utf-8")
+    assert imports_from(admin, "app.api.reads") >= SHARED_READS
+    called_by_reads = {
+        node.func.id
+        for node in ast.walk(ast.parse(shared.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert called_by_reads >= SHARED_READS | {"recent_events"}
+
+
+# The console runs as a container of its own, beside the calls and never in their way: it
+# imports nothing of the voice pipeline, of the agent's turn loop, or of Pipecat.
+VOICE_IMPORTS = ("app.voice", "app.agent.turn", "pipecat")
+
+
+def voice_imports(source: str) -> list[str]:
+    return [
+        module
+        for module in imported_modules(source, CONSOLE_PACKAGE)
+        if any(module == banned or module.startswith(f"{banned}.") for banned in VOICE_IMPORTS)
+    ]
+
+
+def test_the_console_imports_no_voice_pipeline() -> None:
+    for sample in (
+        "from app.voice.pipeline import open_agent_call\n",
+        "import app.voice.calls\n",
+        "from app.agent.turn import SWALLOWED_TURN\n",
+        "import app.agent.turn\n",
+        "from pipecat.frames.frames import Frame\n",
+        "from ..voice import calls\n",
+    ):
+        assert voice_imports(sample), sample
+    assert not voice_imports("from app.api.reads import newest\nimport pipecatx\n")
+    sources = console_sources()
+    assert len(sources) >= 4
+    assert {
+        name: found for name, source in sources.items() if (found := voice_imports(source))
+    } == {}

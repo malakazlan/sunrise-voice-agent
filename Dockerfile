@@ -25,7 +25,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --start-interval=2s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
 # Serve, as the runtime role. Docker starts uvicorn itself, so it is PID 1 and receives the
-# container's signals. The start-up steps (settings check, migrations, role set-up, seed) run as
-# the owner in a separate one-shot service from this image (deploy/docker-compose.yml), so this
-# container never holds the owner's identity.
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+# container's signals. APP_ROLE picks what it serves (app/server.py): the calls, the console, or
+# both. The start-up steps (settings check, migrations, role set-up, seed) run as the owner in a
+# separate one-shot service from this image (deploy/docker-compose.yml), so this container never
+# holds the owner's identity. The console's templates and static files are under app/.
+CMD ["uvicorn", "app.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]

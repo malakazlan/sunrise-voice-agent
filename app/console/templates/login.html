@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Sign in{% endblock %}
+{% block body %}
+<div class="signin">
+  <aside class="signin__side">
+    <span class="brand brand--flat">
+      <span class="brand__mark">{{ icon("sun", " icon--lg") }}</span>
+      <span><span class="brand__name">Sunrise Family Clinic</span><span class="brand__sub">Voice agent console</span></span>
+    </span>
+    <div>
+      <h1>See what the phone agent did on every call.</h1>
+      <p class="signin__lead">For clinic staff and reviewers: the calls that have ended, what staff need to act on, and proof that every look at patient data was recorded.</p>
+    </div>
+    <ul class="signin__facts">
+      <li>{{ icon("eye-off") }}<span><strong>Everything shown is masked</strong>Dates of birth, phone numbers, email addresses and SSN digits never appear in full. Callers' names are masked wherever the console knows them.</span></li>
+      <li>{{ icon("shield-check") }}<span><strong>Everything you do is recorded</strong>Each page you open and each action you take is written to the audit log under your sign-in name.</span></li>
+      <li>{{ icon("lock") }}<span><strong>Your session ends on its own</strong>After 30 minutes without use, or 8 hours after you sign in.</span></li>
+    </ul>
+  </aside>
+
+  <main id="main" class="signin__main">
+    <div class="signin__box">
+      <div>
+        <h2>Sign in</h2>
+        <p class="muted signin__hint">Use the admin name and password for this clinic.</p>
+      </div>
+      {% if message == "You are signed out." %}
+      <p class="note note--box" role="status">{{ icon("check") }}<span>{{ message }}</span></p>
+      {% elif message %}
+      <p class="alert" role="alert">{{ icon("x") }}<span>{{ message }}</span></p>
+      {% endif %}
+      <form class="signin__form" method="post" action="/admin/login">
+        <input type="hidden" name="token" value="{{ token }}">
+        <label class="field">User name
+          <input class="input" type="text" name="user" required autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32">
+        </label>
+        <label class="field">Password
+          <input class="input" type="password" name="password" required autocomplete="current-password">
+        </label>
+        <button type="submit" class="btn btn--primary btn--block">Sign in</button>
+      </form>
+      <p class="note">{{ icon("lock") }}<span>Sign out when you leave the desk. A restart of the console signs everyone out.</span></p>
+    </div>
+  </main>
+</div>
+{% endblock %}
