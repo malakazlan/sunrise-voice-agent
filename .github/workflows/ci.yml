@@ -105,6 +105,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Show the Docker and Compose versions
+        run: |
+          docker version --format 'Docker client {{.Client.Version}}, server {{.Server.Version}}'
+          docker compose version
       - name: Plant decoy env files that must not reach the image
         run: |
           printf 'DECOY=1\n' > app/.env
@@ -137,6 +141,7 @@ jobs:
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
             POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
             POSTGRES_PASSWORD=ci-compose-only-password-0001 \
+            APP_DB_USER=sunrise_app APP_DB_PASSWORD=ci-compose-only-app-password-0001 \
             TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
             DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
             AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 UNRELATED_DECOY=1 > .env
@@ -169,6 +174,178 @@ jobs:
             psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
           echo "patients: $patients"
           test "$patients" = "5"
+          # The start-up service ran to completion, with 0, before the app was started.
+          startup=$($compose ps -a -q startup)
+          state=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")
+          echo "start-up service: $state"
+          test "$state" = "exited 0"
+          finished=$(docker inspect --format '{{.State.FinishedAt}}' "$startup")
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          echo "start-up finished $finished, app started $started"
+          test "$(date -d "$started" +%s%N)" -gt "$(date -d "$finished" +%s%N)"
+      - name: The app connects as the runtime role the start-up set up
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # The app's own engine, built from its own settings inside its container, over the
+          # network with the password (scram-sha-256 in the image's pg_hba.conf).
+          user=$(bounded 60 "the app's database user" $compose exec -T app python -c '
+          import asyncio
+          from sqlalchemy import text
+          from app.config import Settings
+          from app.db.session import create_database_engine
+          async def main():
+              engine = create_database_engine(Settings())
+              async with engine.connect() as connection:
+                  print(await connection.scalar(text("SELECT current_user")))
+              await engine.dispose()
+          asyncio.run(main())
+          ')
+          echo "the app connects as: $user"
+          test "$user" = "sunrise_app"
+          # superuser, create roles, create databases, log in, replication, bypass row security
+          attributes=$(bounded 30 "the runtime role's attributes" $compose exec -T db \
+            psql -U sunrise -d sunrise -tAc "SELECT rolsuper, rolcreaterole, rolcreatedb,
+              rolcanlogin, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = 'sunrise_app'")
+          echo "runtime role attributes: $attributes"
+          test "$attributes" = "f|f|f|t|f|f"
+          # As the role (over the db container's local socket): the audit log refuses a change
+          # by privilege, before its triggers.
+          code=0
+          refused=$(bounded 30 "a DELETE as the runtime role" $compose exec -T db \
+            psql -U sunrise_app -d sunrise -tAc 'DELETE FROM audit_events' 2>&1) || code=$?
+          echo "DELETE as the runtime role -> exit $code: $refused"
+          test "$code" = "1"
+          echo "$refused" | grep -q 'permission denied for table audit_events'
+      - name: Each service's configured environment is its settings class, exactly
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # What Docker gives every process it starts in each container, HEALTHCHECK included:
+          # the container's configured environment, less what the image sets itself. Names only.
+          configured() {
+            id=$($compose ps -a -q "$1")
+            image=$(docker inspect --format '{{.Config.Image}}' "$id")
+            docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
+              | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/image-env"
+            docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" \
+              | cut -d= -f1 | sed '/^$/d' | sort -u | comm -23 - "$RUNNER_TEMP/image-env" \
+              | tr '\n' ' '
+          }
+          {
+            echo "app $(configured app)"
+            echo "startup $(configured startup)"
+          } | tee "$RUNNER_TEMP/configured-env"
+          bounded_run 60 "the configured-environment comparison" ci-configured-env -i --rm \
+            --entrypoint python sunrise-voice-agent:ci -c '
+          import sys
+          from app.config import Settings, StartupSettings
+          expected = {
+              "app": {name.upper() for name in Settings.model_fields},
+              "startup": {name.upper() for name in StartupSettings.model_fields},
+          }
+          found = {}
+          for line in sys.stdin:
+              service, *names = line.split()
+              found[service] = set(names)
+          print("services checked:", " ".join(sorted(found)))
+          if found != expected:
+              for service in sorted(expected):
+                  print(service, "missing:", sorted(expected[service] - found.get(service, set())),
+                        "unexpected:", sorted(found.get(service, set()) - expected[service]))
+              sys.exit(1)
+          ' < "$RUNNER_TEMP/configured-env"
+      - name: No process in the app container holds the owner's identity, healthcheck included
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # Inside the app container, as its own user: every readable /proc/*/environ, sampled
+          # until a HEALTHCHECK process has been seen (bounded), then every value seen is tried
+          # as the owner's password. The real owner password goes in on stdin only, so it is in
+          # no process the check reads (scripts/check_app_processes.py says how).
+          owner_password=$(sed -n 's/^POSTGRES_PASSWORD=//p' .env)
+          test -n "$owner_password"
+          printf '%s' "$owner_password" | bounded 120 "the app container's process check" \
+            $compose exec -T app python -c "$(cat scripts/check_app_processes.py)" sunrise 75
+          # Nor can a start-up step run from what the app container holds.
+          code=0
+          output=$(bounded 60 "role set-up in the app container" $compose exec -T app \
+            python -m app.db.roles 2>&1) || code=$?
+          echo "role set-up in the app container -> exit $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "postgres_user"
+          echo "$output" | grep -q "postgres_password"
+      - name: Restarts keep the role and its privileges; a stack restart runs the start-up again
+        run: |
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # Compose may restart a container in place or recreate it (a new id) when the stack
+          # comes up again, depending on its version: containers are looked up by service
+          # every time, never kept across a restart.
+          inspect() {
+            id=$($compose ps -a -q "$1")
+            test -n "$id"
+            docker inspect --format "$2" "$id"
+          }
+          nanoseconds() {
+            date -d "$1" +%s%N
+          }
+          snapshot() {
+            bounded 30 "the role and privilege snapshot" $compose exec -T db \
+              psql -U sunrise -d sunrise -tA \
+              -c "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin,
+                rolreplication, rolbypassrls FROM pg_roles WHERE rolname = 'sunrise_app'" \
+              -c "SELECT relname, relacl FROM pg_class
+                WHERE relnamespace = 'public'::regnamespace ORDER BY relname" \
+              -c "SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public'" \
+              -c "SELECT datname, datacl FROM pg_database ORDER BY datname"
+          }
+          snapshot > "$RUNNER_TEMP/privileges-before"
+          cat "$RUNNER_TEMP/privileges-before"
+          # The snapshot holds the role and its grants, so the comparisons below mean something.
+          grep -qx 'sunrise_app|f|f|f|t|f|f' "$RUNNER_TEMP/privileges-before"
+          grep -q '^audit_events|.*sunrise_app=ar/sunrise' "$RUNNER_TEMP/privileges-before"
+          setup_finished=$(inspect startup '{{.State.FinishedAt}}')
+          echo "start-up finished at $setup_finished"
+
+          echo "--- the app container alone: no start-up run is needed"
+          app_started=$(inspect app '{{.State.StartedAt}}')
+          bounded 120 "the app to restart" $compose restart app
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
+          test "$(inspect app '{{.State.StartedAt}}')" != "$app_started"
+          # The start-up service did not run again: it last finished when it did before.
+          test "$(inspect startup '{{.State.FinishedAt}}')" = "$setup_finished"
+          snapshot > "$RUNNER_TEMP/privileges-after-app"
+          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-app"
+
+          echo "--- the whole stack: the start-up runs again, then the app starts"
+          bounded 120 "the stack to stop" $compose stop
+          bounded 300 "the stack to start again" $compose up -d
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
+          # The start-up service (whichever container Compose now has for it) started and
+          # finished after the earlier run, with 0, and its log has this run's set-up, which
+          # found the role. Without a new run, none of this holds, restarted in place or not.
+          state=$(inspect startup '{{.State.Status}} {{.State.ExitCode}}')
+          started=$(inspect startup '{{.State.StartedAt}}')
+          finished=$(inspect startup '{{.State.FinishedAt}}')
+          echo "start-up service: $state, started $started, finished $finished"
+          test "$state" = "exited 0"
+          test "$(nanoseconds "$started")" -gt "$(nanoseconds "$setup_finished")"
+          test "$(nanoseconds "$finished")" -gt "$(nanoseconds "$started")"
+          id=$($compose ps -a -q startup)
+          bounded 60 "the start-up service's log" docker logs --since "$started" "$id" \
+            > "$RUNNER_TEMP/startup-log" 2>&1
+          grep runtime_role_ready "$RUNNER_TEMP/startup-log"
+          test "$(grep -c 'runtime_role_ready created=False' "$RUNNER_TEMP/startup-log")" = 1
+          # And the app was started after it had finished.
+          app_started=$(inspect app '{{.State.StartedAt}}')
+          echo "app started $app_started"
+          test "$(nanoseconds "$app_started")" -gt "$(nanoseconds "$finished")"
+          snapshot > "$RUNNER_TEMP/privileges-after-stack"
+          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-stack"
       - name: The db container holds only the database variables
         run: |
           db=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q db)
@@ -191,23 +368,28 @@ jobs:
             grep -qx "$name" "$RUNNER_TEMP/db-env"
           done
           echo "db environment holds only the database variables"
-      - name: The app container receives exactly the settings variables
+      - name: Compose gives app and startup exactly their settings variables
         run: |
           set -o pipefail
           . .github/ci-wait.sh
-          # Compose's resolved configuration, read by the app's own Settings class inside the
-          # image. Names only; values are never printed.
+          # Compose's resolved configuration, read by the app's own settings classes inside the
+          # image. Names only; values are never printed. The running containers are checked
+          # against the same classes above.
           timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
             | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
               --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
-          from app.config import Settings
-          received = set(json.load(sys.stdin)["services"]["app"]["environment"])
-          fields = {name.upper() for name in Settings.model_fields}
-          print("app environment names:", " ".join(sorted(received)))
-          if received != fields:
-              print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
-              sys.exit(1)
+          from app.config import Settings, StartupSettings
+          services = json.load(sys.stdin)["services"]
+          failed = False
+          for service, settings_class in (("app", Settings), ("startup", StartupSettings)):
+              received = set(services[service]["environment"])
+              fields = {name.upper() for name in settings_class.model_fields}
+              print(service, "environment names:", " ".join(sorted(received)))
+              if received != fields:
+                  print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
+                  failed = True
+          sys.exit(1 if failed else 0)
           '
       - name: The coturn container holds only its own variables
         run: |
@@ -345,10 +527,66 @@ jobs:
           echo "$output" | tail -n 15
           echo "exit code: $code"
           test "$code" = "1"
-          for name in postgres_host postgres_db postgres_user postgres_password \
-            audit_hmac_key turn_shared_secret turn_host demo_access_token; do
+          for name in postgres_host postgres_db app_db_user app_db_password audit_hmac_key \
+            turn_shared_secret turn_host demo_access_token; do
             echo "$output" | grep -q "$name"
           done
+      - name: Start-up steps without their settings must not run
+        run: |
+          . .github/ci-wait.sh
+          code=0
+          output=$(bounded_run 60 "the start-up check to refuse" ci-no-startup-settings --rm \
+            -e APP_ENV=prod sunrise-voice-agent:ci python -m app.config 2>&1) || code=$?
+          echo "$output" | tail -n 15
+          echo "exit code: $code"
+          test "$code" = "1"
+          for name in postgres_host postgres_db postgres_user postgres_password app_db_user \
+            app_db_password; do
+            echo "$output" | grep -q "$name"
+          done
+      - name: Start-up whose runtime user is the owner must not run
+        run: |
+          . .github/ci-wait.sh
+          # Every other setting is valid (the Compose env file), so only this rule can stop it.
+          code=0
+          output=$(bounded_run 60 "the start-up check to refuse" ci-same-user --rm \
+            --env-file .env -e APP_DB_USER=sunrise sunrise-voice-agent:ci \
+            python -m app.config 2>&1) || code=$?
+          echo "$output" | tail -n 5
+          echo "exit code: $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "1 validation error for StartupSettings"
+          echo "$output" | grep -q "postgres_user must differ from app_db_user"
+          if echo "$output" | grep -Eq "validation errors? for Settings"; then
+            echo "the application settings were refused too; only the start-up rule should be"
+            exit 1
+          fi
+      - name: A failed start-up keeps the app from starting
+        run: |
+          . .github/ci-wait.sh
+          # The same stack, with a start-up setting the start-up service refuses.
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          bounded 120 "the stack to go down" $compose \
+            -f deploy/docker-compose.relay-test.yml down
+          code=0
+          export APP_DB_USER=sunrise
+          bounded 300 "the stack to try to start" $compose up -d \
+            > "$RUNNER_TEMP/failed-up" 2>&1 || code=$?
+          tail -n 5 "$RUNNER_TEMP/failed-up"
+          echo "up exit code: $code"
+          test "$code" != "0"
+          test "$code" != "124"
+          grep -q 'service "startup" didn.t complete successfully' "$RUNNER_TEMP/failed-up"
+          startup=$($compose ps -a -q startup)
+          app=$($compose ps -a -q app)
+          echo "start-up service: $(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$startup")" = "1"
+          state=$(docker inspect --format '{{.State.Status}}' "$app")
+          echo "app container: $state"
+          test "$state" = "created"
+          status=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
+          echo "GET /health -> $status"
+          test "$status" = "000"
       - name: Compose logs
         if: always()
         run: timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml logs || true

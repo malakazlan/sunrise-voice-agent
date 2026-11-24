@@ -1,9 +1,11 @@
 import re
+import sys
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, ValidationInfo, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, ValidationError, ValidationInfo, field_validator
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from sqlalchemy import URL
 
 from app.domain.clinic import CLINIC_TZ
@@ -20,6 +22,14 @@ MIN_SECRET_LENGTH = 32
 # What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
 TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
+# The APP_DB_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
+EXAMPLE_APP_DB_PASSWORD = "change-me-to-another-long-random-value"  # noqa: S105 (a published placeholder)
+# The runtime role's name goes into role set-up statements (app/db/roles.py), always quoted.
+# Postgres cuts names after 63 bytes and reserves the pg_ prefix.
+APP_DB_USER_NAME = re.compile(r"[a-z0-9_]{1,63}")
+RESERVED_ROLE_PREFIX = "pg_"
+# No database password may be a placeholder from .env.example outside dev.
+DATABASE_PASSWORD_PLACEHOLDERS = (EXAMPLE_PASSWORD, EXAMPLE_APP_DB_PASSWORD)
 # The AUDIT_HMAC_KEY value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a published placeholder)
 MIN_AUDIT_KEY_LENGTH = 32
@@ -52,19 +62,114 @@ ISO_DATE_TIME = re.compile(
 )
 
 
-class Settings(BaseSettings):
+def _check_database_password(name: str, value: SecretStr, info: ValidationInfo) -> None:
+    """The rules every database password follows, the owner's and the runtime role's."""
+    password = value.get_secret_value()
+    if not password:
+        raise ValueError(f"{name} must not be empty")
+    if not _outside_dev(info):
+        return
+    if len(password) < MIN_PASSWORD_LENGTH or password in DATABASE_PASSWORD_PLACEHOLDERS:
+        raise ValueError(
+            f"outside dev {name} needs at least {MIN_PASSWORD_LENGTH} characters"
+            " and must not be a .env.example placeholder"
+        )
+    _check_strong_secret(name, value, info)
+
+
+class _OneEnvFile(PydanticBaseSettingsSource):
+    """The .env file, read for one settings class. One file holds the variables of both
+    classes; each class takes its own from it and leaves the other's, and still refuses any key
+    that belongs to neither. Only the file is shared: an argument or an environment variable
+    of the other class is not read."""
+
+    def __init__(self, settings_cls: type[BaseSettings], env_file: PydanticBaseSettingsSource):
+        super().__init__(settings_cls)
+        self._env_file = env_file
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._env_file.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        own = self.settings_cls.model_fields
+        return {
+            key: value
+            for key, value in self._env_file().items()
+            if key in own or key not in _EVERY_SETTING
+        }
+
+
+class _SettingsBase(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", extra="forbid", hide_input_in_errors=True, env_ignore_empty=True
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            _OneEnvFile(settings_cls, dotenv_settings),
+            file_secret_settings,
+        )
+
     app_env: AppEnv
     log_level: LogLevel = "INFO"
+
+
+class DatabaseSettings(_SettingsBase):
+    """Where the database is, and the runtime role the application connects as."""
 
     postgres_host: str
     postgres_port: int = 5432
     postgres_db: str
-    postgres_user: str
-    postgres_password: SecretStr
+    # The runtime role (app/db/roles.py sets it up).
+    app_db_user: str
+    app_db_password: SecretStr
+
+    @field_validator("app_db_user")
+    @classmethod
+    def runtime_user_is_a_plain_name(cls, value: str) -> str:
+        if not APP_DB_USER_NAME.fullmatch(value) or value.startswith(RESERVED_ROLE_PREFIX):
+            raise ValueError(
+                "app_db_user must be 1 to 63 lower-case letters, digits and underscores,"
+                f" not starting with {RESERVED_ROLE_PREFIX}"
+            )
+        return value
+
+    @field_validator("app_db_password")
+    @classmethod
+    def runtime_password_is_strong(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+        _check_database_password("app_db_password", value, info)
+        return value
+
+    def _database_url(self, user: str, password: SecretStr) -> URL:
+        """The only place a database URL is assembled. Its str() and repr() mask the password."""
+        return URL.create(
+            "postgresql+psycopg",
+            username=user,
+            password=password.get_secret_value(),
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_db,
+        )
+
+    @property
+    def runtime_database_url(self) -> URL:
+        """The application's connections: the runtime role."""
+        return self._database_url(self.app_db_user, self.app_db_password)
+
+
+class Settings(DatabaseSettings):
+    """The application's settings. They hold no part of the owner's identity, and the app
+    container is never given the owner's variables (deploy/docker-compose.yml)."""
 
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
@@ -113,20 +218,6 @@ class Settings(BaseSettings):
     demo_access_token: SecretStr | None = Field(
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
-
-    @field_validator("postgres_password")
-    @classmethod
-    def password_is_strong_outside_dev(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
-        if info.data.get("app_env") in (None, "dev"):
-            return value
-        password = value.get_secret_value()
-        if len(password) < MIN_PASSWORD_LENGTH or password == EXAMPLE_PASSWORD:
-            raise ValueError(
-                f"outside dev the password needs at least {MIN_PASSWORD_LENGTH} characters"
-                " and must not be the .env.example placeholder"
-            )
-        _check_strong_secret("postgres_password", value, info)
-        return value
 
     @field_validator("audit_hmac_key")
     @classmethod
@@ -190,14 +281,57 @@ class Settings(BaseSettings):
             _check_strong_secret("demo_access_token", value, info)
         return value
 
+
+class StartupSettings(DatabaseSettings):
+    """The start-up steps' settings, and theirs only: migrations, role set-up and the seed
+    (a repo hygiene test keeps them there). They add the owner, which never reaches the
+    application. The owner's fields come after the runtime role's, so they are checked
+    against it."""
+
+    postgres_user: str
+    postgres_password: SecretStr
+
+    @field_validator("postgres_user")
+    @classmethod
+    def owner_is_not_the_runtime_role(cls, value: str, info: ValidationInfo) -> str:
+        if value == info.data.get("app_db_user"):
+            raise ValueError("postgres_user must differ from app_db_user")
+        return value
+
+    @field_validator("postgres_password")
+    @classmethod
+    def owner_password_is_strong_and_its_own(
+        cls, value: SecretStr, info: ValidationInfo
+    ) -> SecretStr:
+        _check_database_password("postgres_password", value, info)
+        runtime_password = info.data.get("app_db_password")
+        if runtime_password is not None and (
+            value.get_secret_value() == runtime_password.get_secret_value()
+        ):
+            raise ValueError("postgres_password must differ from app_db_password")
+        return value
+
     @property
-    def database_url(self) -> URL:
-        """The only place a database URL is assembled. Its str() and repr() mask the password."""
-        return URL.create(
-            "postgresql+psycopg",
-            username=self.postgres_user,
-            password=self.postgres_password.get_secret_value(),
-            host=self.postgres_host,
-            port=self.postgres_port,
-            database=self.postgres_db,
-        )
+    def owner_database_url(self) -> URL:
+        """The start-up steps' connections only: the owner (see app/db/session.py)."""
+        return self._database_url(self.postgres_user, self.postgres_password)
+
+
+# Every variable of either class, so that each can leave the other's in the shared .env file.
+_EVERY_SETTING = frozenset(Settings.model_fields) | frozenset(StartupSettings.model_fields)
+
+
+def main() -> None:
+    """`python -m app.config`: the start-up service's first step, which checks the start-up
+    steps' settings from the environment before anything touches the database. Every error is
+    reported, by field name and a fixed message, never a value. The application checks its own
+    settings when it starts."""
+    try:
+        StartupSettings()
+    except ValidationError as error:
+        sys.stderr.write(f"{error}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

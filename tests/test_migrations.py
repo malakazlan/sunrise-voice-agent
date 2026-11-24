@@ -9,9 +9,9 @@ from alembic.migration import MigrationContext
 from sqlalchemy import TextClause, inspect, text
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config import StartupSettings
 from app.db.models import Base
-from app.db.session import create_sync_engine
+from app.db.session import create_owner_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TABLES = {"patients", "medications", "appointments", "available_slots", "audit_events"}
@@ -37,8 +37,8 @@ CONSTRAINT_DEFINITIONS = text(
 )
 
 
-def table_names(settings: Settings) -> set[str]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+def table_names(settings: StartupSettings) -> set[str]:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return set(inspect(connection).get_table_names())
@@ -56,8 +56,8 @@ COLUMN_DEFINITIONS = text(
 )
 
 
-def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+def column_definitions(settings: StartupSettings) -> set[tuple[object, ...]]:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return {tuple(row) for row in connection.execute(COLUMN_DEFINITIONS).all()}
@@ -65,8 +65,8 @@ def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
         engine.dispose()
 
 
-def constraint_definitions(settings: Settings) -> set[tuple[str, str, str]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+def constraint_definitions(settings: StartupSettings) -> set[tuple[str, str, str]]:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             rows = connection.execute(CONSTRAINT_DEFINITIONS).all()
@@ -86,8 +86,8 @@ FUNCTION_DEFINITIONS = text(
 )
 
 
-def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+def definitions(settings: StartupSettings, query: TextClause) -> set[tuple[object, ...]]:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return {tuple(row) for row in connection.execute(query).all()}
@@ -96,13 +96,13 @@ def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]
 
 
 def test_migration_matches_models(
-    new_database: Callable[[], Settings], run_alembic: Alembic
+    new_database: Callable[[], StartupSettings], run_alembic: Alembic
 ) -> None:
     migrated = new_database()
     upgrade = run_alembic(migrated, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
 
-    engine = create_sync_engine(migrated, poolclass=NullPool)
+    engine = create_owner_sync_engine(migrated, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection, opts=COMPARE_OPTIONS)
@@ -117,7 +117,7 @@ def test_migration_matches_models(
     # Alembic compares CHECK constraints by name only. Build the schema straight from the
     # models as well and compare every constraint's definition.
     from_models = new_database()
-    engine = create_sync_engine(from_models, poolclass=NullPool)
+    engine = create_owner_sync_engine(from_models, poolclass=NullPool)
     try:
         with engine.begin() as connection:
             Base.metadata.create_all(connection)
@@ -154,6 +154,16 @@ def test_migration_matches_models(
         "audit_events_check_position",
     }
     assert migrated_functions == definitions(from_models, FUNCTION_DEFINITIONS)
+    # Their search path is pinned, so nothing created later can shadow what they use, and the
+    # table they read is named with its schema.
+    for name, definition in migrated_functions:
+        assert " SET search_path TO 'pg_catalog', 'pg_temp'\n" in str(definition), name
+    check_position = [
+        definition
+        for name, definition in migrated_functions
+        if name == "audit_events_check_position"
+    ]
+    assert "FROM public.audit_events" in str(check_position)
     assert (
         "available_slots",
         "id",
@@ -168,7 +178,7 @@ def test_migration_matches_models(
 
 
 def test_upgrade_on_migrated_database_is_a_no_op(
-    empty_database: Settings, run_alembic: Alembic
+    empty_database: StartupSettings, run_alembic: Alembic
 ) -> None:
     first = run_alembic(empty_database, "upgrade", "head")
     assert first.returncode == 0, first.stderr
@@ -183,7 +193,9 @@ def test_upgrade_on_migrated_database_is_a_no_op(
     assert "(head)" in current.stdout
 
 
-def test_downgrade_removes_the_tables(empty_database: Settings, run_alembic: Alembic) -> None:
+def test_downgrade_removes_the_tables(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
     assert run_alembic(empty_database, "upgrade", "head").returncode == 0
 
     downgrade = run_alembic(empty_database, "downgrade", "base")
