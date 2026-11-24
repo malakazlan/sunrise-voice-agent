@@ -816,6 +816,47 @@ async def test_append_refuses_a_session_outside_a_transaction(
         assert connection.execute(COUNT).scalar_one() == 1
 
 
+def rewrite_on_insert(assignment: str) -> tuple[str, str]:
+    """An owner's BEFORE INSERT trigger that changes the row on its way into storage. Named
+    `rewrite`, it fires after `audit_events_check_position` (same-kind triggers fire in name
+    order), and changes neither seq nor prev_mac, so the row is stored.
+    """
+    return (
+        "CREATE FUNCTION rewrite() RETURNS trigger LANGUAGE plpgsql AS"
+        f" $$ BEGIN {assignment}; RETURN NEW; END $$",
+        "CREATE TRIGGER rewrite BEFORE INSERT ON audit_events"
+        " FOR EACH ROW EXECUTE FUNCTION rewrite()",
+    )
+
+
+async def test_action_fails_when_the_stored_mac_is_rewritten(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # The MAC becomes another 64-hex value; everything else is stored as written.
+    tamper_with_audit_events(sync_engine, *rewrite_on_insert("NEW.mac := repeat('f', 64)"))
+
+    await session.execute(INSERT_PATIENT)
+    with pytest.raises(RuntimeError, match="differs from what was written"):
+        await audit.append(session, call_started(), now=T0)
+    await session.commit()
+
+    assert counts(sync_engine) == (0, 0)
+
+
+async def test_action_fails_when_stored_content_is_rewritten(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # The outcome becomes another registry value; the MAC is left as append computed it.
+    tamper_with_audit_events(sync_engine, *rewrite_on_insert("NEW.outcome := 'failure'"))
+
+    await session.execute(INSERT_PATIENT)
+    with pytest.raises(RuntimeError, match="differs from what was written"):
+        await audit.append(session, call_started(), now=T0)
+    await session.commit()
+
+    assert counts(sync_engine) == (0, 0)
+
+
 async def test_action_fails_when_the_insert_is_redirected(
     audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:

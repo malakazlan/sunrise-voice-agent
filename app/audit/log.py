@@ -390,10 +390,45 @@ class AuditLog:
             # A rule or trigger can make an INSERT store nothing without an error.
             if written.scalars().all() != [seq]:
                 raise RuntimeError("the audit event was not stored: the INSERT returned no row")
-            # A rule can also send the row elsewhere and still return it: read it back.
-            stored = await session.execute(select(AuditEvent.mac).where(AuditEvent.seq == seq))
-            if stored.scalars().all() != [mac]:
+            # A rule can send the row elsewhere and still return it, and a trigger can change
+            # it on the way in: read the whole row back and compare it with what was written.
+            stored = (
+                await session.execute(
+                    select(
+                        AuditEvent.seq,
+                        AuditEvent.ts,
+                        AuditEvent.call_id,
+                        AuditEvent.actor,
+                        AuditEvent.action,
+                        AuditEvent.resource_type,
+                        AuditEvent.resource_id,
+                        AuditEvent.outcome,
+                        AuditEvent.reason,
+                        AuditEvent.prev_mac,
+                        AuditEvent.mac,
+                    ).where(AuditEvent.seq == seq)
+                )
+            ).all()
+            if not stored:
                 raise RuntimeError("the audit event was not stored: it is not in audit_events")
+            written_row = (
+                row.seq,
+                row.ts,
+                row.call_id,
+                row.actor,
+                row.action,
+                row.resource_type,
+                row.resource_id,
+                row.outcome,
+                row.reason,
+                row.prev_mac,
+                mac,
+            )
+            if [tuple(found) for found in stored] != [written_row]:
+                raise RuntimeError(
+                    "the audit event was not stored as written: the stored row differs from"
+                    " what was written"
+                )
         except BaseException:
             try:
                 await _roll_back_to_the_end(session)

@@ -59,8 +59,9 @@ All data used by this project is synthetic. No real customer or personal data is
   - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
     transaction and does not commit, so the event and the action it records commit or roll
     back together. Any failure, a cancelled task included, rolls back the caller's whole
-    transaction. After its INSERT, `append` reads its row back and compares the stored MAC,
-    so an INSERT that stores nothing, or stores the row somewhere else, counts as a failure.
+    transaction. After its INSERT, `append` reads its row back and compares every column
+    with what it wrote, so an INSERT that stores nothing, stores the row somewhere else, or
+    stores it changed counts as a failure.
     Appends take a transaction-scoped advisory lock and wait for it at most 5 seconds (that
     timeout stays in force for the rest of the caller's transaction), so callers append
     last, just before they commit, at the top level of their transaction: an append in a
@@ -86,7 +87,9 @@ All data used by this project is synthetic. No real customer or personal data is
     can carry two breaks, for example a gap and a MAC mismatch next to a removed row. After a
     break it goes on from that row's stored MAC, so later tampering is still found, and one
     edit can show twice: changing only a row's stored MAC breaks that row and the link of the
-    row after it. It never raises because of what is stored.
+    row after it. It never raises because of what is stored. A row whose seq is null (only
+    possible once the owner drops the primary key) is reported as unreadable; it sorts last,
+    so no row comes after it to be checked against it.
   - Limits of the chain: removing the newest events is not visible from the chain alone;
     that needs the head kept outside the database. Anyone who can INSERT can add a row at
     the next position without the key; `verify` reports it as one break and checks the
@@ -104,8 +107,11 @@ All data used by this project is synthetic. No real customer or personal data is
     disable or drop the triggers or drop the table; the chain still shows any edit made that
     way. The repo's scans that keep writes to the table in `app/audit/`, the trigger switch in
     the test fixture, and raw `SAVEPOINT` or `ROLLBACK TO` text out of `app/` are lints
-    against accidents, not controls. The control is the runtime database role in the next
-    change: the app will connect as a role that neither owns the table nor is a superuser.
+    against accidents, not controls: the savepoint scan reads literal strings only, so it does
+    not see an SQL comment between `ROLLBACK` and `TO`, `ROLLBACK WORK TO` or
+    `ROLLBACK TRANSACTION TO`, or text assembled at runtime. The control is the runtime
+    database role in the next change: the app will connect as a role that neither owns the
+    table nor is a superuser.
 
 ### Voice echo call
 
