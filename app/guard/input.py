@@ -6,14 +6,17 @@ and changes nothing; the state changes it asks for are in the decision, for its 
 
 1. Emergency. A phrase of the emergency list, negated or not, wins over everything: the model
    sees nothing of the turn, code speaks the emergency line, and the call moves to emergency.
-2. The SSN step, only while it is armed. A turn with any digit, written or spoken, is
-   swallowed whole and its digits are added to the buffer; a turn without one passes. Every
+2. The SSN step, only while it is armed. A turn with any digit or number word, written or
+   spoken, is swallowed whole and its digits are added to the buffer; a turn without one
+   passes. Every
    armed turn is counted. Four digits in all submit them; more than four clear the buffer and
    ask again; the third armed turn submits whatever there is. A submitting decision disarms the
    step and leaves the claim and the buffer for submit_identity, which the caller runs before
    the model sees anything of the turn.
-3. SSN redaction, always: digits after a cue and SSN-shaped numbers, and while the caller is
-   unverified, a bare group of four digits that is not a year. The patterns are the mask
+3. SSN redaction, always: digits after a cue, SSN-shaped numbers and any run that reads as
+   nine digits. In greeting and intake, while the caller is unverified, every other digit and
+   number word too, but for dates, years from 1900 to 2099 and ten- or eleven-digit numbers;
+   once verified, any group that is the caller's own last four. The patterns are the mask
    module's (app/guard/mask.py).
 4. Flags: an attempt to override the instructions, and a request about someone else. The text
    still passes.
@@ -26,7 +29,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.scripts import ScriptId
 from app.agent.state import CallState, Move, Phase, SsnStep
-from app.guard.mask import mask_last_four, mask_ssns, spoken_digits
+from app.guard.mask import (
+    mask_known_digits,
+    mask_ssns,
+    mask_unverified_digits,
+    says_a_number,
+    spoken_digits,
+)
+
+# Where an unverified caller's numbers are hidden but for dates, years and callback numbers.
+_UNVERIFIED_PHASES = frozenset({Phase.GREETING, Phase.INTAKE})
 
 # The digits the SSN step takes, and the armed turns it waits for them.
 SSN_DIGITS = 4
@@ -116,7 +128,7 @@ def guard_input(text: str, state: CallState) -> GuardDecision:
             change = SsnStep(expecting_ssn4=False, ssn_turns=0, pending_ssn4=pending or None)
         else:
             change = SsnStep(expecting_ssn4=True, ssn_turns=turns, pending_ssn4=pending or None)
-        if digits:
+        if says_a_number(text):
             return GuardDecision(
                 action=GuardAction.SWALLOW,
                 text=None,
@@ -127,8 +139,10 @@ def guard_input(text: str, state: CallState) -> GuardDecision:
             )
 
     seen = mask_ssns(text)
-    if not state.verified:
-        seen = mask_last_four(seen)
+    if not state.verified and state.phase in _UNVERIFIED_PHASES:
+        seen = mask_unverified_digits(seen)
+    elif state.verified_ssn4 is not None:
+        seen = mask_known_digits(seen, state.verified_ssn4)
     return GuardDecision(
         action=GuardAction.PASS,
         text=seen,

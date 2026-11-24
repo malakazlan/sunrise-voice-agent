@@ -29,6 +29,15 @@ FULL_SSN = "-".join(["123", "45", "6789"])
 SPACED_SSN = " ".join(["123", "45", "6789"])
 NINE_DIGITS = "".join(["123", "45", "6789"])
 LAST_FOUR = "33" + "44"
+# A nine-digit SSN said in other groupings and in words.
+NINE_SAID = [
+    "one two three four five six seven eight nine",
+    " ".join("123456789"),
+    " ".join(["123", "456", "789"]),
+    " ".join(["12345", "6789"]),
+    " - ".join(["123", "45", "6789"]),
+    "one two three dash four five dash six seven eight nine",
+]
 
 
 def new_call_id() -> str:
@@ -52,6 +61,12 @@ def armed() -> CallState:
 
 def serving() -> CallState:
     return verify(intake(), patient_id="P001", first_name="Sarah")
+
+
+def verified_with_digits() -> CallState:
+    """A caller verified with the four digits they gave."""
+    collected = apply(armed(), SsnStep(expecting_ssn4=False, ssn_turns=0, pending_ssn4=LAST_FOUR))
+    return verify(collected, patient_id="P001", first_name="Sarah")
 
 
 def every_phase(office_open: bool) -> list[CallState]:
@@ -89,24 +104,73 @@ REDACTED_EVERYWHERE = [
     (f"last 4 is {LAST_FOUR}", "last 4 is ****"),
     (f"ending in {LAST_FOUR}", "ending in ****"),
     (f"it ends in {LAST_FOUR}", "it ends in ****"),
+    # Nine digits in any grouping, without a cue, are an SSN.
+    *[(said, "***-**-****") for said in NINE_SAID],
+    (f"my number is {NINE_SAID[2]} thanks", "my number is ***-**-**** thanks"),
+    (f"send it to {NINE_SAID[1]}", "send it to ***-**-****"),
+    # Ten or eleven digits are a phone number: left as they are.
+    ("call me on 555 201 3344", "call me on 555 201 3344"),
+    ("call me on 1 555 201 3344", "call me on 1 555 201 3344"),
+    (
+        "five five five two zero one three three four four",
+        "five five five two zero one three three four four",
+    ),
 ]
 
-# While the caller is unverified, a standalone group of four digits that is not a year.
+# In greeting and intake, while unverified, digits reach the model only inside a date, a year
+# from 1900 to 2099, or a ten- or eleven-digit run; every other number is hidden.
 REDACTED_UNVERIFIED = [
     (
         f"Sarah Johnson, March 14 1985, {LAST_FOUR}",
         "Sarah Johnson, March 14 1985, ****",
     ),
+    (
+        "Sarah Johnson, March fourteenth, nineteen eighty five, three three four four",
+        "Sarah Johnson, March fourteenth, nineteen eighty five, ****",
+    ),
+    (f"Sarah Johnson March 14 1985 {LAST_FOUR}", "Sarah Johnson March 14 1985 ****"),
+    (f"Sarah Johnson 03/14/1985 {LAST_FOUR}", "Sarah Johnson 03/14/1985 ****"),
+    (f"Sarah Johnson 1985 {LAST_FOUR}", "Sarah Johnson 1985 ****"),
+    ("thirty three forty four", "****"),
+    ("three three uh four four", "**** uh ****"),
+    ("33, 44", "****, ****"),
+    ("3,344", "****,****"),
     ("three three four four", "****"),
     ("3 3 4 4", "****"),
     ("three, three, four, four please", "**** please"),
     ("double three four four", "****"),
+    ("for to for to", "****"),
     ("1985", "1985"),
     ("born in nineteen eighty five", "born in nineteen eighty five"),
+    ("in two thousand one", "in two thousand one"),
+    ("since twenty ten", "since twenty ten"),
     ("call me on 555-201-3344", "call me on 555-201-3344"),
     ("call me on 555 201 3344", "call me on 555 201 3344"),
-    ("one moment please", "one moment please"),
-    ("2026-12-03 at 10:30", "2026-12-03 at 10:30"),
+    ("I have 2 questions", "I have **** questions"),
+    ("one moment please", "**** moment please"),
+    ("2026-12-03 at 10:30", "2026-12-03 at ****:****"),
+    ("can I talk to a person?", "can I talk to a person?"),
+    # The year boundaries.
+    ("1899", "****"),
+    ("1900", "1900"),
+    ("2099", "2099"),
+    ("2100", "****"),
+    ("eighteen ninety nine", "****"),
+    ("nineteen hundred", "nineteen hundred"),
+    ("twenty ninety nine", "twenty ninety nine"),
+    ("twenty one hundred", "****"),
+]
+
+# A verified caller: a group that is their last four is hidden; other numbers are not.
+REDACTED_VERIFIED = [
+    (f"it was {LAST_FOUR}", "it was ****"),
+    ("three three four four", "****"),
+    ("thirty three forty four", "****"),
+    (f"say it to {LAST_FOUR}", "say it to ****"),
+    (f"room {LAST_FOUR}5", f"room {LAST_FOUR}5"),
+    ("room 1234", "room 1234"),
+    ("call me on 555 201 3344", "call me on 555 201 3344"),
+    ("at 10:30 on the 14th", "at 10:30 on the 14th"),
 ]
 
 
@@ -123,10 +187,14 @@ def test_ssn_digits_never_pass() -> None:
     # A full SSN said in the greeting, before anything else.
     assert passed(start(), FULL_SSN) == "***-**-****"
 
-    # While unverified, a bare last four too; a verified caller's text keeps its numbers.
-    for state in (start(), intake(), move(intake(), Phase.BOOKING), intake(office_open=False)):
+    # In greeting and intake, unverified: only dates, years and callback numbers.
+    for state in (start(), intake(), intake(office_open=False), start(office_open=False)):
         for text, expected in REDACTED_UNVERIFIED:
             assert passed(state, text) == expected, (state.phase, text)
+    # Verified: the caller's own last four, wherever it stands alone.
+    for text, expected in REDACTED_VERIFIED:
+        assert passed(verified_with_digits(), text) == expected, text
+    # Verified without collected digits (no last four known), numbers pass as said.
     assert passed(serving(), f"room {LAST_FOUR}") == f"room {LAST_FOUR}"
 
     # In the armed step: numerals, digit words, any script, split across turns, nine digits.
@@ -140,6 +208,17 @@ def test_ssn_digits_never_pass() -> None:
         FULL_SSN,
         f"sure it's {LAST_FOUR} okay",
         "the last four are three three four four",
+        *NINE_SAID,
+        "nineteen thirty",
+        "twenty twenty",
+        "eleven twenty",
+        "fourteen forty",
+        "thirteen fifty",
+        "seventy seventy",
+        "sixteen hundred",
+        "ten ten",
+        "for to for to",
+        "won too tree for",
     ):
         decision = guard_input(text, armed())
         assert (decision.action, decision.text) == (SWALLOW, None), text
@@ -166,7 +245,25 @@ def test_ssn_digits_never_pass() -> None:
 
 
 def test_ssn_step_swallows_only_digit_turns() -> None:
-    for text in (LAST_FOUR, "three", "it is 3", "one moment", "uh, four"):
+    for text in (
+        LAST_FOUR,
+        "three",
+        "it is 3",
+        "one moment",
+        "uh, four",
+        # Any number word, whether or not it reads as digits.
+        "nineteen thirty",
+        "twenty twenty",
+        "sixteen hundred",
+        "ten ten",
+        "a thousand",
+        "double check that",
+        "hmm, twelve",
+        # Homophones next to each other or to a digit.
+        "for to for to",
+        "won too tree for",
+        "for 3",
+    ):
         decision = guard_input(text, armed())
         assert decision.action is SWALLOW, text
         assert decision.text is None, text
@@ -178,6 +275,9 @@ def test_ssn_step_swallows_only_digit_turns() -> None:
         "someone told me to call",
         "oh okay",
         "my last four?",
+        "can I talk to a person?",
+        "I'm waiting for my wife's call",
+        "it's too early",
     ):
         state = armed()
         decision = guard_input(text, state)
@@ -194,7 +294,7 @@ def test_ssn_step_swallows_only_digit_turns() -> None:
     decision = guard_input("my appointment is at 3", intake())
     assert (decision.action, decision.text, decision.change) == (
         PASS,
-        "my appointment is at 3",
+        "my appointment is at ****",
         None,
     )
 
@@ -252,6 +352,35 @@ SEQUENCES: list[list[Turn]] = [
     [(f"my last four are {LAST_FOUR}", SWALLOW, True, None, LAST_FOUR, False, 0)],
     [(f"last 4 is {LAST_FOUR}", SWALLOW, True, None, LAST_FOUR, False, 0)],
     [("oh", PASS, False, None, None, True, 1)],
+    # Number words other than zero to nine, read where they are unambiguous.
+    [("nineteen thirty", SWALLOW, True, None, "1930", False, 0)],
+    [("twenty twenty", SWALLOW, True, None, "2020", False, 0)],
+    [("eleven twenty", SWALLOW, True, None, "1120", False, 0)],
+    [("fourteen forty", SWALLOW, True, None, "1440", False, 0)],
+    [("thirteen fifty", SWALLOW, True, None, "1350", False, 0)],
+    [("seventy seventy", SWALLOW, True, None, "7070", False, 0)],
+    [("sixteen hundred", SWALLOW, True, None, "1600", False, 0)],
+    [("ten ten", SWALLOW, True, None, "1010", False, 0)],
+    [("thirty three forty four", SWALLOW, True, None, LAST_FOUR, False, 0)],
+    [
+        ("twenty", SWALLOW, False, None, "20", True, 1),
+        ("twenty", SWALLOW, True, None, "2020", False, 0),
+    ],
+    [
+        ("one hundred", SWALLOW, False, None, "100", True, 1),
+        ("two", SWALLOW, True, None, "1002", False, 0),
+    ],
+    # A number word that reads as no digit is swallowed and counted all the same.
+    [
+        ("a thousand", SWALLOW, False, None, None, True, 1),
+        ("double", SWALLOW, False, None, None, True, 2),
+        ("hmm", PASS, True, None, None, False, 0),
+    ],
+    # Homophones, next to each other or to a digit.
+    [("for to for to", SWALLOW, True, None, "4242", False, 0)],
+    [("won too tree for", SWALLOW, True, None, "1234", False, 0)],
+    [("for 3 4 4", SWALLOW, True, None, "4344", False, 0)],
+    [("talk to a person", PASS, False, None, None, True, 1)],
 ]
 
 

@@ -1054,6 +1054,8 @@ def test_ssn_patterns_have_one_owner() -> None:
     # The guard uses the owner's redaction and digit reading, not a copy.
     assert imports_from(sources[INPUT_GUARD], "app.guard.mask") >= {
         "mask_ssns",
-        "mask_last_four",
+        "mask_unverified_digits",
+        "mask_known_digits",
+        "says_a_number",
         "spoken_digits",
     }

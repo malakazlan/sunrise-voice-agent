@@ -1,14 +1,17 @@
 """Masks identifiers in free text: SSNs, dates, phone numbers and email addresses.
 
-Text is masked line by line, each line in one pass of one pattern, so the time taken grows with
-the length of the text: every alternative starts only where its lookbehind allows and has only
-bounded repeats, or possessive ones over a run that is scanned once. Masking is idempotent by
-construction: no alternative can consume a "*", start just after "*", "*-" or "*.", or end just
-before "*" or a letter or digit, so nothing a replacement writes or keeps can be part of a new
-match. Digits of any script count as digits; words and separators are matched in ASCII.
+Text is masked line by line, each line in one pass of one pattern and then one pass that reads
+runs of digits and number words, masking any run that reads as exactly nine digits as an SSN;
+so the time taken grows with the length of the text: every alternative starts only where its
+lookbehind allows and has only bounded repeats, or possessive ones over a run that is scanned
+once. Masking is idempotent by construction: no alternative and no nine-digit run can consume a
+"*", start just after "*", "*-" or "*.", or end just before "*" or a letter or digit, so
+nothing a replacement writes or keeps can be part of a new match. Digits of any script count
+as digits; words and separators are matched in ASCII.
 """
 
 import re
+from dataclasses import dataclass
 
 MAX_LENGTH = 10_000
 CUT_MARKER = " [cut]"
@@ -135,7 +138,7 @@ def _replace(match: re.Match[str]) -> str:
 def _mask_line(line: str) -> str:
     if len(line) > MAX_LENGTH:
         line = line[: MAX_LENGTH - len(CUT_MARKER)] + CUT_MARKER
-    masked = _IDENTIFIER.sub(_replace, line)
+    masked = _mask_nine(_IDENTIFIER.sub(_replace, line))
     if len(masked) <= MAX_LENGTH:
         return masked
     # Masking made the line longer. It is cut again, before any run of letters or digits that
@@ -161,53 +164,165 @@ def _replace_ssn(match: re.Match[str]) -> str:
 
 def mask_ssns(text: str) -> str:
     """The text with SSNs masked as `mask` masks them (a grouped or nine-digit number, digits
-    after a cue), line by line; every other identifier is kept as it is. For text that is
-    stored for people to read, such as a caller's message. Not cut."""
-    return "\n".join(_IDENTIFIER.sub(_replace_ssn, line) for line in text.split("\n"))
+    after a cue, a run of tokens that reads as nine digits), line by line; every other
+    identifier is kept as it is. For text that is stored for people to read, such as a
+    caller's message. Not cut."""
+    return "\n".join(_mask_nine(_IDENTIFIER.sub(_replace_ssn, line)) for line in text.split("\n"))
 
 
-# Spoken and written digits, read in runs: a run of numerals, a digit word, or a word that
-# repeats the digit after it. Tokens join into one run across spaces and hyphens, and across a
-# comma only between two single digits ("three, three, four"). "oh" is a zero only in a run
-# that holds another digit. The "four" of the cue "last four" is never a digit.
-_DIGIT_TOKEN = re.compile(
-    rf"\d+|(?<![^\W\d_])(?:{'|'.join(_UNIT_DIGITS)}|double|triple)(?![^\W\d_])", re.IGNORECASE
-)
+# Digits as said or written, read in runs. A token is a run of numerals or a number word: a unit
+# (zero, oh, one to nine), a teen, a tens word, hundred, thousand, double or triple, or a
+# homophone of a digit (won, to, too, tree, for, fore, ate). Tokens join into one run across
+# up to three spaces, hyphens or dots, or the word "dash"; across a comma only between two
+# single digits ("three, three, four"). Within a run: a teen is two digits; a tens word is two,
+# with the unit after it if there is one; hundred after a one- or two-digit number adds two
+# zeros; double and triple repeat the next digit. A homophone is a digit only in a run with a
+# numeral, a unit, a teen or a tens word, or with another homophone; "oh" is a zero only with
+# one of those or a homophone that is a digit. The "four" of the cue "last four" is never a
+# digit. Every step is one pass over the text.
+_TEEN_DIGITS = {
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+}
+_TENS_DIGIT = {
+    "twenty": "2",
+    "thirty": "3",
+    "forty": "4",
+    "fifty": "5",
+    "sixty": "6",
+    "seventy": "7",
+    "eighty": "8",
+    "ninety": "9",
+}
+_HOMOPHONE_DIGITS = {
+    "won": "1",
+    "to": "2",
+    "too": "2",
+    "tree": "3",
+    "for": "4",
+    "fore": "4",
+    "ate": "8",
+}
+_SCALES = ("hundred", "thousand")
 _REPEATS = {"double": 2, "triple": 3}
-_JOINS = re.compile(r"[ \t-]{0,3}")
+_NUMBER_WORDS = sorted(
+    [*_UNIT_DIGITS, *_TEEN_DIGITS, *_TENS_DIGIT, *_HOMOPHONE_DIGITS, *_SCALES, *_REPEATS],
+    key=len,
+    reverse=True,
+)
+_DIGIT_TOKEN = re.compile(
+    rf"\d+|(?<![^\W\d_])(?:{'|'.join(_NUMBER_WORDS)})(?![^\W\d_])", re.IGNORECASE
+)
+_JOINS = re.compile(r"[ \t.-]{0,3}|[ \t]{0,3}dash[ \t]{0,3}", re.IGNORECASE)
 _JOINS_SINGLE_DIGITS = re.compile(r"[ \t-]{0,2},[ \t-]{0,2}")
 _LAST_FOUR_CUE = re.compile(rf"(?<![^\W\d_]){_LAST_FOUR}(?![^\W\d_])", re.IGNORECASE)
-# A group of four digits that reads as a year in this range is taken for one.
+# Tokens a run may be trimmed of at either end when it is read as a group: a homophone or an
+# "oh" just before or after the digits ("say it to ...").
+_SOFT = frozenset({*_HOMOPHONE_DIGITS, "oh"})
+
+# The dates `mask` recognises, and years from 1900 to 2099 in words.
+_DATE_KINDS = frozenset({"repr", "ymd", "mdy", "dmy", "month_first", "day_first"})
+_SPACE = r"[ \t-]{1,3}"
+_UNIT_WORD = "one|two|three|four|five|six|seven|eight|nine"
+_TEEN_WORD = "|".join(sorted(_TEEN_DIGITS, key=len, reverse=True))
+_TENS_WORD = "|".join(_TENS_DIGIT)
+_YEAR_END = (
+    rf"(?:(?:{_TENS_WORD})(?:{_SPACE}(?:{_UNIT_WORD}))?|{_TEEN_WORD}|oh{_SPACE}(?:{_UNIT_WORD}))"
+)
+_YEAR_WORDS = re.compile(
+    rf"(?<![^\W\d_])(?:(?:nineteen|twenty){_SPACE}{_YEAR_END}|nineteen{_SPACE}hundred"
+    rf"|two{_SPACE}thousand(?:{_SPACE}(?:and{_SPACE})?(?:{_YEAR_END}|{_UNIT_WORD}))?)"
+    r"(?![^\W\d_])",
+    re.IGNORECASE,
+)
 _YEARS = range(1900, 2100)
+# Runs this long are telephone numbers: a caller gives one to be called back.
+_CALLBACK_LENGTHS = (10, 11)
 
 
-def _single(token: str) -> bool:
-    return len(token) == 1 or not token[0].isdigit()
+@dataclass(frozen=True, slots=True)
+class _Token:
+    start: int
+    end: int
+    word: str
+    # A digit or a number word: what the SSN step swallows and redaction hides.
+    counted: bool
+    # The digits it adds to its run's reading.
+    reading: str
 
 
-def _run_digits(tokens: list[re.Match[str]]) -> str:
-    words = [token[0].lower() for token in tokens]
-    zero_counts = any(word[0].isdigit() or word in _UNIT_DIGITS for word in words if word != "oh")
-    digits = ""
+def _single(word: str) -> bool:
+    return (
+        (word[0].isdigit() and len(word) == 1) or word in _UNIT_DIGITS or word in _HOMOPHONE_DIGITS
+    )
+
+
+def _read(matches: list[re.Match[str]]) -> list[_Token]:
+    words = [match[0].lower() for match in matches]
+    base = any(
+        word[0].isdigit()
+        or word in _TEEN_DIGITS
+        or word in _TENS_DIGIT
+        or (word in _UNIT_DIGITS and word != "oh")
+        for word in words
+    )
+    homophones = sum(word in _HOMOPHONE_DIGITS for word in words)
+    sounds = base or homophones > 1
+    zero = base or (sounds and homophones > 0)
+    readings: list[tuple[bool, str]] = []
     repeat = 1
-    for word in words:
+    last = 0
+    index = 0
+    while index < len(words):
+        word = words[index]
+        index += 1
         if word in _REPEATS:
             repeat = _REPEATS[word]
+            readings.append((True, ""))
             continue
-        if word[0].isdigit():
-            read = "".join(str(int(char)) for char in word)
-        elif word != "oh" or zero_counts:
-            read = _UNIT_DIGITS[word]
-        else:
+        if word in _SCALES:
+            readings.append((True, "00" if word == "hundred" and last in (1, 2) else ""))
+            last = 0
+            continue
+        if (word in _HOMOPHONE_DIGITS and not sounds) or (word == "oh" and not zero):
+            readings.append((False, ""))
             repeat = 1
             continue
-        digits += read[0] * repeat + read[1:]
+        joined = False
+        if word[0].isdigit():
+            read = "".join(str(int(char)) for char in word)
+        elif word in _TEEN_DIGITS:
+            read = _TEEN_DIGITS[word]
+        elif word in _TENS_DIGIT:
+            unit = words[index] if index < len(words) else ""
+            joined = unit in _UNIT_DIGITS and unit not in ("zero", "oh")
+            read = _TENS_DIGIT[word] + (_UNIT_DIGITS[unit] if joined else "0")
+        elif word in _HOMOPHONE_DIGITS:
+            read = _HOMOPHONE_DIGITS[word]
+        else:
+            read = _UNIT_DIGITS[word]
+        readings.append((True, read[0] * repeat + read[1:]))
+        if joined:
+            readings.append((True, ""))
+            index += 1
         repeat = 1
-    return digits
+        last = len(read)
+    return [
+        _Token(match.start(), match.end(), match[0].lower(), counted, reading)
+        for match, (counted, reading) in zip(matches, readings, strict=True)
+    ]
 
 
-def _digit_runs(text: str) -> list[tuple[int, int, str]]:
-    """Each run of digit tokens: where it starts, where it ends, and the digits it says."""
+def _runs(text: str) -> list[list[_Token]]:
+    """Each run of tokens in the text, read."""
     text = _LAST_FOUR_CUE.sub(lambda cue: " " * len(cue[0]), text)
     runs: list[list[re.Match[str]]] = []
     for token in _DIGIT_TOKEN.finditer(text):
@@ -215,26 +330,153 @@ def _digit_runs(text: str) -> list[tuple[int, int, str]]:
             previous = runs[-1][-1]
             gap = text[previous.end() : token.start()]
             if _JOINS.fullmatch(gap) or (
-                _JOINS_SINGLE_DIGITS.fullmatch(gap) and _single(previous[0]) and _single(token[0])
+                _JOINS_SINGLE_DIGITS.fullmatch(gap)
+                and _single(previous[0].lower())
+                and _single(token[0].lower())
             ):
                 runs[-1].append(token)
                 continue
         runs.append([token])
-    return [(run[0].start(), run[-1].end(), _run_digits(run)) for run in runs]
+    return [_read(run) for run in runs]
+
+
+def _digits(tokens: list[_Token]) -> str:
+    return "".join(token.reading for token in tokens)
+
+
+def _groups(run: list[_Token]) -> list[list[_Token]]:
+    """The run, and the run without the homophones and "oh" at its ends, when that differs."""
+    start, end = 0, len(run)
+    while start < end and run[start].word in _SOFT:
+        start += 1
+    while end > start and run[end - 1].word in _SOFT:
+        end -= 1
+    trimmed = run[start:end]
+    return [run] if len(trimmed) == len(run) or not trimmed else [run, trimmed]
+
+
+def _replaced(line: str, spans: list[tuple[int, int, str]]) -> str:
+    """The line with each span, in order and not overlapping, replaced."""
+    pieces = []
+    kept = 0
+    for start, end, replacement in spans:
+        pieces.append(line[kept:start] + replacement)
+        kept = end
+    return "".join(pieces) + line[kept:]
+
+
+def _ssn_run_may_start(line: str, start: int) -> bool:
+    before = line[start - 1] if start else ""
+    after_mask = start >= 2 and line[start - 2] == "*" and before in "-."
+    return not (before.isalnum() or before == "*" or after_mask)
+
+
+def _ssn_run_may_end(line: str, end: int) -> bool:
+    after = line[end] if end < len(line) else ""
+    at_cut = end == len(line) - len(CUT_MARKER) and line.endswith(CUT_MARKER)
+    return not (after.isalnum() or after == "*" or at_cut)
+
+
+def _mask_nine(line: str) -> str:
+    """The line with every run that reads as exactly nine digits masked as an SSN. A run that
+    starts or ends inside letters or digits, or next to masked output or the cut marker, is
+    left: so masking stays idempotent."""
+    spans = []
+    for run in _runs(line):
+        for group in _groups(run):
+            start, end = group[0].start, group[-1].end
+            if (
+                len(_digits(group)) == 9
+                and _ssn_run_may_start(line, start)
+                and _ssn_run_may_end(line, end)
+            ):
+                spans.append((start, end, "***-**-****"))
+                break
+    return _replaced(line, spans)
 
 
 def spoken_digits(text: str) -> str:
     """Every digit the text says, in order, written or spoken."""
-    return "".join(digits for _start, _end, digits in _digit_runs(text))
+    return "".join(_digits(run) for run in _runs(text))
 
 
-def mask_last_four(text: str) -> str:
-    """The text with each run of exactly four digits masked, unless it reads as a year from
-    1900 to 2099. A run joined to other digits is longer than four and is left as it is."""
-    masked = []
-    kept_until = 0
-    for start, end, digits in _digit_runs(text):
-        if len(digits) == 4 and int(digits) not in _YEARS:
-            masked.append(text[kept_until:start] + "****")
-            kept_until = end
-    return "".join(masked) + text[kept_until:]
+def says_a_number(text: str) -> bool:
+    """Whether the text holds any digit or number word, whether or not it reads as digits."""
+    return any(token.counted for run in _runs(text) for token in run)
+
+
+def _allowed_spans(line: str) -> list[tuple[int, int]]:
+    dates = [match.span() for match in _IDENTIFIER.finditer(line) if match.lastgroup in _DATE_KINDS]
+    years = [match.span() for match in _YEAR_WORDS.finditer(line)]
+    return sorted(dates + years)
+
+
+def _kept(tokens: list[_Token], spans: list[tuple[int, int]]) -> list[bool]:
+    """For each token, in order: inside an allowed span, or a year in numerals."""
+    kept = []
+    first = 0
+    for token in tokens:
+        while first < len(spans) and spans[first][1] <= token.start:
+            first += 1
+        inside = False
+        index = first
+        while index < len(spans) and spans[index][0] <= token.start:
+            if token.end <= spans[index][1]:
+                inside = True
+                break
+            index += 1
+        year = token.word.isdigit() and len(token.word) == 4 and int(token.word) in _YEARS
+        kept.append(inside or year)
+    return kept
+
+
+def _mask_unlisted(line: str) -> str:
+    runs = _runs(line)
+    flags = iter(_kept([token for run in runs for token in run], _allowed_spans(line)))
+    spans = []
+    for run in runs:
+        kept = [next(flags) for _token in run]
+        # The run, cut at its allowed tokens; a piece that reads as a callback number stays.
+        pieces: list[list[_Token]] = [[]]
+        for token, allowed in zip(run, kept, strict=True):
+            if allowed:
+                pieces.append([])
+            else:
+                pieces[-1].append(token)
+        for piece in pieces:
+            if len(_digits(piece)) in _CALLBACK_LENGTHS:
+                continue
+            # Each stretch of counted tokens, hidden as one.
+            group: list[_Token] = []
+            for token in piece:
+                if token.counted:
+                    group.append(token)
+                    continue
+                if group:
+                    spans.append((group[0].start, group[-1].end, "****"))
+                group = []
+            if group:
+                spans.append((group[0].start, group[-1].end, "****"))
+    return _replaced(line, spans)
+
+
+def mask_unverified_digits(text: str) -> str:
+    """For an unverified caller: every digit and number word hidden, line by line, except
+    inside a date `mask` recognises, a year from 1900 to 2099 in numerals or words, or a run
+    that reads as ten or eleven digits (a callback number)."""
+    return "\n".join(_mask_unlisted(line) for line in text.split("\n"))
+
+
+def mask_known_digits(text: str, digits: str) -> str:
+    """The text with every run that reads as exactly `digits` hidden, line by line. A longer
+    run that holds them, such as a phone number, is left as it is."""
+    lines = []
+    for line in text.split("\n"):
+        spans = []
+        for run in _runs(line):
+            for group in _groups(run):
+                if _digits(group) == digits:
+                    spans.append((group[0].start, group[-1].end, "****"))
+                    break
+        lines.append(_replaced(line, spans))
+    return "\n".join(lines)
