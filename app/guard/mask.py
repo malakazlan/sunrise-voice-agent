@@ -48,17 +48,14 @@ def _day(name: str) -> str:
     return rf"(?:(?P<{name}_day>\d{{1,2}})(?:st|nd|rd|th)?|(?P<{name}_ordinal>{_ORDINAL}))(?![a-z])"
 
 
-# An SSN cue, and the words that may stand between a cue and the digits: other cues ("last
-# four"), then short words that are not numbers ("security number is").
-_CUE = (
-    r"(?:ssn_last_?(?:four|4)|ssn|social|last[_ \t-]?(?:four|4)|ending[ \t]+in|ends[ \t]+in)"
-    r"(?![a-z])"
-)
+# An SSN cue, and the short words that may stand between a cue and the digits ("security
+# number is"). A cue may follow "_" (ssn_last4).
+_CUE = r"(?:ssn|social|last[_ \t-]?(?:four|4)|ending[ \t]+in|ends[ \t]+in)(?![a-z])"
 _GAP = r"[\s:;,.#=\"'()\[\]-]{0,8}+"
-# A word is never also read as a cue or a number, so each run of words has one reading.
-_FILLER = rf"(?:{_CUE}|(?!{_CUE})(?!{_NUMBER})[a-z]{{1,20}}+(?![a-z]))"
-# Up to twelve digits or number words. A cue between ("last four") is read as a cue, never as
-# a word, so its "four" or "4" is never taken for the digits.
+# A word between is never a number, and never the start of another cue: the scan starts again
+# at that cue, so the "four" of "last four" is never taken for the digits.
+_FILLER = rf"(?!{_CUE})(?!{_NUMBER})[a-z]{{1,20}}+(?![a-z])"
+# Up to twelve digits or number words.
 _DIGITS = rf"(?:\d|{_NUMBER})(?:[\s,.-]{{0,3}}(?:\d|{_NUMBER})){{0,11}}"
 _PHONE_SEPARATOR = r"[ ./-]{0,2}"
 _WORD_SEPARATOR = r"[ \t,-]{1,3}"
@@ -121,8 +118,7 @@ def _day_number(text: str) -> str:
 def _replace(match: re.Match[str]) -> str:
     kind = match.lastgroup
     if kind == "email":
-        first = match["email_first"]
-        return f"{first if first.isalpha() else '*'}***@***.{match['email_tld']}"
+        return f"{match['email_first']}***@***.{match['email_tld']}"
     if kind == "cue":
         return f"{match['cue_kept']}****"
     if kind == "ssn":

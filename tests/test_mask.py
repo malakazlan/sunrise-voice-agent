@@ -172,6 +172,10 @@ HOSTILE = [
     "@" * 20_000,
     f"x@y.com{'1985-03-14'} {PHONE}-12-15 {SSN}(555) 201-{LAST_FOUR}",
     "ssn " + "".join(PHONE_PARTS) + "@example.com x@y.mar 14 1985 x@y.com@z.org",
+    # Number words that end just before a date the masking replaces.
+    "five five five two zero one three three four four" + "1985-03-14",
+    # A line that grows past 10,000 characters when masked, with a run of digits at the cut.
+    (SSN_PLAIN + " ") * 832 + "".join(["1234567890", "123"]) + " " + "x" * 10,
 ]
 
 
