@@ -14,6 +14,7 @@ from app.agent.endings import drain_call_events
 from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
+from app.agent.turn import drain_guard_audits
 from app.api.admin import PREFIX as ADMIN_PREFIX
 from app.api.admin import build_admin_app
 from app.api.offer import OpenCall, build_router
@@ -61,8 +62,10 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
         await calls.close()
-        # The call events still being written (each bounded) end before the engine goes.
+        # The call events and guard blocks still being written (each bounded) end before the
+        # engine goes.
         await drain_call_events()
+        await drain_guard_audits()
         # And the call records still being masked and stored.
         await drain_call_records()
         if model is not None:

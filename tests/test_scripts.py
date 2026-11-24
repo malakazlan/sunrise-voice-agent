@@ -66,6 +66,16 @@ LINES = [
         " receive a confirmation by email.",
         True,
     ),
+    (
+        "advice_refusal",
+        "I'm not able to give medical advice. I can send a message to your doctor instead.",
+        True,
+    ),
+    (
+        "refill_no_promise",
+        "I'm not able to confirm that a refill is approved. I can send the request to our team.",
+        True,
+    ),
 ]
 
 # The part of the day the after-hours line wishes the caller, written by hand: `day` from 5 AM
@@ -117,6 +127,8 @@ def test_lines_name_their_values() -> None:
         "after_hours_close": frozenset({"name", "part_of_day"}),
         "fallback": frozenset(),
         "booking_instructions": frozenset(),
+        "advice_refusal": frozenset(),
+        "refill_no_promise": frozenset(),
     }
 
 

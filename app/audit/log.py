@@ -140,6 +140,7 @@ class Action(StrEnum):
     BOOKING_PREVIEWED = "booking_previewed"
     SLOT_TAKEN = "slot_taken"
     BOOKING_REPEATED = "booking_repeated"
+    GUARD_BLOCK = "guard_block"
 
 
 class ResourceType(StrEnum):
@@ -191,6 +192,12 @@ class Reason(StrEnum):
     FRUSTRATION = "frustration"
     VERIFICATION_LOCKED = "verification_locked"
     OTHER = "other"
+    # The output guard's rules, each the reason of a guard_block (app/guard/output.py).
+    SSN_LAST4 = "ssn_last4"
+    SSN_SHAPE = "ssn_shape"
+    PHI_OUTSIDE_GATE = "phi_outside_gate"
+    MEDICAL_ADVICE = "medical_advice"
+    REFILL_PROMISE = "refill_promise"
 
 
 def _check_member(name: str, value: object, registry: type[StrEnum]) -> None:

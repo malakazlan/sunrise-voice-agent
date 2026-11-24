@@ -1399,6 +1399,7 @@ def test_only_registry_members_are_accepted() -> None:
         "booking_previewed",
         "slot_taken",
         "booking_repeated",
+        "guard_block",
     }
     assert {member.value for member in ResourceType} == {
         "call",
@@ -1426,6 +1427,12 @@ def test_only_registry_members_are_accepted() -> None:
         "frustration",
         "verification_locked",
         "other",
+        # The output guard's rules (app/guard/output.py), each the reason of a guard_block.
+        "ssn_last4",
+        "ssn_shape",
+        "phi_outside_gate",
+        "medical_advice",
+        "refill_promise",
     }
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:

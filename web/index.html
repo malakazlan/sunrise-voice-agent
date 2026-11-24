@@ -112,6 +112,9 @@
       const lines = Array.isArray(message.lines) ? message.lines : [];
       if (lines.length === 0) item.append(line("hidden", "(no reply)"));
       lines.forEach((text) => item.append(line("reply", String(text))));
+      if (typeof message.withheld === "string") {
+        item.append(line("hidden", `(a reply was withheld: ${message.withheld})`));
+      }
       if (message.type === "turn") {
         const t = message.timings || {};
         item.append(line("timings",
