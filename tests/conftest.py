@@ -33,6 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # The audit key every test uses unless it sets its own: long enough for any APP_ENV, built from
 # short pieces so that no file holds a key-shaped literal.
 TEST_AUDIT_KEY = "-".join(["test", "audit", "key"] * 4)
+# The same for the key of the identity claims' hashes (app/agent/claims.py).
+TEST_IDENTITY_KEY = "-".join(["test", "identity", "hash", "key"] * 3)
 
 # Required values for tests that only build StartupSettings and never connect.
 OFFLINE_DB_ENV = {
@@ -43,6 +45,7 @@ OFFLINE_DB_ENV = {
     "APP_DB_USER": "sunrise_offline_app",
     "APP_DB_PASSWORD": "offline-test-app-password",
     "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
+    "IDENTITY_HASH_KEY": TEST_IDENTITY_KEY,
 }
 
 # Obviously fake voice settings that let a demo or prod configuration validate. Built from
@@ -261,6 +264,7 @@ def database_env(settings: StartupSettings) -> dict[str, str]:
         "APP_DB_USER": settings.app_db_user,
         "APP_DB_PASSWORD": settings.app_db_password.get_secret_value(),
         "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
+        "IDENTITY_HASH_KEY": TEST_IDENTITY_KEY,
     }
 
 

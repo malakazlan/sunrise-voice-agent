@@ -6,10 +6,12 @@ runs them inside its transaction and writes the audit event; a handler never end
 transaction. A writing tool called without `confirmed=true` writes nothing and returns
 `needs_confirmation` with what it would write. A call writes the same request once: the
 database's unique constraints on `requests` and `messages` decide, and a repeat inserts
-nothing and answers as the first did.
+nothing and answers as the first did. The event says what came of a writing tool's call:
+previewed, not found (a refill, outcome refused), or requested and sent once the row is
+written or already there.
 
-"Now", for the next appointment, is the call's clock reading (`started_at`, taken when the call
-started, as office hours are): the clock is injected there, and a handler has no other.
+"Now", for the next appointment, is the moment of the question on the call's clock (the
+handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
 import re
@@ -21,8 +23,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.state import CallState, Phase
-from app.agent.tool_registry import Handler, Tool, ToolResult
-from app.audit.log import Action, ResourceType
+from app.agent.tool_registry import Handler, HandlerContext, NoArguments, Tool, ToolResult
+from app.audit.log import Action, Outcome, ResourceType
 from app.db.models import (
     MAX_MESSAGE_BODY,
     MAX_REQUEST_SUMMARY,
@@ -64,10 +66,6 @@ MONTHS = (
     "November",
     "December",
 )
-
-
-class NoArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class RefillArguments(BaseModel):
@@ -121,7 +119,7 @@ def _spoken(starts_at: datetime, doctor: str) -> str:
 
 
 async def get_next_appointment(
-    session: AsyncSession, state: CallState, arguments: NoArguments
+    session: AsyncSession, state: CallState, arguments: NoArguments, context: HandlerContext
 ) -> ToolResult:
     next_one = (
         await session.execute(
@@ -129,7 +127,7 @@ async def get_next_appointment(
             .where(
                 Appointment.patient_id == _patient_id(state),
                 Appointment.status == SCHEDULED,
-                Appointment.starts_at >= state.started_at,
+                Appointment.starts_at >= context.now,
             )
             .order_by(Appointment.starts_at)
             .limit(1)
@@ -140,7 +138,7 @@ async def get_next_appointment(
 
 
 async def get_lab_status(
-    session: AsyncSession, state: CallState, arguments: NoArguments
+    session: AsyncSession, state: CallState, arguments: NoArguments, context: HandlerContext
 ) -> ToolResult:
     status = (
         await session.execute(
@@ -151,7 +149,7 @@ async def get_lab_status(
 
 
 async def get_balance(
-    session: AsyncSession, state: CallState, arguments: NoArguments
+    session: AsyncSession, state: CallState, arguments: NoArguments, context: HandlerContext
 ) -> ToolResult:
     balance = (
         await session.execute(select(Patient.balance_due).where(Patient.id == _patient_id(state)))
@@ -176,7 +174,7 @@ async def _record_request(
 
 
 async def request_refill(
-    session: AsyncSession, state: CallState, arguments: RefillArguments
+    session: AsyncSession, state: CallState, arguments: RefillArguments, context: HandlerContext
 ) -> ToolResult:
     medications = (
         await session.execute(
@@ -187,11 +185,13 @@ async def request_refill(
     ).all()
     matched = match_medication(arguments.medication_name, [row.name for row in medications])
     if matched is None:
-        return ToolResult(data={"status": NOT_FOUND})
+        return ToolResult(data={"status": NOT_FOUND}, audit_action=Action.REFILL_NOT_FOUND)
     (medication,) = [row for row in medications if row.name == matched]
     named = {"medication": medication.name, "pharmacy": medication.pharmacy}
     if not arguments.confirmed:
-        return ToolResult(data={"status": NEEDS_CONFIRMATION, **named})
+        return ToolResult(
+            data={"status": NEEDS_CONFIRMATION, **named}, audit_action=Action.REFILL_PREVIEWED
+        )
 
     # Cut to the column's bound, always at the same place, so a repeat has the same summary.
     summary = f"{medication.name} at {medication.pharmacy}"[:MAX_REQUEST_SUMMARY]
@@ -201,11 +201,14 @@ async def request_refill(
 
 
 async def send_message_to_doctor(
-    session: AsyncSession, state: CallState, arguments: MessageArguments
+    session: AsyncSession, state: CallState, arguments: MessageArguments, context: HandlerContext
 ) -> ToolResult:
     body = arguments.summary_short
     if not arguments.confirmed:
-        return ToolResult(data={"status": NEEDS_CONFIRMATION, "message": body})
+        return ToolResult(
+            data={"status": NEEDS_CONFIRMATION, "message": body},
+            audit_action=Action.DOCTOR_MESSAGE_PREVIEWED,
+        )
 
     patient_id = _patient_id(state)
     message_id = await session.scalar(
@@ -231,18 +234,27 @@ async def send_message_to_doctor(
 
 
 def _serving_tool(
-    name: str, arguments: type[BaseModel], handler: Handler, *, writes: bool, action: Action
+    name: str,
+    arguments: type[BaseModel],
+    handler: Handler,
+    *,
+    writes: bool,
+    action: Action,
+    outcome_actions: dict[Action, Outcome] | None = None,
 ) -> Tool:
     return Tool(
         name=name,
         arguments=arguments,
         handler=handler,
+        model_callable=True,
         phi=True,
         phases=frozenset({Phase.SERVING}),
         office_open_only=True,
         writes=writes,
         may_verify=False,
+        takes_identity_claim=False,
         audit_action=action,
+        outcome_actions={} if outcome_actions is None else outcome_actions,
         resource_type=ResourceType.PATIENT,
     )
 
@@ -261,6 +273,10 @@ SERVING_TOOLS = (
         request_refill,
         writes=True,
         action=Action.REFILL_REQUESTED,
+        outcome_actions={
+            Action.REFILL_PREVIEWED: Outcome.SUCCESS,
+            Action.REFILL_NOT_FOUND: Outcome.REFUSED,
+        },
     ),
     _serving_tool(
         "get_lab_status", NoArguments, get_lab_status, writes=False, action=Action.LAB_STATUS_READ
@@ -274,5 +290,6 @@ SERVING_TOOLS = (
         send_message_to_doctor,
         writes=True,
         action=Action.DOCTOR_MESSAGE_SENT,
+        outcome_actions={Action.DOCTOR_MESSAGE_PREVIEWED: Outcome.SUCCESS},
     ),
 )

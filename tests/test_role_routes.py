@@ -641,6 +641,7 @@ def test_a_membership_another_role_granted_stops_the_setup(
         "; sequence medications_id_seq: SELECT not declared"
         "; sequence messages_id_seq: SELECT not declared"
         "; sequence requests_id_seq: SELECT not declared"
+        "; sequence verification_attempts_id_seq: SELECT not declared"
         "; table alembic_version: SELECT not declared"
     )
     reported = f"member of {name}" + (reads if name == "pg_read_all_data" else "")

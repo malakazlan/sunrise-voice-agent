@@ -10,13 +10,14 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
-from conftest import TEST_AUDIT_KEY
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY
 from psycopg import errors
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app.agent.claims import ClaimKeys
 from app.agent.state import CallState, Phase, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry, Status, ToolOutcome
 from app.agent.tools import register_tools
@@ -133,6 +134,13 @@ def offered(registry: Registry, state: CallState) -> list[str]:
     return [item.name for item in registry.tools_for(state) if item.name in SERVING_TOOLS]
 
 
+def clocked(deps: Deps, now: datetime) -> Deps:
+    """The same dependencies with the call's clock reading `now`."""
+    return Deps(
+        sessions=deps.sessions, audit=deps.audit, now=lambda: now, claim_keys=deps.claim_keys
+    )
+
+
 def refill(spoken: str, confirmed: bool | None = None) -> dict[str, Any]:
     arguments: dict[str, Any] = {"medication_name": spoken}
     if confirmed is not None:
@@ -147,8 +155,8 @@ def message(body: str, confirmed: bool | None = None) -> dict[str, Any]:
     return arguments
 
 
-def event(action: str, state: CallState) -> tuple[Any, ...]:
-    return (action, "patient", state.patient_id, "success", state.call_id, "agent", None)
+def event(action: str, state: CallState, outcome: str = "success") -> tuple[Any, ...]:
+    return (action, "patient", state.patient_id, outcome, state.call_id, "agent", None)
 
 
 @pytest.fixture
@@ -162,6 +170,7 @@ async def deps(runtime: AsyncEngine) -> AsyncIterator[Deps]:
         sessions=create_session_factory(runtime),
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
+        claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
     )
 
 
@@ -575,10 +584,21 @@ async def test_next_appointment_is_in_the_future(
         ),
         (datetime(2026, 12, 10, 14, 0, 1, tzinfo=UTC), None),
     ]
+    # "Now" is the moment of the question on the call's clock, not when the call started: one
+    # call, started before all of them, asks at each moment.
+    state = sarah(T0)
     for now, appointment in expected:
-        assert await data_of(registry, deps, sarah(now), APPOINTMENT) == {
+        asked_at = clocked(deps, now)
+        assert await data_of(registry, asked_at, state, APPOINTMENT) == {
             "appointment": appointment
         }, now
+
+    # A call that started before Sarah's appointment and asks after it began does not hear it.
+    started_before = sarah(at_appointment - timedelta(minutes=20))
+    during = clocked(deps, at_appointment + timedelta(minutes=15))
+    assert await data_of(registry, during, started_before, APPOINTMENT) == {
+        "appointment": "Thursday, December 10 at 9:00 AM with Dr. Lee"
+    }
 
     # Rendered in clinic time: 19:00 UTC on 28 November is 2:00 PM there.
     assert await data_of(registry, deps, serving("P003", "Maria"), APPOINTMENT) == {
@@ -680,6 +700,7 @@ async def test_tool_and_audit_commit_together(
         sessions=deps.sessions,
         audit=AuditThatFailsAfterWriting(SecretStr(TEST_AUDIT_KEY)),
         now=deps.now,
+        claim_keys=deps.claim_keys,
     )
     state = sarah()
     after, outcome = await registry.dispatch(state, REFILL, refill("lisinopril", True), failing)
@@ -820,10 +841,10 @@ async def test_audit_carries_no_text(
     assert stored == [
         event("appointment_read", state),
         event("refill_requested", state),
-        event("refill_requested", state),
+        event("refill_not_found", state, "refused"),
         event("lab_status_read", state),
         event("balance_read", state),
-        event("doctor_message_sent", state),
+        event("doctor_message_previewed", state),
         event("doctor_message_sent", state),
     ]
     secrets_said = (MARKER, "Lisinopril", "CVS", "45.00", SARAH_LABS, "December", "Patel")
@@ -898,3 +919,38 @@ async def test_request_columns_are_constrained(owner_engine: Engine, seeded: Non
         execute(owner_engine, insert_message, call_id=new_call_id())
     assert isinstance(excinfo.value.orig, errors.CheckViolation)
     assert excinfo.value.orig.diag.constraint_name == "ck_messages_kind"
+
+
+async def test_audit_says_what_happened(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    # Each path of the two writing tools, with the status it answers and the action and outcome
+    # its event records, written by hand.
+    state = sarah()
+    paths: list[tuple[str, dict[str, Any], str, str, str]] = [
+        (REFILL, refill("ibuprofen"), "not_found", "refill_not_found", "refused"),
+        (REFILL, refill("ibuprofen", True), "not_found", "refill_not_found", "refused"),
+        (REFILL, refill("lisinopril"), "needs_confirmation", "refill_previewed", "success"),
+        (REFILL, refill("lisinopril", False), "needs_confirmation", "refill_previewed", "success"),
+        (REFILL, refill("lisinopril", True), "requested", "refill_requested", "success"),
+        # The same request again in this call: the row already exists.
+        (REFILL, refill("lisinopril", True), "requested", "refill_requested", "success"),
+        (REFILL, refill("metformin", True), "sent_to_doctor", "refill_requested", "success"),
+        (MESSAGE, message("call me"), "needs_confirmation", "doctor_message_previewed", "success"),
+        (MESSAGE, message("call me", True), "sent", "doctor_message_sent", "success"),
+        # The same message again in this call: it already exists.
+        (MESSAGE, message("call me", True), "sent", "doctor_message_sent", "success"),
+    ]
+    for name, arguments, status, _action, _outcome in paths:
+        assert (await data_of(registry, deps, state, name, arguments))["status"] == status, (
+            name,
+            arguments,
+        )
+    assert rows(owner_engine, EVENTS) == [
+        event(action, state, outcome) for _name, _arguments, _status, action, outcome in paths
+    ]
+    assert [row[2:4] for row in rows(owner_engine, REQUESTS)] == [
+        ("refill", "Lisinopril 10mg at CVS Main St"),
+        ("refill", "Metformin 500mg at CVS Main St"),
+        ("doctor_message", "call me"),
+    ]

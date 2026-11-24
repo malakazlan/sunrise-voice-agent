@@ -32,7 +32,14 @@ RESERVED_ROLE_PREFIX = "pg_"
 DATABASE_PASSWORD_PLACEHOLDERS = (EXAMPLE_PASSWORD, EXAMPLE_APP_DB_PASSWORD)
 # The AUDIT_HMAC_KEY value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a published placeholder)
+# The IDENTITY_HASH_KEY value in .env.example. It is only accepted when APP_ENV=dev.
+EXAMPLE_IDENTITY_KEY = "change-me-to-a-long-random-identity-key"  # noqa: S105 (a published placeholder)
+# The audit key and the identity key, outside dev: at least this long, not their placeholder.
 MIN_AUDIT_KEY_LENGTH = 32
+HMAC_KEY_PLACEHOLDERS = {
+    "audit_hmac_key": EXAMPLE_AUDIT_KEY,
+    "identity_hash_key": EXAMPLE_IDENTITY_KEY,
+}
 
 
 def _outside_dev(info: ValidationInfo) -> bool:
@@ -173,6 +180,8 @@ class Settings(DatabaseSettings):
 
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
+    # The key of the identity claims' hashes in verification_attempts (app/agent/claims.py).
+    identity_hash_key: SecretStr
 
     # A fixed clock for dev and demo. Set together with app_env=prod, startup stops.
     simulated_now: datetime | None = None
@@ -219,22 +228,31 @@ class Settings(DatabaseSettings):
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
 
-    @field_validator("audit_hmac_key")
+    @field_validator("audit_hmac_key", "identity_hash_key")
     @classmethod
-    def audit_key_is_set_and_strong_outside_dev(
+    def hmac_key_is_set_and_strong_outside_dev(
         cls, value: SecretStr, info: ValidationInfo
     ) -> SecretStr:
+        name = info.field_name or ""
         key = value.get_secret_value()
         if not key:
-            raise ValueError("audit_hmac_key must not be empty")
+            raise ValueError(f"{name} must not be empty")
         if info.data.get("app_env") == "dev":
             return value
-        if len(key) < MIN_AUDIT_KEY_LENGTH or key == EXAMPLE_AUDIT_KEY:
+        if len(key) < MIN_AUDIT_KEY_LENGTH or key == HMAC_KEY_PLACEHOLDERS[name]:
             raise ValueError(
-                f"outside dev the audit key needs at least {MIN_AUDIT_KEY_LENGTH} characters"
+                f"outside dev {name} needs at least {MIN_AUDIT_KEY_LENGTH} characters"
                 " and must not be the .env.example placeholder"
             )
-        _check_strong_secret("audit_hmac_key", value, info)
+        _check_strong_secret(name, value, info)
+        return value
+
+    @field_validator("identity_hash_key")
+    @classmethod
+    def identity_key_is_not_the_audit_key(cls, value: SecretStr, info: ValidationInfo) -> SecretStr:
+        audit_key = info.data.get("audit_hmac_key")
+        if audit_key is not None and value.get_secret_value() == audit_key.get_secret_value():
+            raise ValueError("identity_hash_key must differ from audit_hmac_key")
         return value
 
     @field_validator("max_concurrent_calls", mode="before")

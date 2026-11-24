@@ -364,3 +364,107 @@ def test_mask_is_linear() -> None:
         for text, seconds in zip(ADVERSARIAL, timings, strict=True)
     }
     assert max(timings) < LINEAR_BOUND_SECONDS, slow
+
+
+# Nine digits in a run, in any grouping or in words, are an SSN for every masker: the logs and
+# a stored message. Ten or eleven are a phone number, left to the phone rules. Written by hand.
+NINE_IN_A_RUN = [
+    ("one two three four five six seven eight nine", "***-**-****"),
+    (" ".join("123456789"), "***-**-****"),
+    (" ".join(["123", "456", "789"]), "***-**-****"),
+    (" ".join(["12345", "6789"]), "***-**-****"),
+    (" - ".join(["123", "45", "6789"]), "***-**-****"),
+    ("one two three dash four five dash six seven eight nine", "***-**-****"),
+    ("caller said " + " ".join(["123", "456", "789"]) + ".", "caller said ***-**-****."),
+    ("send it to " + " ".join("123456789"), "send it to ***-**-****"),
+]
+NOT_NINE = [
+    " ".join(["12", "345", "678"]),
+    "P" + "".join(["123", "45", "6789"]),
+    "order " + " ".join(["1234", "5678"]),
+    "talk to a person for a while",
+]
+
+
+def test_nine_digit_runs_are_ssns() -> None:
+    for masker in (mask, mask_ssns):
+        assert [
+            (given, masker(given)) for given, expected in NINE_IN_A_RUN if masker(given) != expected
+        ] == [], masker.__name__
+        assert [given for given in NOT_NINE if masker(given) != given] == [], masker.__name__
+    # A line that masking makes longer than the limit is cut again; a run the cut would split
+    # goes with it, so a run cut down to nine digits is never left to be masked the next time.
+    grown = (SSN_PLAIN + " ") * 829 + "x" * 26 + " " + " ".join("1234567891234567")
+    assert len(grown) < 10_000
+    assert mask(grown).endswith(" [cut]")
+    assert mask(mask(grown)) == mask(grown)
+    # The run goes; the space before it stays, then the marker.
+    assert mask(grown).endswith("x" * 26 + "  [cut]")
+
+    # A ten- or eleven-digit number is not an SSN: the message masker keeps it.
+    for phone in (
+        " ".join(["555", "201", "3344"]),
+        " ".join(["1", "555", "201", "3344"]),
+        "five five five two zero one three three four four",
+    ):
+        assert mask_ssns(phone) == phone
+
+
+# Long runs of number words, homophones and joiners that a backtracking reader would be slow on.
+DIGIT_ADVERSARIAL = [
+    "nineteen " * 1_111,
+    "to " * 3_333,
+    "for to " * 1_428,
+    "one two three dash " * 526,
+    "1 . " * 2_500,
+    "twenty one hundred " * 526,
+    "two thousand and " * 588,
+    "oh " * 3_333,
+    "1, " * 3_333,
+    "double " * 1_428,
+]
+
+MEASURE_DIGITS = """
+import json, sys, time
+from app.guard.mask import (
+    mask, mask_known_digits, mask_ssns, mask_unverified_digits, says_a_number, spoken_digits
+)
+readers = [
+    mask,
+    mask_ssns,
+    mask_unverified_digits,
+    lambda text: mask_known_digits(text, "33" + "44"),
+    spoken_digits,
+    says_a_number,
+]
+timings = []
+for text in json.load(sys.stdin):
+    for reader in readers:
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            reader(text)
+            best = min(best, time.perf_counter() - started)
+        timings.append(best)
+print(json.dumps(timings))
+"""
+
+
+def test_digit_reading_is_linear() -> None:
+    texts = ADVERSARIAL + DIGIT_ADVERSARIAL
+    assert max(len(text) for text in texts) <= 10_000
+    try:
+        measured = subprocess.run(
+            [sys.executable, "-c", MEASURE_DIGITS],
+            input=json.dumps(texts),
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=MEASURE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"reading did not finish within {MEASURE_TIMEOUT_SECONDS} s") from None
+    timings = json.loads(measured.stdout)
+    assert len(timings) == 6 * len(texts)
+    assert max(timings) < LINEAR_BOUND_SECONDS, max(timings)
