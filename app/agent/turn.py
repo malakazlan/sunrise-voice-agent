@@ -312,6 +312,23 @@ class CallAgent:
             finally:
                 self._speak = None
 
+    def is_emergency(self, transcript: str) -> bool:
+        """Whether the input guard reads an emergency in what the caller said: its decision,
+        the one owner of the emergency phrases."""
+        return guard_input(transcript, self._state).action is GuardAction.EMERGENCY
+
+    async def say_emergency(self, speak: Speak) -> Line:
+        """The emergency's one way (`emergency`, app/agent/endings.py) for an emergency heard
+        outside a turn: the call moves to emergency and its line is released at once. It takes
+        no lock: the voice adapter calls it with the running turn cancelled, and nothing here
+        waits, so a turn cannot run in between."""
+        self._state, script = await emergency(self._state, Reason.GUARD, self._deps)
+        self._speak = speak
+        try:
+            return self._say(script)
+        finally:
+            self._speak = None
+
     async def end(self, reason: Reason) -> None:
         """The one place a call ends: `end_call` (app/agent/endings.py) writes its call_ended
         event, once, with the reason."""
@@ -407,9 +424,9 @@ class CallAgent:
 
     async def _filler(self, round_started: float) -> None:
         """The filler line FILLER_SECONDS after the tool round started, unless the turn has
-        said it already or the SSN step is armed."""
+        said it already, the SSN step is armed or the call is ending."""
         await self._sleep(max(0.0, round_started + FILLER_SECONDS - self._clock()))
-        if self._filler_said or self._state.expecting_ssn4:
+        if self._filler_said or self._state.expecting_ssn4 or self.ending is not None:
             return
         self._filler_said = True
         self.say(ScriptId.FILLER)

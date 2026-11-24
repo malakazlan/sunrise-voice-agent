@@ -16,15 +16,23 @@ timings, from the moment the caller stopped speaking: the silence voice activity
 for, speech-to-text, the model, and the first audio of the reply.
 
 While the caller is muted (the opening line, the closed line, the emergency line) nothing they
-say is a turn or an interruption. Otherwise, when they start speaking over a line, speech out is
-interrupted: what they did not hear leaves the conversation (`heard`).
+say is a turn, an interruption or an emergency. Otherwise, when they start speaking over a line,
+speech out is interrupted: what they did not hear leaves the conversation (`heard`).
+
+An emergency is not left to the turn queue: every finished utterance is read by the input
+guard's emergency decision as it arrives, whatever the call is doing (a turn running, turns
+queued, the call closing for any reason). On one, the running turn is cancelled, queued ones are
+dropped, every interruptible line stops, the emergency line is released in the same step of the
+event loop, and the call ends for the emergency, whatever reason it was ending for.
 
 The call ends once: after the line that ends it has played (emergency, transfer, goodbye,
 after-hours close: the phase says which), after the goodbye of IDLE_SECONDS twice without the
-caller speaking (once, the agent asks whether they are still there) or of MAX_CALL_SECONDS, when
-the caller hangs up, and with `error` on a turn that fails or a pipeline that ends without the
-call deciding to. The idle timer runs only while nothing is said and no turn runs. Ending is
-`end` of the agent, then an EndWorkerFrame: the transport sends what is left, then closes.
+caller speaking (once, the agent asks whether they are still there) or of MAX_CALL_SECONDS
+(which lets a running turn finish first), when the caller hangs up, and with `error` on a turn
+that fails or a pipeline that ends without the call deciding to. The idle timer runs only while
+nothing is said and no turn runs. Before it ends, a closing call hears out a caller who is
+speaking (HEAR_OUT_SECONDS at most). Ending is `end` of the agent, then an EndWorkerFrame: the
+transport sends what is left, then closes.
 
 Logs carry event names, the call id, line ids, counts and milliseconds; never text.
 """
@@ -83,6 +91,9 @@ CONNECT_TIMEOUT_SECONDS = 30.0
 # the call's own goodbye comes first, after the line playing, then the transport's closing
 # silence.
 END_GRACE_SECONDS = 30
+# How long a call that is closing waits, after its last line, for a caller who is speaking or
+# whose words are still being transcribed: they may be an emergency.
+HEAR_OUT_SECONDS = 5.0
 
 
 class Agent(Protocol):
@@ -98,6 +109,10 @@ class Agent(Protocol):
     def heard(self, line_id: int, words: int | None = None) -> None: ...
 
     async def end(self, reason: Reason) -> None: ...
+
+    def is_emergency(self, transcript: str) -> bool: ...
+
+    async def say_emergency(self, speak: Speak) -> Line: ...
 
 
 # Starts the call: its agent and its opening line.
@@ -180,6 +195,10 @@ class AgentProcessor(FrameProcessor):
         self._closing: Reason | None = None
         self._ended = False
         self._busy = False
+        # Set while no turn runs; and whenever something is heard of the caller.
+        self._turn_free = asyncio.Event()
+        self._turn_free.set()
+        self._caller_changed = asyncio.Event()
         self._caller_speaking = False
         self._idle_prompted = False
         self._turn_count = 0
@@ -221,7 +240,13 @@ class AgentProcessor(FrameProcessor):
 
     async def _caller(self, frame: Frame) -> None:
         """What voice activity detection and speech-to-text report of the caller. While the
-        caller is muted, none of it counts: no interruption, no turn."""
+        caller is muted, none of it counts: no interruption, no turn, no emergency."""
+        try:
+            await self._hear(frame)
+        finally:
+            self._caller_changed.set()
+
+    async def _hear(self, frame: Frame) -> None:
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._caller_speaking = False
         if self._playback.muted:
@@ -243,17 +268,47 @@ class AgentProcessor(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             self._heard.append(frame.text)
             if frame.finalized:
-                self._utterance_done()
+                await self._utterance_done()
             return
-        self._utterance_done()
+        await self._utterance_done()
 
-    def _utterance_done(self) -> None:
+    async def _utterance_done(self) -> None:
+        """A finished utterance: an emergency is acted on the moment it is heard, whatever
+        the call is doing; anything else becomes a turn, unless the call is closing."""
         text = " ".join(self._heard).strip()
         self._heard = []
-        if text and self._closing is None:
+        speech_end, self._speech_end = self._speech_end, None
+        if not text or self._agent is None or self._ended:
+            return
+        if self._agent.is_emergency(text):
+            await self._emergency()
+            return
+        if self._closing is None:
             self._stop_idle()
-            self._queue.put_nowait(_Utterance(text, self._speech_end, self._clock()))
-            self._speech_end = None
+            self._queue.put_nowait(_Utterance(text, speech_end, self._clock()))
+
+    async def _emergency(self) -> None:
+        """An emergency the caller said, outside a turn: the running turn is cancelled and the
+        queued ones dropped, every interruptible line stops, the emergency line is released and
+        the call ends for the emergency, whatever reason it was ending for. Nothing here waits
+        before the line is released."""
+        agent = self._agent
+        if agent is None or self._ended or self._closing is Reason.EMERGENCY:
+            return
+        current = asyncio.current_task()
+        for task in (self._turns, self._idle, self._max, self._closer):
+            if task is not None and task is not current:
+                task.cancel()
+        self._idle = None
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        cut = await self._playback.interrupt()
+        line = await agent.say_emergency(self._speak)
+        self._close(Reason.EMERGENCY)
+        logger.warning("emergency_heard call_id=%s lines_cut=%d", self._call_id, len(cut))
+        if cut:
+            await self.push_frame(InterruptionFrame())
+        await self._send({"type": "said", "lines": [line.text]})
 
     async def _interrupt(self) -> None:
         cut = await self._playback.interrupt()
@@ -325,6 +380,7 @@ class AgentProcessor(FrameProcessor):
             caller_end = self._caller_end(item)
             self._awaiting_line = (self._turn_count, caller_end)
             self._busy = True
+            self._turn_free.clear()
             self._stop_idle()
             try:
                 result = await self._agent.handle(item.text, self._speak)
@@ -335,6 +391,7 @@ class AgentProcessor(FrameProcessor):
                 return
             finally:
                 self._busy = False
+                self._turn_free.set()
                 self._awaiting_line = None
             await self._report(item, caller_end, result)
             ending = self._agent.ending
@@ -451,13 +508,17 @@ class AgentProcessor(FrameProcessor):
     # --- the end ---------------------------------------------------------------------------
 
     def _close(self, reason: Reason, *, goodbye: bool = False) -> None:
-        """Decide that the call ends, for `reason`: no more turns; the goodbye first if asked
-        for, once every line is over; the end once the last line is over."""
-        if self._closing is not None:
+        """Decide that the call ends, for `reason`: no new turn starts (the one running runs
+        to its end); the goodbye first if asked for, once every line is over; the end once the
+        last line is over and the caller has been heard out. The first reason stands, but for
+        the emergency, which replaces any other."""
+        if self._closing is not None and (
+            reason is not Reason.EMERGENCY or self._closing is Reason.EMERGENCY
+        ):
             return
         self._closing = reason
         current = asyncio.current_task()
-        for task in (self._turns, self._idle, self._max):
+        for task in (self._idle, self._max, self._closer):
             if task is not None and task is not current:
                 task.cancel()
         self._idle = None
@@ -465,14 +526,35 @@ class AgentProcessor(FrameProcessor):
 
     async def _closed_after(self, reason: Reason, goodbye: bool) -> None:
         logger.info("call_closing call_id=%s reason=%s", self._call_id, reason.value)
-        if goodbye and self._agent is not None:
+        await self._turn_free.wait()
+        if goodbye and self._agent is not None and self._agent.ending is None:
             await self._playback.all_over()
             line = await self._agent.prompt(ScriptId.GOODBYE, self._speak)
             await self._send({"type": "said", "lines": [line.text]})
         await self._playback.all_over()
+        await self._heard_out()
         await self._finish(reason)
         await self._send({"type": "ended", "reason": reason.value})
         await self.push_frame(EndWorkerFrame(), FrameDirection.UPSTREAM)
+
+    def _caller_pending(self) -> bool:
+        """Whether the caller is speaking, or what they said is still being transcribed."""
+        return self._caller_speaking or self._speech_end is not None or bool(self._heard)
+
+    async def _heard_out(self) -> None:
+        """Wait, at most HEAR_OUT_SECONDS, for a caller who is speaking or whose words are
+        still being transcribed: what they say may be an emergency."""
+        if not self._caller_pending():
+            return
+        deadline = asyncio.ensure_future(self._sleep(HEAR_OUT_SECONDS))
+        try:
+            while self._caller_pending() and not deadline.done():
+                self._caller_changed.clear()
+                heard = asyncio.ensure_future(self._caller_changed.wait())
+                await asyncio.wait({heard, deadline}, return_when=asyncio.FIRST_COMPLETED)
+                heard.cancel()
+        finally:
+            deadline.cancel()
 
     async def _end_now(self, reason: Reason) -> None:
         """End the call at once: for the reason already decided, if any."""

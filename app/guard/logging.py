@@ -31,7 +31,7 @@ VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "dee
 THIRD_PARTY_FLOOR = logging.WARNING
 # Pipecat's modules that quote the text being spoken in their records (pipecat-ai 1.17.0): the
 # text-to-speech service warns with a line it will not speak, the frame sequencer with the words
-# it drops. Their records are not written at all.
+# it drops. Their records are not written; one at warning or above leaves a line of ours.
 SPEECH_TEXT_MODULES = frozenset(
     {
         "pipecat.services.tts_service",
@@ -42,7 +42,16 @@ SPEECH_TEXT_MODULES = frozenset(
 
 
 def _carries_no_speech_text(record: "Record") -> bool:
-    return record["name"] not in SPEECH_TEXT_MODULES
+    """Whether a loguru record may be written. One of SPEECH_TEXT_MODULES' is not; one at
+    warning or above leaves a line of the application's own in its place: its level and its
+    logger, nothing of its message."""
+    if record["name"] not in SPEECH_TEXT_MODULES:
+        return True
+    if record["level"].no >= logging.WARNING:
+        logger.warning(
+            "pipecat_record_withheld level=%s logger=%s", record["level"].name, record["name"]
+        )
+    return False
 
 
 class MaskingFormatter(logging.Formatter):

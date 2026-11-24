@@ -877,6 +877,18 @@ through the functions of "Messages, transfer, emergency and the end of the call"
   played are dropped, and the conversation keeps only the words ElevenLabs reported played of
   the line that was cut (counted from its word timestamps), none of the others. The page notes
   the interruption.
+- The caller cannot be heard during the greeting, the closed line or the 911 line: anything
+  they say then, an emergency included, is not acted on.
+- An emergency is heard whatever the call is doing: every finished utterance goes through the
+  input guard's emergency decision the moment it arrives, before the turn queue, while a turn
+  runs, with turns queued, and while the call is closing for any reason (during the goodbye,
+  the transfer line or the after-hours close). The running turn is cancelled (its reply, if it
+  comes, is never said), queued turns are dropped, every line that can be interrupted stops,
+  the 911 line is released in the same step of the event loop as the transcript arrived, and
+  the call ends with `emergency`, whatever reason it was ending for and whatever timer fires
+  meanwhile. Anything else said while the call is closing is not a turn. A closing call does
+  not end while the caller is speaking or their words are being transcribed (5 seconds at
+  most), so an emergency said over the last line is still heard.
 - How the adapter knows what was played: each line goes to text-to-speech between two marks.
   Pipecat's text-to-speech service keeps frames it does not speak in order with its audio, and
   the transport sends them on only once the audio before them has been written to the caller,
@@ -888,8 +900,10 @@ through the functions of "Messages, transfer, emergency and the end of the call"
   the transfer line (`transferred`), the goodbye or the after-hours close (`completed`) has
   played; when the caller hangs up or the connection drops (`caller_hung_up`); after
   `IDLE_SECONDS` without the caller speaking the agent asks "Are you still there?", and after
-  another `IDLE_SECONDS` says goodbye (`idle_timeout`); at `MAX_CALL_SECONDS` it says goodbye
-  once the line playing is over (`max_duration`); a turn that fails, or a pipeline that ends
+  another `IDLE_SECONDS` says goodbye (`idle_timeout`); at `MAX_CALL_SECONDS` it lets a
+  running turn finish (a reported emergency in it still ends the call with `emergency`), then
+  says goodbye once the line playing is over (`max_duration`); a turn that fails, or a pipeline
+  that ends
   without the call having decided to (a vendor that can no longer work), ends it with `error`.
   The caller speaking resets the idle count; the idle timer does not run while a line plays or
   a turn runs. Once a reason is decided it stands, even if the caller hangs up during the last
@@ -905,9 +919,11 @@ through the functions of "Messages, transfer, emergency and the end of the call"
   rejects the key, the voice or the model, and the call then ends with `error`. In CI's relay
   test ElevenLabs' host points at the app's own loopback: the call starts, its lines fail this
   way, and the probe still passes.
-- Logs: event names, the call id, line ids, counts and milliseconds. Pipecat's own records that
-  quote the text being spoken (its text-to-speech service and its word sequencer write them at
-  warning level) are not written at all.
+- Logs: event names, the call id, line ids, counts and milliseconds. Pipecat's own records from
+  the modules that quote the text being spoken (its text-to-speech service and its word
+  sequencer, at warning level) are not written; each one at warning or above leaves a line of
+  ours in its place, `pipecat_record_withheld level=<level> logger=<module>`, with nothing of
+  its message.
 - Wording (`app/agent/prompts.py`): one short sentence for an answer about the caller's
   information, no trailing offer of help; "anything else?" only when a request is done and
   once per request; name and date of birth asked together, with no spelling (only the scripted
@@ -926,6 +942,13 @@ Limits of this slice:
   may be counted wrongly.
 - ElevenLabs keeps its usual request logs (zero retention is an enterprise setting); the data
   is synthetic.
+- A line that produced no audio (speech out that cannot connect) is recorded as heard in the
+  conversation.
+- If speech out takes more than 3 seconds to its first audio, Pipecat gives the line up as
+  silent, so the caller can be unmuted before an uninterruptible line (the greeting, the closed
+  line, the 911 line) has finished playing.
+- On a real call the agent's own voice coming back through loudspeakers can be taken for the
+  caller speaking and interrupt it: use headphones.
 - The call record (the stored, masked transcript) is not part of this slice.
 
 ### Evals

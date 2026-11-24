@@ -10,7 +10,13 @@ from datetime import date
 from typing import Any, cast
 
 import pytest
-from pipecat.frames.frames import EndFrame, VADUserStartedSpeakingFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    Frame,
+    InterruptionFrame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+)
 from speech_fakes import CallPipeline, FakeTime, FakeVoice, agent_call, caller_says, settle, until
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -29,7 +35,7 @@ from app.agent.model import ModelReply
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import CallAgent
+from app.agent.turn import CallAgent, Line
 from app.db.seed import load_seed_data, seed
 from evals.scripted import ScriptedModel, calls, says
 
@@ -439,3 +445,209 @@ async def test_filler_rules(seeded_deps: Deps) -> None:
     assert spoken == []
     let_go.set()
     assert (await turn).lines == ("Shall I transfer you to our staff?",)
+
+
+# --- the emergency, heard whatever the call is doing ------------------------------------
+
+CHEST_PAIN = "Wait, I'm having chest pain"
+HEART_ATTACK = "I think I'm having a heart attack"
+
+
+def final(text: str) -> TranscriptionFrame:
+    """A finalized transcript alone, as speech-to-text sends it once the caller has stopped."""
+    return TranscriptionFrame(text, "", "2026-11-24T15:00:00Z", finalized=True)
+
+
+async def ends_with_the_emergency(
+    call: CallPipeline, voice: FakeVoice, owner_engine: Engine, call_id: str
+) -> None:
+    """The 911 line, then nothing after it, played in full; the call ends for the emergency."""
+    await until(lambda: voice.waiting == 1, "the emergency line")
+    assert voice.spoken[-1] == (EMERGENCY, False)
+    assert not call.ended
+    await voice.play_all()
+    await until(lambda: call.ended, "the call to end")
+    assert voice.spoken[-1] == (EMERGENCY, False)
+    assert voice.played[-len(EMERGENCY.split()) :] == EMERGENCY.split()
+    assert ended_reason(call) == ["emergency"]
+    await drain_call_events()
+    assert call_events(owner_engine, call_id) == [
+        ("call_started", None),
+        ("call_ended", "emergency"),
+    ]
+
+
+@pytest.mark.parametrize("closing", ["goodbye", "transfer", "after_hours_close"])
+async def test_an_emergency_while_the_call_closes(
+    runtime: AsyncEngine, owner_engine: Engine, closing: str
+) -> None:
+    caller, steps = TURNS[closing]
+    model = ScriptedModel(*steps)
+    time = FakeTime()
+    call_id = new_call_id()
+    deps = deps_on(runtime, EVENING if closing == "after_hours_close" else T0)
+    processor, playback = agent_call(call_id, deps, model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the opening line")
+        await voice.play_all()
+        await call.send(*caller_says(caller))
+        await until(lambda: voice.waiting == 1, "the closing line")
+        assert texts(voice)[-1] == ENDINGS[closing][1]
+        # Three words in, the caller speaks over it: the line stops, and what they say is an
+        # emergency. The call had decided to end; the emergency is heard all the same.
+        await voice.start(3)
+        await call.send(VADUserStartedSpeakingFrame())
+        await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
+        await call.send(*caller_says(CHEST_PAIN)[1:])
+        await ends_with_the_emergency(call, voice, owner_engine, call_id)
+
+
+async def test_an_emergency_while_a_turn_runs(runtime: AsyncEngine, owner_engine: Engine) -> None:
+    let_go, slow = held(says("Your appointment is on Thursday."))
+    model = ScriptedModel(slow)
+    time = FakeTime()
+    call_id = new_call_id()
+    processor, playback = agent_call(call_id, deps_on(runtime), model, time)
+    voice = FakeVoice(autoplay=False)
+    # Each turn of the event loop, counted; and the turn in which the transcript of the
+    # emergency reaches the adapter, and the one in which its line is released.
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    arrived: list[int] = []
+    released: list[int] = []
+    hears = processor._caller
+    releases = playback.release
+
+    async def hearing(frame: Frame) -> None:
+        if isinstance(frame, TranscriptionFrame):
+            arrived.append(ticks)
+        await hears(frame)
+
+    def releasing(line: Line, *, opening: bool = False) -> None:
+        if line.text == EMERGENCY:
+            released.append(ticks)
+        releases(line, opening=opening)
+
+    processor._caller = hearing  # type: ignore[method-assign]
+    playback.release = releasing  # type: ignore[method-assign]
+    ticker = asyncio.ensure_future(tick())
+    try:
+        async with CallPipeline(processor, playback, voice) as call:
+            processor.connected()
+            await until(lambda: voice.waiting == 1, "the opening line")
+            await voice.play_all()
+            # Ten seconds before the call's maximum, a turn waits on the model; the caller
+            # speaks again, and it is an emergency.
+            await time.advance(590)
+            await call.send(*caller_says("When is my appointment?"))
+            await until(lambda: len(model.requests) == 1, "the model to be asked")
+            await call.send(*caller_says(HEART_ATTACK))
+            await until(lambda: released != [], "the emergency line")
+            # Released in the same turn of the event loop as its transcript arrived: no wait
+            # for the running turn, which is cancelled.
+            assert released == [arrived[-1]]
+            let_go.set()
+            await time.advance(10)
+            await ends_with_the_emergency(call, voice, owner_engine, call_id)
+    finally:
+        ticker.cancel()
+    # The turn's own reply, too late, was never spoken; nor was a goodbye.
+    assert "Your appointment is on Thursday." not in texts(voice)
+    assert GOODBYE not in texts(voice)
+
+
+@pytest.mark.parametrize("timer", ["idle", "max_duration"])
+async def test_an_emergency_as_a_timer_fires(
+    runtime: AsyncEngine, owner_engine: Engine, timer: str
+) -> None:
+    model = ScriptedModel()
+    time = FakeTime()
+    call_id = new_call_id()
+    processor, playback = agent_call(call_id, deps_on(runtime), model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the opening line")
+        await voice.play_all()
+        await until(lambda: time.waiting == 2, "the timers")
+        # The transcript and the timer, in the same instant.
+        await call.worker.queue_frame(final(HEART_ATTACK))
+        await time.advance(30 if timer == "idle" else 600)
+        # Whatever the timer released before the 911 line was cut: the 911 line is the last.
+        await ends_with_the_emergency(call, voice, owner_engine, call_id)
+    spoken = texts(voice)
+    assert GOODBYE not in spoken[spoken.index(EMERGENCY) :]
+    assert STILL_THERE not in spoken[spoken.index(EMERGENCY) :]
+
+
+async def test_an_emergency_during_the_greeting_is_not_heard(runtime: AsyncEngine) -> None:
+    # The caller is not heard during the greeting, whatever they say: an emergency included.
+    model = ScriptedModel()
+    time = FakeTime()
+    processor, playback = agent_call(new_call_id(), deps_on(runtime), model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the greeting")
+        await voice.start(2)
+        await call.send(*caller_says(HEART_ATTACK))
+        await voice.finish()
+        await settle()
+        assert texts(voice) == [GREETING]
+        assert not call.ended
+    await drain_call_events()
+
+
+async def test_the_maximum_waits_for_the_running_turn(
+    runtime: AsyncEngine, owner_engine: Engine
+) -> None:
+    # The call's maximum comes while the model works on a turn. The turn runs to its end; it
+    # reports an emergency, whose line is said, and the call ends for it, with no goodbye.
+    let_go, slow = held(calls(("report_emergency", {})))
+    model = ScriptedModel(slow)
+    time = FakeTime()
+    call_id = new_call_id()
+    processor, playback = agent_call(call_id, deps_on(runtime), model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the opening line")
+        await voice.play_all()
+        await call.send(*caller_says("My chest feels tight and my arm is numb."))
+        await until(lambda: len(model.requests) == 1, "the model to be asked")
+        await time.advance(600)
+        assert voice.waiting == 0
+        let_go.set()
+        await ends_with_the_emergency(call, voice, owner_engine, call_id)
+    assert GOODBYE not in texts(voice)
+
+    # A turn that answers: its answer, then the goodbye, and the call ends at its maximum.
+    let_go, slow = held(says("Your appointment is on Thursday."))
+    model = ScriptedModel(slow)
+    time = FakeTime()
+    call_id = new_call_id()
+    processor, playback = agent_call(call_id, deps_on(runtime), model, time)
+    voice = FakeVoice()
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the greeting")
+        await call.send(*caller_says("When is my appointment?"))
+        await until(lambda: len(model.requests) == 1, "the model to be asked")
+        await time.advance(600)
+        let_go.set()
+        await until(lambda: call.ended, "the call to end")
+    assert texts(voice)[-2:] == ["Your appointment is on Thursday.", GOODBYE]
+    await drain_call_events()
+    assert call_events(owner_engine, call_id)[-1] == ("call_ended", "max_duration")

@@ -261,10 +261,18 @@ async def test_voice_logs_carry_no_text(
         server.close()
         await server.wait_closed()
     written = capsys.readouterr().err
-    # Its records about the connection are written; the text is not.
+    # Its records about the connection are written; the text is not. Each record withheld
+    # for the text it may hold, at warning or above, leaves a line of the application's
+    # own: the level and the logger, nothing of the message.
     assert "ElevenLabsTTSService" in written
     for text in ("marker-spoken", "is said"):
         assert text not in written, text
+    for withheld in (
+        "pipecat_record_withheld level=WARNING logger=pipecat.services.tts_service",
+        "pipecat_record_withheld level=WARNING"
+        " logger=pipecat.utils.context.aggregated_frame_sequencer",
+    ):
+        assert withheld in written, withheld
 
 
 async def close_at_once(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

@@ -244,6 +244,12 @@ class Withheld:
     async def end(self, reason: Reason) -> None:
         self.ended = reason
 
+    def is_emergency(self, transcript: str) -> bool:
+        return False
+
+    async def say_emergency(self, speak: Speak) -> Line:
+        raise AssertionError("no emergency is said")
+
 
 @pytest.mark.anyio
 async def test_a_withheld_reply_reaches_the_page_by_its_rule() -> None:
