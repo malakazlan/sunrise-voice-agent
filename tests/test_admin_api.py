@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
 
+from app import main as main_module
 from app.api import admin
 from app.audit import read as audit_read
 from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
@@ -739,3 +740,29 @@ def test_admin_credentials_compared_in_constant_time() -> None:
     assert len(returned) == 1
     value = returned[0].value
     assert isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitAnd)
+
+
+def test_admin_shares_the_app_engine(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # create_app builds one engine, one session factory and one audit log, and the admin API
+    # is given those; it builds none of its own.
+    counts = {"create_database_engine": 0, "create_session_factory": 0, "AuditLog": 0}
+    for name in counts:
+        original = getattr(main_module, name)
+
+        def counting(*args: Any, _name: str = name, _original: Any = original) -> Any:
+            counts[_name] += 1
+            return _original(*args)
+
+        monkeypatch.setattr(main_module, name, counting)
+
+    create_app(admin_settings(database))
+
+    assert counts == {"create_database_engine": 1, "create_session_factory": 1, "AuditLog": 1}
+    built = {
+        node.func.id
+        for node in ast.walk(ast.parse(ADMIN_MODULE.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert not built & {"create_database_engine", "create_session_factory", "AuditLog"}

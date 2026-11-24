@@ -92,6 +92,9 @@ services:
       DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
     depends_on:
       startup:
         condition: service_completed_successfully

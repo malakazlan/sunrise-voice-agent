@@ -18,6 +18,7 @@ class ScriptId(StrEnum):
     VERIFY_FAIL = "verify_fail"
     VERIFY_LOCKED = "verify_locked"
     EMERGENCY = "emergency"
+    FALLBACK = "fallback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,11 @@ SCRIPTS = MappingProxyType(
             "If you're experiencing a medical emergency, please hang up and call 911 or go to"
             " the nearest emergency room right away.",
             interruptible=False,
+        ),
+        # For a model turn that failed or ran too long (app/agent/turn.py).
+        ScriptId.FALLBACK: Script(
+            "I'm sorry, I can't help with that. I can take a message for our staff instead.",
+            interruptible=True,
         ),
     }
 )

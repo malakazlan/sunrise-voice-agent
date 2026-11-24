@@ -1,10 +1,15 @@
 # Test only (CI's forced-relay probe): coturn keeps its committed configuration file; only
 # its networking changes. app and coturn join a network whose addresses lie outside every
-# range coturn denies, so no peer has to be allowed and every deny rule is exercised.
+# range coturn denies, so no peer has to be allowed and every deny rule is exercised. The
+# app's vendor hosts resolve to its own loopback, where nothing listens: the probe's calls
+# start speech-to-text, which must fail there and never reach the vendor with CI's fake keys.
 #   TURN_HOST=203.0.113.10 docker compose --env-file .env -f deploy/docker-compose.yml \
 #     -f deploy/docker-compose.relay-test.yml up -d
 services:
   app:
+    extra_hosts:
+      - "api.deepgram.com:127.0.0.1"
+      - "api.anthropic.com:127.0.0.1"
     networks:
       default: {}
       relay-test: {}

@@ -30,6 +30,8 @@ MIN_SECRET_LENGTH = 32
 # What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
 TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
+# LLM_MODEL: a Claude model id as Anthropic writes them, such as claude-haiku-5-5.
+CLAUDE_MODEL_ID = r"^claude-[a-z0-9][a-z0-9.-]{0,59}$"
 # The APP_DB_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_APP_DB_PASSWORD = "change-me-to-another-long-random-value"  # noqa: S105 (a published placeholder)
 # The runtime role's name goes into role set-up statements (app/db/roles.py), always quoted.
@@ -241,6 +243,24 @@ class Settings(DatabaseSettings):
     # password comes first: the user's check reads it.
     admin_password: SecretStr | None = None
     admin_user: str | None = Field(default=None, validate_default=True)
+    # The vendors of a call: the model (app/agent/model.py) and speech-to-text
+    # (app/voice/pipeline.py). Without both keys a call is refused at set-up.
+    anthropic_api_key: SecretStr | None = Field(default=None, validate_default=True)
+    deepgram_api_key: SecretStr | None = Field(default=None, validate_default=True)
+    llm_model: str = Field(default="claude-haiku-5-5", pattern=CLAUDE_MODEL_ID)
+
+    @field_validator("anthropic_api_key", "deepgram_api_key")
+    @classmethod
+    def _vendor_key_outside_dev(
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        name = info.field_name or ""
+        if value is None:
+            if _outside_dev(info):
+                raise ValueError(f"{name} is required unless app_env is dev")
+            return None
+        _check_strong_secret(name, value, info)
+        return value
 
     @field_validator("audit_hmac_key", "identity_hash_key")
     @classmethod

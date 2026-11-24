@@ -730,6 +730,37 @@ def test_domain_is_pure() -> None:
     assert offenders == {}
 
 
+# The agent's turns are plain text (app/agent/turn.py), so they are tested without audio; the
+# voice pipeline (app/voice/) adapts frames to them, never the reverse. No module of the agent
+# package imports Pipecat.
+AGENT_DIR = REPO_ROOT / "app" / "agent"
+
+
+def pipecat_imports(source: str) -> list[str]:
+    return [
+        module
+        for module in imported_modules(source, "app.agent")
+        if module == "pipecat" or module.startswith("pipecat.")
+    ]
+
+
+def test_the_agent_imports_no_pipecat() -> None:
+    for sample in (
+        "import pipecat\n",
+        "import pipecat.frames.frames as frames\n",
+        "from pipecat.frames.frames import TranscriptionFrame\n",
+        "from pipecat import frames\n",
+    ):
+        assert pipecat_imports(sample), sample
+    assert not pipecat_imports("from app.agent.model import Model\nimport pipecatx\n")
+
+    sources = {path.name: path.read_text(encoding="utf-8") for path in AGENT_DIR.rglob("*.py")}
+    assert "turn.py" in sources
+    assert {
+        name: found for name, source in sources.items() if (found := pipecat_imports(source))
+    } == {}
+
+
 # Log output is configured in app/guard/logging.py only, where every handler gets the masking
 # formatter: no other file may configure logging, build or add a handler or formatter, or add or
 # remove loguru's sinks. Tests included. A lint against accidents, like the scans above: a name
