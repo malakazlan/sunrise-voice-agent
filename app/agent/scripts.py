@@ -21,7 +21,7 @@ class ScriptId(StrEnum):
     FALLBACK = "fallback"
     BOOKING_INSTRUCTIONS = "booking_instructions"
     ADVICE_REFUSAL = "advice_refusal"
-    REFILL_SENT = "refill_sent"
+    REFILL_NO_PROMISE = "refill_no_promise"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,12 @@ SCRIPTS = MappingProxyType(
             "I'm not able to give medical advice. I can send a message to your doctor instead.",
             interruptible=True,
         ),
-        # In place of a sentence the output guard blocks as a refill promise.
-        ScriptId.REFILL_SENT: Script("Your request has been sent to our team.", interruptible=True),
+        # In place of a sentence the output guard blocks as a refill promise. It claims no
+        # action: nothing has been sent when it is said.
+        ScriptId.REFILL_NO_PROMISE: Script(
+            "I'm not able to confirm that a refill is approved. I can send the request to our"
+            " team.",
+            interruptible=True,
+        ),
     }
 )

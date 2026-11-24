@@ -4,19 +4,26 @@ Pure: it decides from the text and the call's state alone, with no database, net
 `guard_output` checks one sentence against these rules, in this order, and the first that
 matches blocks it with a scripted line to say instead:
 
-1. `ssn_last4`: a run of digits, written or spoken, equal to the caller's verified last four.
-   A longer run that holds them, such as a phone number, passes.
+1. `ssn_last4`: a run of digits, numerals or number words, equal to the caller's verified last
+   four, read across the reply so far. A longer run that holds them, such as a phone number,
+   passes.
 2. `ssn_shape`: a run that reads as nine digits, in any grouping, verified or not.
 3. `phi_outside_gate`: the caller is not verified, or the office is closed, and the sentence
-   carries a money amount, a lab status, a dosage, or refill, prescription or medication with a
-   capitalised drug-like word.
+   carries a money amount, a lab status or a dosage.
 4. `medical_advice`: advice or diagnosis phrasing.
-5. `refill_promise`: a refill or prescription said to be approved, ready or filled.
+5. `refill_promise`: a refill, prescription or medication said to be approved, ready or filled,
+   unless the sentence asks, waits or denies before it ("whether", "once", "can't" ...).
 
-The digit reading is the mask module's (app/guard/mask.py), the one owner of the SSN patterns.
-Rules 3 to 5 are patterns: they cannot catch every phrasing, and they block some harmless
-sentences. The gate, which keeps patient data from the model until the caller is verified, is
-the control; this guard is the last check before words are said.
+The digit reading is the mask module's (app/guard/mask.py), the one owner of the SSN patterns;
+it reads numerals and number words, not homophones such as "to" or "for". Rules 3 to 5 are
+patterns: they cannot catch every phrasing, and they block some harmless sentences. The gate,
+which keeps patient data from the model until the caller is verified, is the control; this
+guard is the last check before words are said.
+
+A tool may hand the model the caller's own words to read back (a message waiting for
+confirmation). Those words, where the reply quotes them (compared without case and repeated
+spaces), are not the model's advice or promise: rules 4 and 5 skip them. Rules 1 to 3 read the
+whole sentence.
 
 `split_sentences` turns a stream of text pieces into complete sentences, and `guard_reply`
 takes a reply through both: its sentences in order while each passes and the reply stays within
@@ -32,8 +39,7 @@ from types import MappingProxyType
 
 from app.agent.scripts import ScriptId
 from app.agent.state import CallState
-from app.domain.clinic import DOCTORS
-from app.guard.mask import mask_known_digits, reads_as_nine_digits, says_a_number
+from app.guard.mask import reads_as_nine_digits, says_a_number, says_digits
 
 # A reply is cut at the last complete sentence within this many characters.
 MAX_REPLY_CHARACTERS = 600
@@ -54,7 +60,7 @@ INSTEAD = MappingProxyType(
         OutputRule.SSN_SHAPE: ScriptId.FALLBACK,
         OutputRule.PHI_OUTSIDE_GATE: ScriptId.FALLBACK,
         OutputRule.MEDICAL_ADVICE: ScriptId.ADVICE_REFUSAL,
-        OutputRule.REFILL_PROMISE: ScriptId.REFILL_SENT,
+        OutputRule.REFILL_PROMISE: ScriptId.REFILL_NO_PROMISE,
     }
 )
 
@@ -95,20 +101,6 @@ _DOSE_UNIT = re.compile(
 )
 # How far before a unit its number is looked for: the longest number word, with room.
 _DOSE_WINDOW = 32
-_MEDICATION_WORD = re.compile(
-    r"\b(?:refills?|refilled|prescriptions?|prescribed|medications?|medicines?|meds)\b",
-    re.IGNORECASE,
-)
-_CAPITALISED = re.compile(r"(?<![\w'])[A-Z][A-Za-z-]{2,}")
-_FIRST_LETTER = re.compile(r"[^\W\d_]")
-# Capitalised words that are never a drug: the clinic's own words, its doctors, days and months.
-_NOT_DRUGS = frozenset(
-    "sunrise family clinic doctor social security eastern time okay mrs".split()
-    + "monday tuesday wednesday thursday friday saturday sunday".split()
-    + "january february march april may june july august september october november".split()
-    + ["december"]
-    + [doctor.split()[-1].lower() for doctor in DOCTORS]
-)
 
 
 def _dosage(text: str) -> bool:
@@ -120,150 +112,215 @@ def _dosage(text: str) -> bool:
     return False
 
 
-def _names_a_drug(text: str) -> bool:
-    """A capitalised word, not the sentence's first, that is not one of the clinic's words."""
-    first = _FIRST_LETTER.search(text)
-    for word in _CAPITALISED.finditer(text):
-        if first is not None and word.start() == first.start():
-            continue
-        if word[0].lower() not in _NOT_DRUGS:
-            return True
-    return False
-
-
 def _carries_patient_data(text: str) -> bool:
     return (
         bool(_MONEY.search(text))
         or (bool(_OWING.search(text)) and says_a_number(text))
         or (bool(_LAB_SUBJECT.search(text)) and bool(_LAB_STATUS.search(text)))
         or _dosage(text)
-        or (bool(_MEDICATION_WORD.search(text)) and _names_a_drug(text))
     )
 
 
 # --- advice and promises ----------------------------------------------------------------
 
+# What "take" may be followed by and not be about a medicine: "take your insurance card".
+_TAKE = (
+    r"take\b(?!\s+(?:(?:your|a|an|the)\s+)?(?:insurance|photo|id|card|list|copy|moment|seat"
+    r"|look|minute|time|message|call|note)\b)"
+)
 _ADVICE = re.compile(
     "|".join(
         [
             r"\byou\s+(?:should(?:n't|\s+not)?|need\s+to|ought\s+to|must|had\s+better|'d\s+better"
             r"|(?:might|may)\s+want\s+to)\s+(?:(?:also|just|really|probably|definitely|not|never)"
-            r"\s+)?(?:take|stop(?!\s+by\b)|start(?!\s+by\b)|increase|decrease|double|skip)\b",
+            rf"\s+)?(?:{_TAKE}|stop(?!\s+by\b)|start(?!\s+by\b)|increase|decrease|double(?!-)"
+            r"|skip)\b",
+            rf"\byou\s+can\s+(?:also\s+|just\s+|still\s+)?{_TAKE}",
             r"\b(?:stop|start|keep|try|continue|avoid|quit)\s+taking\b",
+            r"\bhold\s+off\s+(?:on\s+)?taking\b",
             r"\b(?:do\s+not|don't|never)\s+take\b",
             r"\b(?:it|that)(?:'s|\s+is)\s+probably\b(?!\s+(?:best|better|easiest|simplest"
-            r"|quickest|fastest|a\s+good\s+idea)\b)",
+            r"|quickest|fastest|a\s+good\s+idea|in\s+your\s+(?:spam|junk|inbox|email|mail))\b)",
             r"\bit\s+sounds\s+like\s+you(?:'ve|\s+have|\s+(?:may|might)\s+have)\b",
-            r"\byou\s+(?:may|might|probably)\s+have\b(?!\s+(?:to|been|already|just|received"
-            r"|heard|seen|gotten|got|left|sent|forgotten|missed|called|tried)\b)",
+            r"\b(?:it|that|this)\s+sounds\s+like\s+an?\b(?!\s+(?:good|great|nice|plan|question)\b)",
+            r"\b(?:it|that|this)\s+could\s+be\s+an?\b(?!\s+(?:few|while|day|week|bit|little"
+            r"|couple|moment|minute)\b)",
+            r"\byou\s+(?:may|might|probably|likely)\s+have\b(?!\s+(?:to|been|already|just"
+            r"|received|heard|seen|gotten|got|left|sent|forgotten|missed|called|tried)\b"
+            r"|\s+(?:(?:an?|the|your)\s+)?(?:copay|co-pay|message|voicemail|bill|balance"
+            r"|appointment|reminder|call|email|letter|form|text|question|insurance|card)s?\b)",
             r"\b(?:it|that|this)(?:'s|\s+is)\s+(?:(?:perfectly|completely|totally|very|quite"
-            r"|pretty)\s+)?normal\b",
+            r"|pretty)\s+)?normal\b(?!\s+for\s+(?:(?:lab|test)\s+)?results\b|\s+for\s+labs?\b"
+            r"|\s+for\s+(?:our|the)\s+(?:lab|office|clinic|staff|team)\b)",
             r"\bnothing\s+to\s+worry\s+about\b",
-            r"\bI(?:\s+would|'d)?\s+(?:recommend|suggest)\s+(?:taking|trying(?!\s+to\b))\b",
+            r"\bI(?:\s+would|'d)?\s+(?:recommend|suggest)\s+(?:taking|trying(?!\s+(?:to|our)\b))\b",
+            r"\bI(?:\s+would|'d)?\s+(?:recommend|suggest)\s+(?:that\s+)?you\s+(?:take|try|stop"
+            r"|start|skip|increase|decrease|double)\b",
+            r"\b(?:it|that)(?:'s|\s+is)\s+(?:fine|okay|ok|alright|all\s+right|safe)\s+to\s+(?:take"
+            r"|skip|stop|double|mix)\b",
             r"\bsafe\s+to\s+take\b",
             r"\bside\s+effects?\s+of\b",
         ]
     ),
     re.IGNORECASE,
 )
-_REFILL = re.compile(r"\b(?:refills?|prescriptions?)\b", re.IGNORECASE)
+_REFILL = re.compile(r"\b(?:refills?|refilled|prescriptions?|medications?|meds)\b", re.IGNORECASE)
 _PROMISE = re.compile(
-    r"\bapproved\b|(?:\b(?:is|are)|'s|'re)\s+(?:now\s+|all\s+)?ready\b"
-    r"|\b(?:has|have|had)\s+(?:now\s+|already\s+)?been\s+filled\b|\b(?:was|were)\s+filled\b",
+    r"\bapproved\b|\bwill\s+be\s+ready\b"
+    r"|(?:\b(?:is|are)|'s|'re)\s+(?:now\s+|all\s+)?ready\b(?!\s+to\s+(?:send|submit|go)\b)"
+    r"|(?:\bis|'s)\s+all\s+set\b"
+    r"|\b(?:has|have|had)\s+(?:now\s+|already\s+)?been\s+(?:re)?filled\b"
+    r"|\b(?:was|were)\s+(?:re)?filled\b",
+    re.IGNORECASE,
+)
+# Words that, before a promise word, make it a question, a wait or a denial.
+_HEDGE = re.compile(
+    r"\b(?:whether|if|once|until|when|after|can't|cannot|can\s+not|don't\s+know"
+    r"|do\s+not\s+know|not|(?:must|needs?\s+to)\s+be)\b",
     re.IGNORECASE,
 )
 
 
-def _broken_rule(text: str, state: CallState) -> OutputRule | None:
-    if state.verified_ssn4 is not None and mask_known_digits(text, state.verified_ssn4) != text:
+def _promises(text: str) -> bool:
+    """A refill word, and a promise word that no hedge comes before."""
+    if not _REFILL.search(text):
+        return False
+    promise = _PROMISE.search(text)
+    if promise is None:
+        return False
+    hedge = _HEDGE.search(text)
+    return hedge is None or hedge.start() > promise.start()
+
+
+def _plain(text: str) -> str:
+    return text.replace("’", "'").replace("‘", "'")
+
+
+def _normal(text: str) -> str:
+    """The text without case and with each run of spaces as one."""
+    return " ".join(_plain(text).casefold().split())
+
+
+def _without_read_back(sentence: str, read_back: tuple[str, ...]) -> str:
+    """The sentence, compared as `_normal` text, with each read-back text and each of its
+    sentences taken out; what is taken out is replaced by a mark no pattern spans."""
+    left = _normal(sentence)
+    for text in read_back:
+        for part in (text, *split_sentences([text])):
+            quoted = _normal(part)
+            if quoted:
+                left = left.replace(quoted, " ¶ ")
+    return left
+
+
+def _broken_rule(
+    text: str, state: CallState, said_before: str, read_back: tuple[str, ...]
+) -> OutputRule | None:
+    so_far = f"{said_before} {text}" if said_before else text
+    if state.verified_ssn4 is not None and says_digits(so_far, state.verified_ssn4):
         return OutputRule.SSN_LAST4
     if reads_as_nine_digits(text):
         return OutputRule.SSN_SHAPE
     if not (state.verified and state.office_open) and _carries_patient_data(text):
         return OutputRule.PHI_OUTSIDE_GATE
-    if _ADVICE.search(text):
+    words = _without_read_back(text, read_back) if read_back else text
+    if _ADVICE.search(words):
         return OutputRule.MEDICAL_ADVICE
-    if _REFILL.search(text) and _PROMISE.search(text):
+    if _promises(words):
         return OutputRule.REFILL_PROMISE
     return None
 
 
-def guard_output(sentence: str, state: CallState) -> Block | None:
-    """The block for one sentence of the model's, or None when it may be said."""
-    rule = _broken_rule(sentence.replace("’", "'").replace("‘", "'"), state)
+def guard_output(
+    sentence: str,
+    state: CallState,
+    *,
+    said_before: str = "",
+    read_back: tuple[str, ...] = (),
+) -> Block | None:
+    """The block for one sentence of the model's, or None when it may be said. `said_before`
+    is what this reply has said already; `read_back` the texts a tool gave the model this turn
+    to read back to the caller."""
+    rule = _broken_rule(_plain(sentence), state, _plain(said_before), read_back)
     return None if rule is None else Block(rule=rule, script=INSTEAD[rule])
 
 
 # --- sentences --------------------------------------------------------------------------
 
-# A sentence's end: its marks, any closing quote or bracket, and the space after them. Whether
-# it ends the sentence is decided once the next character is known. A match starts only where
-# a run of marks starts, and takes the run whole, so a long run is read once.
-_END = re.compile(r"(?<![.!?])[.!?]++[\"')\]”’]*+\s+")
-_END_CHARACTERS = frozenset(".!?\"')]”’")
+# What may close a sentence after its marks: quotes and brackets.
+_CLOSERS = frozenset("\"')]”’")
 # Titles before a name: "Dr. Patel" is one sentence.
 _TITLES = frozenset({"dr", "mr", "mrs", "ms", "mx", "prof", "rev"})
+# Where the reading is: in text, in a run of marks (. ! ?), in the closers after them, or in
+# the space after those, waiting for the next character to decide.
+_TEXT, _MARKS, _CLOSING, _AFTER = range(4)
 
 
-def _ends_sentence(text: str, end: re.Match[str]) -> bool:
-    """Whether the marks end a sentence, given the character after their space. "?" and "!"
-    always do. A full stop does not before a lower-case letter ("a.m. with"), after a title
-    ("Dr. Patel") or after a single capital letter (an initial)."""
-    if "?" in end[0] or "!" in end[0]:
+def _ends(asks: bool, word: str, following: str) -> bool:
+    """Whether a run of marks ends a sentence, given the first character after its space. "?"
+    and "!" always do. A full stop does not before a lower-case letter ("a.m. with"), after a
+    title ("Dr. Patel") or after a single capital letter (an initial)."""
+    if asks:
         return True
-    if text[end.end()].islower():
+    if following.islower():
         return False
-    start = end.start()
-    while start and text[start - 1].isalpha():
-        start -= 1
-    word = text[start : end.start()]
     return word.lower() not in _TITLES and not (len(word) == 1 and word.isupper())
 
 
 def split_sentences(pieces: Iterable[str]) -> Iterator[str]:
     """Each complete sentence of the text the pieces make, in order, stripped, as soon as it is
     known to be complete; whatever is left is flushed when the pieces end. Empty sentences are
-    left out."""
-    pending = ""
-    start = 0
-    # Where the search for the next end starts: no end can begin before it.
-    position = 0
+    left out. Each character is read once, however the text is cut into pieces."""
+    sentence: list[str] = []
+    where = _TEXT
+    # The run of marks: whether it holds "?" or "!", and the letters just before it.
+    asks = False
+    word = ""
+    # Where the letters at the end of the sentence so far start.
+    letters_from = 0
     for piece in pieces:
-        pending = pending[start:] + piece
-        position -= start
-        start = 0
-        while (end := _END.search(pending, position)) is not None:
-            if end.end() == len(pending):
-                # The character after the space has not come yet.
-                position = end.start()
-                break
-            if _ends_sentence(pending, end):
-                sentence = pending[start : end.end()].strip()
-                if sentence:
-                    yield sentence
-                start = end.end()
-            position = end.end()
-        else:
-            # Marks at the very end may start an end once more text comes.
-            position = len(pending)
-            while position > start and pending[position - 1] in _END_CHARACTERS:
-                position -= 1
-    rest = pending[start:].strip()
+        for char in piece:
+            if where == _AFTER and not char.isspace():
+                if _ends(asks, word, char):
+                    done = "".join(sentence).strip()
+                    if done:
+                        yield done
+                    sentence = []
+                where = _TEXT
+            if char in ".!?":
+                if where != _MARKS:
+                    after_letter = bool(sentence) and sentence[-1].isalpha()
+                    word = "".join(sentence[letters_from:]) if after_letter else ""
+                    asks = False
+                    where = _MARKS
+                asks = asks or char != "."
+            elif char in _CLOSERS and where in (_MARKS, _CLOSING):
+                where = _CLOSING
+            elif char.isspace() and where in (_MARKS, _CLOSING, _AFTER):
+                where = _AFTER
+            else:
+                where = _TEXT
+            if char.isalpha() and not (sentence and sentence[-1].isalpha()):
+                letters_from = len(sentence)
+            sentence.append(char)
+    rest = "".join(sentence).strip()
     if rest:
         yield rest
 
 
-def guard_reply(pieces: Iterable[str], state: CallState) -> GuardedReply:
+def guard_reply(
+    pieces: Iterable[str], state: CallState, *, read_back: tuple[str, ...] = ()
+) -> GuardedReply:
     """A reply's sentences while each passes `guard_output` and the reply, its sentences joined
     by a space, stays within MAX_REPLY_CHARACTERS. The first blocked sentence ends it: it is not
-    said and nothing after it is read."""
+    said and nothing after it is read. `read_back` is as for `guard_output`."""
     said: list[str] = []
     length = -1
     for sentence in split_sentences(pieces):
         length += 1 + len(sentence)
         if length > MAX_REPLY_CHARACTERS:
             break
-        block = guard_output(sentence, state)
+        block = guard_output(sentence, state, said_before=" ".join(said), read_back=read_back)
         if block is not None:
             return GuardedReply(said=tuple(said), block=block)
         said.append(sentence)

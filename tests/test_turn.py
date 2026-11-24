@@ -9,14 +9,14 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, VOICE_SECRETS, offline_settings
 from httpx2 import AsyncClient, MockTransport, Request, Response
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.claims import ClaimKeys
 from app.agent.model import (
@@ -740,7 +740,7 @@ async def test_blocked_text_goes_nowhere(
     assert result.hand_off is False
 
     await agent.handle("No, thanks.")
-    await agent.settle()
+    await agent.finish_audits()
     # The conversation has what was said, never the blocked text or what came after it.
     sent = everything_sent(model)
     for blocked in (marker, "stop taking", "Then call us back"):
@@ -798,11 +798,107 @@ async def test_two_blocks_hand_off(
         f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
         f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
     ]
-    await agent.settle()
+    await agent.finish_audits()
     assert (
         rows_with_reasons(owner_engine)
         == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
     )
+
+
+QUESTION = "Should I stop taking my Lisinopril because of the headaches?"
+
+
+async def test_a_message_read_back_is_said(deps: Deps, registry: Registry) -> None:
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry)
+    await verified(agent, model)
+    read_back = f"Your message to Dr. Patel reads: {QUESTION} Shall I send it?"
+    model.then(
+        calls(("send_message_to_doctor", {"summary_short": QUESTION})),
+        says(read_back),
+        says(read_back),
+    )
+
+    first = await agent.handle("Ask my doctor if I should stop my Lisinopril for the headaches.")
+
+    # The tool returned the caller's own words to be read back: they are said.
+    assert (first.lines, first.withheld, first.hand_off) == ((read_back,), None, False)
+    assert tool_results(model.requests[-1])[0]["content"]["data"] == {
+        "status": "needs_confirmation",
+        "message": QUESTION,
+    }
+    # In a later turn, with no read-back from a tool, the same words are the model's own.
+    second = await agent.handle("Sorry, what was that?")
+    assert (second.lines, second.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
+    await agent.finish_audits()
+
+
+async def test_a_first_sentence_over_the_bound_falls_back(
+    offline_deps: Deps, registry: Registry, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    model = ScriptedModel(says("A" * 600 + ". Short one."))
+    agent = agent_for(model, offline_deps, registry)
+
+    result = await agent.handle("Hello.")
+
+    assert (result.lines, result.withheld, result.hand_off) == ((FALLBACK,), None, False)
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("model_")] == [
+        f"model_fallback call_id={agent.state.call_id} reason=reply_too_long failures=1"
+        " hand_off=False"
+    ]
+
+
+class Unreachable:
+    """Sessions from a database that cannot be reached."""
+
+    def __call__(self) -> AsyncSession:
+        raise ConnectionRefusedError("the database is down")
+
+
+class Hanging:
+    """Sessions that never open."""
+
+    def __call__(self) -> "Hanging":
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        await asyncio.Event().wait()
+        raise AssertionError("a session that never opens does not open")
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.mark.parametrize("sessions", [Unreachable, Hanging], ids=["failed", "cancelled"])
+async def test_guard_audit_failures_are_logged(
+    registry: Registry, caplog: pytest.LogCaptureFixture, sessions: type[Unreachable | Hanging]
+) -> None:
+    caplog.set_level(logging.INFO)
+    deps = Deps(
+        sessions=cast("async_sessionmaker[AsyncSession]", sessions()),
+        audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
+        now=lambda: T0,
+        claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+    )
+    state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
+    agent = CallAgent(state, deps, ScriptedModel(says("It's probably just a cold.")), registry)
+
+    result = await agent.handle("I feel sick.")
+    # The block stands whatever becomes of its audit event.
+    assert (result.lines, result.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
+
+    # At the end of the call: a write that cannot finish in time is cancelled, and logged.
+    await agent.finish_audits(timeout=0.05)
+    expected = {
+        Unreachable: "guard_audit_failed call_id={} rule=medical_advice"
+        " error=ConnectionRefusedError",
+        Hanging: "guard_audit_cancelled call_id={} rule=medical_advice",
+    }[sessions].format(FIXED_CALL_ID)
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_audit")] == [
+        expected
+    ]
+    assert "database is down" not in caplog.text
 
 
 # --- R10 --------------------------------------------------------------------------------

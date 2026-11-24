@@ -1206,7 +1206,7 @@ def test_ssn_patterns_have_one_owner() -> None:
         "spoken_digits",
     }
     assert imports_from(sources[OUTPUT_GUARD], "app.guard.mask") >= {
-        "mask_known_digits",
         "reads_as_nine_digits",
         "says_a_number",
+        "says_digits",
     }

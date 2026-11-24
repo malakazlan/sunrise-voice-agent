@@ -17,7 +17,7 @@ from app.agent.scripts import SCRIPTS, ScriptId
 from app.agent.state import CallState, IdentityClaim, Phase, SsnStep, apply, move, new_call, verify
 from app.agent.tool_registry import FAILED_MESSAGE, REFUSED_MESSAGE
 from app.db.seed import load_seed_data
-from app.guard.output import INSTEAD, guard_output, guard_reply, split_sentences
+from app.guard.output import INSTEAD, GuardedReply, guard_output, guard_reply, split_sentences
 from app.voice.calls import CallRegistry
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
@@ -91,7 +91,7 @@ def test_the_line_said_instead() -> None:
         "ssn_shape": "fallback",
         "phi_outside_gate": "fallback",
         "medical_advice": "advice_refusal",
-        "refill_promise": "refill_sent",
+        "refill_promise": "refill_no_promise",
     }
     # The rules in the order they are checked.
     assert [name.value for name in INSTEAD] == [
@@ -129,8 +129,27 @@ def test_verified_last_four_is_blocked() -> None:
         # In the middle of a sentence, and at its end.
         f"Thanks, so {LAST_FOUR} matches and you're all set.",
         f"Got it, {LAST_FOUR}.",
+        # Groups joined across commas, dashes of any length, "and", and um or uh.
+        "I have thirty-three, forty-four on file.",
+        f"I have {FIRST_PAIR}, {SECOND_PAIR} on file.",
+        f"I have {FIRST_PAIR} – {SECOND_PAIR} on file.",
+        f"I have {FIRST_PAIR}—{SECOND_PAIR} on file.",
+        f"I have {FIRST_PAIR} and {SECOND_PAIR} on file.",
+        f"I have {FIRST_PAIR}, um, {SECOND_PAIR} on file.",
+        "I have thirty-three uh forty-four on file.",
     ]
     assert mismatches([(sentence, "ssn_last4") for sentence in said], SARAH) == []
+
+    # The reply so far: two sentences that each say half are blocked at the second.
+    split = guard_reply([f"Your last four are {FIRST_PAIR}. {SECOND_PAIR}. Anything else?"], SARAH)
+    assert split.said == (f"Your last four are {FIRST_PAIR}.",)
+    assert split.block is not None
+    assert split.block.rule.value == "ssn_last4"
+    # A limit, pinned: the cardinal reading is not read as the four digits.
+    assert rule("I have three thousand three hundred forty-four on file.", SARAH) is None
+    # Said next to other numbers it is still said; inside a longer number it is not.
+    assert rule(f"It's {LAST_FOUR} and 10 more.", SARAH) == "ssn_last4"
+    assert rule(f"The order number is {'1' + LAST_FOUR + '5'}.", SARAH) is None
 
     # Another patient's own digits, in words.
     michael = verified_as("P002", "Michael", "10" + "20")
@@ -140,9 +159,6 @@ def test_verified_last_four_is_blocked() -> None:
     # Only the caller's own: the same digits for another caller, or before verification, pass.
     assert rule(f"I have {LAST_FOUR} on file.", michael) is None
     assert rule(f"I have {LAST_FOUR} on file.", UNVERIFIED) is None
-    # A known miss, pinned: a comma joins a run only between single digits (the mask module's
-    # reader), so two pairs in tens words with a comma between are two runs.
-    assert rule("I have thirty-three, forty-four on file.", SARAH) is None
 
     decision = guard_output(f"I have {LAST_FOUR} on file.", SARAH)
     assert decision is not None
@@ -164,7 +180,7 @@ def phone_forms(phone: str) -> list[str]:
         f"({area}) {exchange}-{line}",
         f"1-{phone}",
         f"+1 {area} {exchange} {line}",
-        f"{exchange}-{line}",
+        f"{area}, {exchange}, {line}",
         words,
     ]
 
@@ -183,6 +199,11 @@ def test_phone_readback_is_allowed() -> None:
         rows += [
             ("Your email is s a r a h dot j at example dot com.", None),
             ("I'll call you back at that number.", None),
+            # A known false positive, pinned: seven digits are no callback number, so the last
+            # four in them are said.
+            (f"I have your number as {patient['phone'][4:]}.", "ssn_last4"),
+            # Digits joined by "and" are no phone number.
+            (f"I have 555 201 and {patient['ssn_last4']}.", "ssn_last4"),
         ]
         assert mismatches(rows, state) == [], patient["id"]
 
@@ -224,6 +245,8 @@ def test_ssn_shapes_are_blocked() -> None:
             # A known miss, pinned: a comma joins a run only between single digits, so
             # comma-separated groups are three runs.
             (f"The number on file is {', '.join(NINE_PARTS)}.", None),
+            # "to", "for", "won" and "ate" are words here, not digits.
+            ("We have an opening from ten thirty to eleven thirty.", None),
         ]
         assert mismatches(rows, state) == [], state.verified
 
@@ -258,12 +281,6 @@ PHI = [
     "It is twenty milligrams.",
     "That's two tablets a day.",
     "That's 10 units at night.",
-    # A named medication with refill, prescription or medication.
-    "I can request a refill of Atorvastatin once you're verified.",
-    "Your Metformin prescription is on file.",
-    "Your medication list shows Albuterol.",
-    "Do you need a refill of Zoloft?",
-    "Is the refill for Lisinopril or Metformin?",
 ]
 
 # The same kinds of words without patient data: allowed in every state.
@@ -279,23 +296,27 @@ NOT_PHI = [
     "Please spell your last name for me.",
     "Thank you, Sarah.",
     "Is this a refill for a medication you take every day?",
-    # The clinic's doctors and its days are not drug names.
     "Dr. Lee can review your refill request on Monday once you're verified.",
+    # Names, pharmacies and drug names next to refill, prescription or medication: before
+    # verification it is what the caller said (the gate keeps the record from the model).
+    "Okay, Michael, I can help with a refill once I verify your identity.",
+    "Sure, Sarah, I can help with your refill once you're verified.",
+    "I can send your refill to CVS Main St once I verify your identity.",
+    "Thanks, Maria, I'll need to verify you before I look at your prescription.",
+    "I can help with your Lisinopril refill once I verify your identity.",
+    "I can request a refill of Atorvastatin once you're verified.",
+    "Do you need a refill of Zoloft?",
+    "Is the refill for lisinopril?",
 ]
 
 # Known false positives, pinned: harmless sentences the pattern rules block outside the gate.
 PHI_FALSE_POSITIVES = [
-    # A caller's name next to "refill" reads as a drug-like token.
-    "Sure, Sarah, I can help with your refill once you're verified.",
     # A status word next to "results" reads as a lab status.
     "Once you're verified, I can check whether your results are ready.",
 ]
 
 # Known misses, pinned: patient data the patterns do not see.
 PHI_MISSES = [
-    # A drug name as the sentence's first word, or in lower case.
-    "Lisinopril refills need verification first.",
-    "Is the refill for lisinopril?",
     # A dosage without a number next to its unit.
     "You take half a tablet.",
 ]
@@ -354,6 +375,16 @@ ADVICE = [
     "It's safe to take ibuprofen with that.",
     "Dizziness is a common side effect of Lisinopril.",
     "Nausea is one of the side effects of Metformin.",
+    "I'd recommend you take it with food.",
+    "You can take ibuprofen for that.",
+    "It could be a sinus infection.",
+    "That sounds like a migraine.",
+    "You likely have a cold.",
+    "It's fine to take them together.",
+    "It's okay to take it at night.",
+    "It's safe to take two.",
+    "It's okay to skip a dose.",
+    "Hold off on taking it until you talk to your doctor.",
 ]
 
 NOT_ADVICE = [
@@ -375,12 +406,21 @@ NOT_ADVICE = [
     "It sounds like you'd like to book an appointment.",
     "If this is an emergency, you should hang up and call 911.",
     "I'm not able to give medical advice.",
+    "You may have a copay at your visit.",
+    "You might have a message from our office.",
+    "I'd suggest trying our patient portal.",
+    "It's normal for lab results to take a few days.",
+    "It's probably in your spam folder.",
+    "You should take your insurance card to the visit.",
+    "You should take a moment to find your insurance card.",
+    "You can take your time.",
+    "It could be a few days before we hear back.",
+    "That sounds like a good plan.",
+    "You probably have your insurance card handy.",
 ]
 
 # Known false positives, pinned: ordinary sentences an advice phrase blocks.
 ADVICE_FALSE_POSITIVES = [
-    "You should take a moment to find your insurance card.",
-    "You probably have your insurance card handy.",
     "I can't tell you about the side effects of that medication.",
 ]
 
@@ -418,6 +458,10 @@ PROMISES = [
     "The pharmacy says your refill is ready.",
     "Your prescription has been filled.",
     "Your prescriptions have been filled.",
+    "Your refill will be ready tomorrow.",
+    "Your medication is all set.",
+    "Your Lisinopril has been refilled.",
+    "It's been approved, so your prescription is on its way.",
 ]
 
 NOT_PROMISES = [
@@ -427,19 +471,38 @@ NOT_PROMISES = [
     "Your doctor will review the refill request.",
     "Your lab results are ready.",
     "I'll let the pharmacy know about your prescription.",
+    # Not a promise: the word is asked about, waited for or denied.
+    "I can't see whether your refill has been approved.",
+    "Your doctor will decide whether the refill is approved.",
+    "I don't know if your prescription is ready.",
+    "Once your refill is approved, the pharmacy will text you.",
+    "Refills must be approved by your doctor.",
+    "Your refill request is ready to send; shall I submit it?",
+    "Your prescription is not approved yet.",
+    "When your prescription is ready, the pharmacy will call you.",
 ]
-
-PROMISE_FALSE_POSITIVES = ["Refills must be approved by your doctor."]
 
 
 def test_refill_promise() -> None:
-    rows: Rows = [(s, "refill_promise") for s in PROMISES + PROMISE_FALSE_POSITIVES]
+    rows: Rows = [(s, "refill_promise") for s in PROMISES]
     rows += [(s, None) for s in NOT_PROMISES]
     assert mismatches(rows, SARAH) == []
     assert rule(PROMISES[0], UNVERIFIED) == "refill_promise"
     decision = guard_output(PROMISES[0], SARAH)
     assert decision is not None
-    assert decision.script is ScriptId.REFILL_SENT
+    assert decision.script is ScriptId.REFILL_NO_PROMISE
+    # The review's reply: an honest denial, said whole.
+    denial = (
+        "I can't see whether your refill has been approved. I can send a request to your"
+        " doctor if you'd like."
+    )
+    assert guard_reply([denial], SARAH) == GuardedReply(
+        said=(
+            "I can't see whether your refill has been approved.",
+            "I can send a request to your doctor if you'd like.",
+        ),
+        block=None,
+    )
 
 
 # --- R7 -------------------------------------------------------------------------------------
@@ -488,6 +551,21 @@ ANSWERS = [
 ]
 
 
+# A first-time caller booking: never verified.
+NEW_PATIENT = move(intake(), Phase.BOOKING)
+
+# What the model says with booking's tool results (app/agent/booking.py), written by hand.
+BOOKING_ANSWERS = [
+    "I have Dr. Patel on Wednesday, November 25 at 9:30 AM, or Dr. Lee on Thursday,"
+    " November 26 at 10:00 AM.",
+    "Dr. Patel on Wednesday, November 25 at 9:30 AM. Shall I book it?",
+    "You're booked with Dr. Patel on Wednesday, November 25 at 9:30 AM.",
+    "I have your email as A N N dot E X at example dot com.",
+    "I have your phone number as 555-410-2233.",
+    "That time was just taken. Would you like another one?",
+]
+
+
 def seed_states() -> dict[str, CallState]:
     return {
         patient["id"]: verified_as(patient["id"], patient["first_name"], patient["ssn_last4"])
@@ -507,15 +585,22 @@ def test_real_answers_pass() -> None:
         guarded = guard_reply([reply], states[patient_id])
         assert (guarded.said, guarded.block) == (sentences or (reply,), None), reply
 
-    for state in [*states.values(), UNVERIFIED, CLOSED]:
+    for state in [*states.values(), UNVERIFIED, CLOSED, NEW_PATIENT]:
         first_name = state.patient_first_name or "Sarah"
         for line in every_line_said_to_the_model(first_name):
             guarded = guard_reply([line], state)
             assert guarded.block is None, (line, guarded.block)
             assert " ".join(guarded.said) == line
 
-    # A known false positive, pinned: a year or a time said in words that reads as the caller's
-    # own last four is blocked. A time in numerals with a colon is two runs and passes.
+    # Booking's answers, for a verified caller and for a first-time caller.
+    for state in (states["P001"], NEW_PATIENT):
+        for reply in BOOKING_ANSWERS:
+            guarded = guard_reply([reply], state)
+            assert (" ".join(guarded.said), guarded.block) == (reply, None), reply
+
+    # A year in numerals, or a time in words, that reads as the caller's own last four is
+    # blocked: a known false positive, pinned. A time in numerals with a colon is two runs and
+    # passes.
     year_caller = verified_as("P001", "Sarah", "20" + "26")
     time_caller = verified_as("P001", "Sarah", "10" + "30")
     assert rule(
@@ -526,6 +611,55 @@ def test_real_answers_pass() -> None:
         "ssn_last4"
     )
     assert rule("Your appointment is at 10:30 AM with Dr. Patel.", time_caller) is None
+
+
+# The caller's own message to the doctor, as send_message_to_doctor returns it to be read back.
+QUESTION = "Should I stop taking my Lisinopril because of the headaches?"
+READ_BACK = f"Your message to Dr. Patel reads: {QUESTION} Shall I send it?"
+
+
+def test_a_message_read_back_passes() -> None:
+    # The message the tool returned is not the model's advice; the rest of the reply is.
+    assert guard_reply([READ_BACK], SARAH, read_back=(QUESTION,)) == GuardedReply(
+        said=(f"Your message to Dr. Patel reads: {QUESTION}", "Shall I send it?"), block=None
+    )
+    # Compared ignoring case and repeated spaces, with the message in quotes, or as two
+    # sentences of a longer message.
+    loose = f'Your message reads: "{QUESTION.lower().replace(" ", "  ")}" Shall I send it?'
+    assert guard_reply([loose], SARAH, read_back=(QUESTION,)).block is None
+    two = "I have headaches. Should I stop taking it?"
+    assert (
+        guard_reply([f"Your message reads: {two} Shall I send it?"], SARAH, read_back=(two,)).block
+        is None
+    )
+
+    # Without the read-back, or outside it, the advice rule applies.
+    plain = guard_reply([READ_BACK], SARAH)
+    assert plain.block is not None
+    assert plain.block.rule.value == "medical_advice"
+    outside = guard_reply([f"{READ_BACK} You should stop taking it."], SARAH, read_back=(QUESTION,))
+    assert outside.block is not None
+    assert outside.block.rule.value == "medical_advice"
+    # A paraphrased read-back may still be blocked: a known false positive, pinned.
+    paraphrase = "Your message asks whether you should stop taking your Lisinopril."
+    assert guard_output(paraphrase, SARAH, read_back=(QUESTION,)) is not None
+    # A refill promise inside the read-back passes too.
+    promise = "Is my refill approved?"
+    assert guard_output(f"Your message reads: {promise}", SARAH, read_back=(promise,)) is None
+
+    # The SSN rules and the outside-the-gate rule still see the whole sentence.
+    with_digits = f"Please call me about {LAST_FOUR}."
+    said = guard_output(f"Your message reads: {with_digits}", SARAH, read_back=(with_digits,))
+    assert said is not None
+    assert said.rule.value == "ssn_last4"
+    nine = f"My number is {'-'.join(NINE_PARTS)}."
+    shaped = guard_output(f"Your message reads: {nine}", SARAH, read_back=(nine,))
+    assert shaped is not None
+    assert shaped.rule.value == "ssn_shape"
+    owed = "Do I still owe $45.00?"
+    gated = guard_output(f"Your message reads: {owed}", UNVERIFIED, read_back=(owed,))
+    assert gated is not None
+    assert gated.rule.value == "phi_outside_gate"
 
 
 # --- R8 -------------------------------------------------------------------------------------
@@ -578,6 +712,8 @@ def test_sentences_and_blocking() -> None:
         ("   \n ", []),
     ]
     assert [(text, list(split_sentences([text]))) for text, _ in rows] == rows
+    # Streamed a character at a time, the sentences are the same.
+    assert [(text, list(split_sentences(iter(text)))) for text, _ in rows] == rows
 
     # A blocked sentence: what came before it is said, it is replaced, the rest is dropped.
     guarded = guard_reply(["Sure. You should skip ", "your next dose. Then call us back."], SARAH)
@@ -614,7 +750,6 @@ OUTPUT_IMPORTS = {
     "types",
     "app.agent.scripts",
     "app.agent.state",
-    "app.domain.clinic",
     "app.guard.mask",
 }
 
@@ -641,6 +776,9 @@ readers = [
     lambda text: guard_output(text, start),
     lambda text: list(split_sentences([text])),
     lambda text: guard_reply([text], start),
+    # Streamed, a character at a time.
+    lambda text: list(split_sentences(iter(text))),
+    lambda text: guard_reply(iter(text), verified),
 ]
 timings = []
 for text in json.load(sys.stdin):
@@ -698,5 +836,5 @@ def test_guard_is_pure_and_linear() -> None:
     except subprocess.TimeoutExpired:
         raise AssertionError(f"the guard took over {MEASURE_TIMEOUT_SECONDS} s") from None
     timings = json.loads(measured.stdout)
-    assert len(timings) == 4 * len(texts)
+    assert len(timings) == 6 * len(texts)
     assert max(timings) < LINEAR_BOUND_SECONDS, max(timings)

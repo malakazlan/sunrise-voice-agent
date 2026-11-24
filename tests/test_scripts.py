@@ -57,7 +57,11 @@ LINES = [
         "I'm not able to give medical advice. I can send a message to your doctor instead.",
         True,
     ),
-    ("refill_sent", "Your request has been sent to our team.", True),
+    (
+        "refill_no_promise",
+        "I'm not able to confirm that a refill is approved. I can send the request to our team.",
+        True,
+    ),
 ]
 
 
