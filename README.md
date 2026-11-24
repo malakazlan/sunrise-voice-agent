@@ -246,8 +246,8 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
 - `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch, the
   connection state, the ICE candidate types in use, and one entry per turn: what the model was
   given (the guard's text, or "(not shown to the assistant)" for a swallowed or emergency
-  turn), the lines said, the timings and whether a hand-off was asked for. The server's text
-  is written as text, never as markup.
+  turn), the lines said, the output guard's rule when it withheld part of a reply, the timings
+  and whether a hand-off was asked for. The server's text is written as text, never as markup.
 - `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
   shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
 - `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.
@@ -307,7 +307,8 @@ each turn's result to the call page over the data channel. Nothing is spoken bac
 Limits of this slice:
 
 - No voice out yet: replies are text on the page.
-- No output guard yet: the model's text reaches the page unchecked. All data is synthetic.
+- The model's text reaches the page through the output guard (see "Output guard" below). All
+  data is synthetic.
 - Booking, messages, transfer and call end are not wired; the hand-off signal is shown and
   nothing acts on it. The guard's flags (an attempt to override the instructions, a request
   about someone else) are not passed to the model.
@@ -544,6 +545,59 @@ name, message text, balance or status reaches the audit log or the logs.
     such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
     four five six seven eight nine`) is not masked.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
+
+### Output guard
+
+Every sentence of the model's own answer is checked in code before it is returned
+(`app/guard/output.py`, pure: no database, network or clock). Scripted lines are code's and are
+not checked. The rules, in order; the first that matches blocks the sentence:
+
+| Rule | Blocks | Said instead |
+|---|---|---|
+| `ssn_last4` | a run of digits, numerals or words, grouped or not, equal to the caller's verified last four; a longer run that holds them (a phone number) passes | `fallback` |
+| `ssn_shape` | a run that reads as nine digits, in any grouping, verified or not, inside letters too | `fallback` |
+| `phi_outside_gate` | before verification or with the office closed: a money amount (`$`, dollars, cents, or balance/owe with a number), a lab status (labs or results with ready, pending, came back, no recent ...), a dosage (a number before mg, mcg, ml, units, tablets, pills, capsules), or refill/prescription/medication with a capitalised word that is not the sentence's first nor one of the clinic's own words | `fallback` |
+| `medical_advice` | "you should take/stop/start/increase/decrease/double/skip", "stop taking", "don't take", "it's probably" (not "probably best"), "it sounds like you have", "you may/might/probably have" (not "have to", "have received" ...), "that's normal", "nothing to worry about", "I recommend/suggest taking/trying", "safe to take", "side effects of" | `advice_refusal` |
+| `refill_promise` | refill or prescription in the same sentence as approved, is/are ready, has been filled | `refill_sent` |
+
+- Digits are read by the mask module (`app/guard/mask.py`), the one owner of the SSN patterns,
+  the same reader the input guard uses.
+- Sentences are split as the text comes (`split_sentences`): a sentence is released only once
+  the character after its end is known, so a blocked sentence is never partly shown. A full
+  stop before a lower-case letter (`a.m. with`), after a title (`Dr.`, `Mr.`, `Mrs.`, `Ms.`) or
+  after a single capital letter does not end a sentence; `10:30 AM. Is ...` does. Text with no
+  end is flushed at the end of the reply. A reply is cut at the last complete sentence within
+  600 characters; a first sentence longer than that gives the fallback line.
+- In the turn: what passed is said; a blocked sentence is replaced by its line and the rest of
+  the reply is dropped. The blocked text never enters the conversation, a log line or the audit
+  log. Each block writes `guard_block` (resource `call`, outcome `refused`, the rule's name as
+  the reason) in a task of its own after the reply, so the reply never waits on the database;
+  if it cannot be written the failure is logged (`guard_audit_failed`) and the block stands.
+  Two blocked replies in a row raise the hand-off signal; a model reply said in full starts the
+  count again. The page shows a blocked turn as the line said plus "(a reply was withheld:
+  <rule>)".
+
+Limits of the output guard:
+
+- The gate, not this guard, is what keeps patient data from unverified callers: before
+  verification the model has no patient data to say. This guard is the last check, and its
+  patient-data, advice and refill rules are patterns: they cannot catch every phrasing of
+  advice, a diagnosis or a promise, and they block some harmless sentences. Pinned in the
+  tests as known false positives: "You should take a moment to ...", "You probably have your
+  insurance card handy", "I can't tell you about the side effects of ...", "Refills must be
+  approved by your doctor", a caller's name in a refill sentence before verification ("Sure,
+  Sarah, I can help with your refill ..."), "whether your results are ready" before
+  verification, and a year or a time said in words that reads as the caller's last four
+  ("ten thirty" for 1030).
+- Missed by design of the patterns: a drug name as a sentence's first word, or in lower case,
+  before verification; a dosage said without a number word or numeral next to its unit ("half a
+  tablet"); advice phrased any other way ("Try ibuprofen").
+- Digit reading follows the mask module: groups joined by a comma are one run only between
+  single digits, so "thirty-three, forty-four" is two runs and passes `ssn_last4`, and an SSN
+  written "123, 45, 6789" is not one run of nine.
+- A verified caller's last four is only known when they gave it on this call; a sentence that
+  says another patient's digits passes `ssn_last4` (the model never has them: tools act on the
+  caller's own record only).
 
 ## Configuration
 
