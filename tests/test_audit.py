@@ -66,8 +66,7 @@ LOCK_WAITERS = text(
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
     " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
 )
-# Owner-level ways to make an INSERT store nothing, created past the table's protection.
-SWALLOW_BY_RULE = "CREATE RULE swallow AS ON INSERT TO audit_events DO INSTEAD NOTHING"
+# An owner-level way to make an INSERT store nothing, created past the table's protection.
 SWALLOW_BY_TRIGGER = (
     "CREATE FUNCTION swallow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
     "CREATE TRIGGER swallow BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION swallow()",
@@ -465,6 +464,29 @@ async def test_deleted_event_is_detected(
     assert await verified(audit, session) == broken(checked, *breaks)
 
 
+async def test_first_event_must_follow_zeros(
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+) -> None:
+    # Only a key holder can write this: event 1 with a genuine MAC that does not start from
+    # 64 zeros. Its position is right; its link is not.
+    genesis = ChainRow(
+        seq=1,
+        ts=T0,
+        call_id=cid(1),
+        actor="agent",
+        action="call_started",
+        resource_type="call",
+        resource_id=cid(1),
+        outcome="success",
+        reason=None,
+        prev_mac="ab" * 32,
+    )
+    values = {name: getattr(genesis, name) for name in ROW_COLUMNS[:-1]}
+    tamper_with_audit_events(sync_engine, (INSERT_ROW.text, {**values, "mac": audit._mac(genesis)}))
+
+    assert await verified(audit, session) == broken(1, (1, WRONG_START))
+
+
 REORDERINGS = {
     # Both moved rows fail their MAC; event 4 then follows the wrong neighbour.
     "swap": (
@@ -799,8 +821,9 @@ async def test_action_fails_when_the_insert_is_redirected(
 ) -> None:
     tamper_with_audit_events(sync_engine, *REDIRECT_BY_RULE)
 
+    # The rule returns the row, so only the read-back can tell.
     await session.execute(INSERT_PATIENT)
-    with pytest.raises(RuntimeError, match="not stored"):
+    with pytest.raises(RuntimeError, match="not in audit_events"):
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 
@@ -809,21 +832,16 @@ async def test_action_fails_when_the_insert_is_redirected(
         assert connection.execute(text("SELECT count(*) FROM audit_sink")).scalar_one() == 0
 
 
-@pytest.mark.parametrize("swallow", ["rule", "trigger"])
 async def test_action_fails_when_the_insert_is_swallowed(
-    audit: AuditLog,
-    session: AsyncSession,
-    sync_engine: Engine,
-    tamper_with_audit_events: Tamper,
-    swallow: str,
+    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
-    if swallow == "rule":
-        tamper_with_audit_events(sync_engine, SWALLOW_BY_RULE)
-    else:
-        tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
+    # A trigger that returns NULL makes the INSERT store nothing and return nothing; the
+    # RETURNING check sees it first. (A DO INSTEAD NOTHING rule needs no test of its own:
+    # Postgres refuses INSERT ... RETURNING on such a table before append's checks run.)
+    tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
 
     await session.execute(INSERT_PATIENT)
-    with pytest.raises((RuntimeError, DBAPIError)):
+    with pytest.raises(RuntimeError, match="returned no row"):
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 

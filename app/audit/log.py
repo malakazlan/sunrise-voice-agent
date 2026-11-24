@@ -389,11 +389,11 @@ class AuditLog:
             )
             # A rule or trigger can make an INSERT store nothing without an error.
             if written.scalars().all() != [seq]:
-                raise RuntimeError("the audit event was not stored")
+                raise RuntimeError("the audit event was not stored: the INSERT returned no row")
             # A rule can also send the row elsewhere and still return it: read it back.
             stored = await session.execute(select(AuditEvent.mac).where(AuditEvent.seq == seq))
             if stored.scalars().all() != [mac]:
-                raise RuntimeError("the audit event was not stored")
+                raise RuntimeError("the audit event was not stored: it is not in audit_events")
         except BaseException:
             try:
                 await _roll_back_to_the_end(session)
