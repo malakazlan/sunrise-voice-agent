@@ -141,8 +141,8 @@ def _mask_line(line: str) -> str:
     masked = _IDENTIFIER.sub(_replace, line)
     if len(masked) <= MAX_LENGTH:
         return masked
-    # Masking made the line longer. It is cut again, back to the end of a run of letters or
-    # digits, so that no match can end at the cut.
+    # Masking made the line longer. It is cut again, before any run of letters or digits that
+    # the cut would split, so that no match can end at the cut.
     end = MAX_LENGTH - len(CUT_MARKER)
     while end and masked[end - 1].isalnum():
         end -= 1
