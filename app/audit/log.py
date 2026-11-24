@@ -35,13 +35,13 @@ Identifiers
       version digit 4 and its variant 8, 9, a or b checked, as app/voice/calls.py gives each
       call (`uuid.uuid4().hex`).
     - the id of a `patient`: `P` and 3 to 6 digits, as the seed data has them (`P001`).
-    - the id of an `appointment`, `medication` or `slot`: the row's number, 1 to 8 digits, no
-      leading zero.
+    - the id of an `appointment`, `medication`, `slot`, `request`, `message` or
+      `audit_event`: the row's number (an event's seq), 1 to 8 digits, no leading zero.
     - the id of a `tool`: its registered name, 2 to 40 lower-case letters and underscores, as
       app/agent/tool_registry.py declares tools. A name the model gives that is not a
       registered tool is never recorded.
     - `actor`: `agent`, or `admin:` and a user name of 1 to 32 letters and underscores,
-      starting with a letter.
+      starting with a letter (ADMIN_NAME, which ADMIN_USER is held to as well).
 
     The shapes limit what an identifier can look like, not what it can mean: a patient id, a
     row id and the digits inside a call id can coincide with other numbers, such as part of a
@@ -75,6 +75,7 @@ from pydantic import SecretStr
 from sqlalchemy import BigInteger, and_, case, cast, extract, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import ADMIN_NAME
 from app.db.models import AuditEvent
 from app.db.session import in_database_transaction
 
@@ -93,7 +94,6 @@ CHAIN_LOCK = int.from_bytes(b"audit", "big")
 
 AGENT = "agent"
 ADMIN_PREFIX = "admin:"
-ADMIN_NAME = re.compile(r"[A-Za-z][A-Za-z_]{0,31}")
 CALL_ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}")
 PATIENT_ID = re.compile(r"P[0-9]{3,6}")
 ROW_ID = re.compile(r"[1-9][0-9]{0,7}")
@@ -117,6 +117,10 @@ class Action(StrEnum):
     LAB_STATUS_READ = "lab_status_read"
     BALANCE_READ = "balance_read"
     DOCTOR_MESSAGE_SENT = "doctor_message_sent"
+    ADMIN_READ_REQUESTS = "admin_read_requests"
+    ADMIN_READ_MESSAGES = "admin_read_messages"
+    ADMIN_READ_AUDIT = "admin_read_audit"
+    ADMIN_VERIFY_AUDIT = "admin_verify_audit"
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
@@ -137,6 +141,9 @@ class ResourceType(StrEnum):
     MEDICATION = "medication"
     SLOT = "slot"
     TOOL = "tool"
+    REQUEST = "request"
+    MESSAGE = "message"
+    AUDIT_EVENT = "audit_event"
 
 
 # The shape of each resource type's ids.
@@ -147,6 +154,9 @@ ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
     ResourceType.MEDICATION: ROW_ID,
     ResourceType.SLOT: ROW_ID,
     ResourceType.TOOL: TOOL_NAME,
+    ResourceType.REQUEST: ROW_ID,
+    ResourceType.MESSAGE: ROW_ID,
+    ResourceType.AUDIT_EVENT: ROW_ID,
 }
 
 

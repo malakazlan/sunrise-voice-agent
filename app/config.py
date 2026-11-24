@@ -1,9 +1,17 @@
+import hmac
 import re
 import sys
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, ValidationError, ValidationInfo, field_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from sqlalchemy import URL
@@ -22,6 +30,8 @@ MIN_SECRET_LENGTH = 32
 # What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
 TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
+# LLM_MODEL: a Claude model id as Anthropic writes them, such as claude-haiku-5-5.
+CLAUDE_MODEL_ID = r"^claude-[a-z0-9][a-z0-9.-]{0,59}$"
 # The APP_DB_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_APP_DB_PASSWORD = "change-me-to-another-long-random-value"  # noqa: S105 (a published placeholder)
 # The runtime role's name goes into role set-up statements (app/db/roles.py), always quoted.
@@ -36,6 +46,8 @@ EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a publ
 EXAMPLE_IDENTITY_KEY = "change-me-to-a-long-random-identity-key"  # noqa: S105 (a published placeholder)
 # The audit key and the identity key, outside dev: at least this long, not their placeholder.
 MIN_AUDIT_KEY_LENGTH = 32
+# An admin's user name, as the audit log records it after `admin:` (app/audit/log.py).
+ADMIN_NAME = re.compile(r"[A-Za-z][A-Za-z_]{0,31}")
 HMAC_KEY_PLACEHOLDERS = {
     "audit_hmac_key": EXAMPLE_AUDIT_KEY,
     "identity_hash_key": EXAMPLE_IDENTITY_KEY,
@@ -227,6 +239,28 @@ class Settings(DatabaseSettings):
     demo_access_token: SecretStr | None = Field(
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
+    # The admin API's sign-in (app/api/admin.py). Without a password it is not mounted. The
+    # password comes first: the user's check reads it.
+    admin_password: SecretStr | None = None
+    admin_user: str | None = Field(default=None, validate_default=True)
+    # The vendors of a call: the model (app/agent/model.py) and speech-to-text
+    # (app/voice/pipeline.py). Without both keys a call is refused at set-up.
+    anthropic_api_key: SecretStr | None = Field(default=None, validate_default=True)
+    deepgram_api_key: SecretStr | None = Field(default=None, validate_default=True)
+    llm_model: str = Field(default="claude-haiku-5-5", pattern=CLAUDE_MODEL_ID)
+
+    @field_validator("anthropic_api_key", "deepgram_api_key")
+    @classmethod
+    def _vendor_key_outside_dev(
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        name = info.field_name or ""
+        if value is None:
+            if _outside_dev(info):
+                raise ValueError(f"{name} is required unless app_env is dev")
+            return None
+        _check_strong_secret(name, value, info)
+        return value
 
     @field_validator("audit_hmac_key", "identity_hash_key")
     @classmethod
@@ -298,6 +332,53 @@ class Settings(DatabaseSettings):
         else:
             _check_strong_secret("demo_access_token", value, info)
         return value
+
+    @field_validator("admin_password")
+    @classmethod
+    def _admin_password_is_strong(
+        cls, value: SecretStr | None, info: ValidationInfo
+    ) -> SecretStr | None:
+        if value is None:
+            return None
+        password = value.get_secret_value()
+        if not password:
+            raise ValueError("admin_password must not be empty")
+        if _outside_dev(info) and len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"outside dev admin_password needs at least {MIN_PASSWORD_LENGTH} characters"
+            )
+        _check_strong_secret("admin_password", value, info)
+        return value
+
+    @field_validator("admin_user")
+    @classmethod
+    def _admin_user_with_password(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            if info.data.get("admin_password") is not None:
+                raise ValueError("admin_user is required when admin_password is set")
+            return None
+        if not ADMIN_NAME.fullmatch(value):
+            raise ValueError(
+                "admin_user must be 1 to 32 letters and underscores, starting with a letter"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _admin_password_is_its_own(self) -> "Settings":
+        """The admin password is none of the other secrets: every SecretStr field, whatever
+        its name or place, compared in constant time and reported by field name only."""
+        if self.admin_password is None:
+            return self
+        password = self.admin_password.get_secret_value().encode("utf-8")
+        for name in type(self).model_fields:
+            other = getattr(self, name)
+            if (
+                name != "admin_password"
+                and isinstance(other, SecretStr)
+                and hmac.compare_digest(other.get_secret_value().encode("utf-8"), password)
+            ):
+                raise ValueError(f"admin_password must differ from {name}")
+        return self
 
 
 class StartupSettings(DatabaseSettings):

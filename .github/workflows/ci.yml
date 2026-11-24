@@ -145,7 +145,9 @@ jobs:
             TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
             DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
             AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 \
-            IDENTITY_HASH_KEY=ci-compose-only-identity-hash-key-0000001 UNRELATED_DECOY=1 > .env
+            IDENTITY_HASH_KEY=ci-compose-only-identity-hash-key-0000001 \
+            ANTHROPIC_API_KEY=ci-compose-only-fake-anthropic-key-0001 \
+            DEEPGRAM_API_KEY=ci-compose-only-fake-deepgram-key-00001 UNRELATED_DECOY=1 > .env
       - name: Smoke test through Compose
         run: |
           . .github/ci-wait.sh
@@ -156,6 +158,10 @@ jobs:
           docs=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
+          # No ADMIN_PASSWORD in the env file: the admin API is not mounted.
+          admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/admin/api/requests)
+          echo "GET /admin/api/requests -> $admin"
+          test "$admin" = "404"
           uid=$(bounded 30 "id -u in the app container" $compose exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
@@ -458,11 +464,13 @@ jobs:
           image=$(docker inspect --format '{{.Config.Image}}' "$coturn")
           bounded 600 "the entrypoint check of all cases" \
             python3 scripts/check_coturn_entrypoint.py --image "$image"
-      - name: Forced-relay echo through coturn, and the per-credential relay quota
+      - name: Forced-relay calls through coturn, and the per-credential relay quota
         run: |
           . .github/ci-wait.sh
           # Only networking differs from the stack above: app and coturn join a network whose
-          # addresses coturn does not deny, so no peer is allowed and every deny rule applies.
+          # addresses coturn does not deny, so no peer is allowed and every deny rule applies,
+          # and the app's vendor hosts point at its own loopback, so a call's speech-to-text
+          # (and any model request) fails inside the container: CI never reaches a vendor.
           echo "--- override used only by this step"
           cat deploy/docker-compose.relay-test.yml
           export TURN_HOST=203.0.113.10
@@ -487,7 +495,7 @@ jobs:
             bounded_run 300 "the $name probe" "ci-probe-$name" --rm \
               --network sunrise-voice-agent_relay-test -e PROBE_TOKEN="$token" \
               -v "$PWD/scripts:/probe:ro" --entrypoint python sunrise-voice-agent:ci \
-              -I /probe/echo_probe.py --url http://app:8000 "$@"
+              -I /probe/relay_probe.py --url http://app:8000 "$@"
           }
           echo "--- three calls, relay candidates only"
           probe relay --calls 3 --relay
@@ -529,7 +537,8 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           for name in postgres_host postgres_db app_db_user app_db_password audit_hmac_key \
-            identity_hash_key turn_shared_secret turn_host demo_access_token; do
+            identity_hash_key turn_shared_secret turn_host demo_access_token anthropic_api_key \
+            deepgram_api_key; do
             echo "$output" | grep -q "$name"
           done
       - name: Start-up steps without their settings must not run

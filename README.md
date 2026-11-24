@@ -76,8 +76,8 @@ All data used by this project is synthetic. No real customer or personal data is
     for the app and the start-up steps alike.
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
-    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
-    slot id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
+    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication,
+    slot, request, message or audit event id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
     lower-case letters and underscores), and the actor is `agent` or `admin:` and a
     user name of letters and underscores. The database's own CHECKs are the outer bound: at
     most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
@@ -239,13 +239,17 @@ All data used by this project is synthetic. No real customer or personal data is
     handler a library adds after the configuration is not covered. The repo's scans that
     keep log configuration in one module are lints against accidents.
 
-### Voice echo call
+### Voice call: speech in, the model and its tools, text out
 
-The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC
-transport). There is no speech recognition, model or speech synthesis yet.
+A call takes the caller's audio over WebRTC (Pipecat's SmallWebRTC transport) through voice
+activity detection (Silero) and Deepgram's streaming speech-to-text to the agent, and sends
+each turn's result to the call page over the data channel. Nothing is spoken back yet.
 
-- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch,
-  the connection state, the ICE candidate types in use and a count of audio packets received.
+- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch, the
+  connection state, the ICE candidate types in use, and one entry per turn: what the model was
+  given (the guard's text, or "(not shown to the assistant)" for a swallowed or emergency
+  turn), the lines said, the timings and whether a hand-off was asked for. The server's text
+  is written as text, never as markup.
 - `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
   shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
 - `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.
@@ -253,7 +257,46 @@ transport). There is no speech recognition, model or speech synthesis yet.
   the body is read. When no token is configured (only allowed in dev without TURN) the two
   endpoints are open.
 - At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). A call ends when the caller
-  leaves, when it has not connected within 30 seconds, or after `MAX_CALL_SECONDS`.
+  leaves, when it has not connected within 30 seconds, after `MAX_CALL_SECONDS`, when
+  speech-to-text cannot connect, or when a turn fails in a way the agent does not handle.
+  Without both vendor keys (allowed in dev only) a call is refused at set-up.
+- Speech-to-text (`app/voice/pipeline.py`): Deepgram `nova-3-general`, `en-US`, punctuation
+  and smart formatting on, numerals off (smart formatting already writes numbers as numerals),
+  opted out of Deepgram's model improvement programme. Smart formatting writes "three three
+  four four" as `3344` and a date as `March 14, 1985`; a spelled name stays letters (`J O H N
+  S O N`); the input guard reads digits and number words either way. The caller is taken to
+  have stopped after 0.8 seconds of silence; Deepgram is then asked to finalize, and only a
+  finalized transcript makes a turn.
+- The turn (`app/agent/turn.py`, no Pipecat in it): the input guard decides first. Emergency:
+  the emergency line, the call moves to `emergency`, no model request. Swallowed (the SSN
+  step): the model sees nothing of the turn; when the guard says submit, code runs
+  `submit_claim` and its line is the reply. Pass: a submit the guard asks for runs first, then
+  one model turn with the guard's text. Turns run one at a time.
+- A model turn sends the system prompt (`app/agent/prompts.py`: fixed text, no patient data,
+  written for speech), the conversation so far and the tools `tools_for` allows right now,
+  each with its argument model's JSON schema and a fixed description. Every tool call goes
+  through `dispatch`, and its outcome goes back to the model, unless it carries a scripted
+  line: that line is the reply, word for word, the model is told it was said, and tools asked
+  for after it in the same reply do not run. Scripted lines join the conversation as the
+  model's own; swallowed turns never join it. At most four tool rounds per turn.
+- The model (`app/agent/model.py`): Claude through the official Anthropic SDK, async and
+  streamed, `LLM_MODEL` (default `claude-haiku-5-5`), `max_tokens` 300, effort `low`, no
+  `temperature` or other sampling parameter, no SDK retries. A refusal, a failed request, no
+  first token within 8 seconds, a reply not finished 20 seconds after that, a reply that is
+  neither an answer nor a tool request (cut off at `max_tokens`, say), or a fifth tool round:
+  the fixed fallback line, and the call goes on. Two in one call, or a dispatch outcome that
+  asks for one, raise the hand-off signal. Thinking is off in every request (`thinking:
+  disabled`, which Claude Haiku 5.5 accepts at effort `low`): on a phone call it would delay
+  the first word and use up the 300 tokens; a `LLM_MODEL` that refuses thinking off (Claude
+  Opus 5.5 and Sonnet 5.5 do) gets the fallback line on every turn.
+- `Deps` (sessions as the runtime role, the audit log, the clinic clock with `SIMULATED_NOW`,
+  the claim hasher) is built once at start-up from the settings (`build_deps` in
+  `app/main.py`, kept on `app.state.deps`).
+- Per turn, logged as numbers only (`turn_measured`) and shown on the page: speech end to
+  final transcript, final transcript to the model's first and last token, tool rounds, and
+  speech end to the reply sent. The vendor clients' loggers (`anthropic`, `httpx2`, `httpx`,
+  `httpcore`, `websockets`, `deepgram`) keep only warnings and errors: below that they write
+  request bodies and websocket frames.
 - coturn runs as a Compose service built from `deploy/coturn`: one configuration file with
   allocation and bandwidth quotas, no relaying to private, loopback, link-local or unspecified
   IPv4 addresses, and its own logging switched off because it records caller addresses.
@@ -263,13 +306,25 @@ transport). There is no speech recognition, model or speech synthesis yet.
   IPv6 address is not denied: coturn 4.19.2 matches that rule against IPv4 peers as well and
   then refuses every relayed call.
 
-What has been run: the test suite on Windows 10, and `scripts/echo_probe.py` (an aiortc
-client that sends a tone and checks it comes back) against the app in Docker Desktop on
-Windows, both directly and forced through coturn. The forced-relay runs used the committed
-coturn configuration with only its networking changed (`deploy/docker-compose.relay-test.yml`:
-app and coturn on 203.0.113.0/24, which coturn does not deny), no peer allowed, coturn on that
-network rather than on host networking. CI runs the same forced-relay probe. No browser, phone
-or server deployment has been tried yet.
+Limits of this slice:
+
+- No voice out yet: replies are text on the page.
+- No output guard yet: the model's text reaches the page unchecked. All data is synthetic.
+- Booking, messages, transfer and call end are not wired; the hand-off signal is shown and
+  nothing acts on it. The guard's flags (an attempt to override the instructions, a request
+  about someone else) are not passed to the model.
+- One call's conversation is kept in memory only, for the call's life.
+- The verified line, said by code, puts the caller's first name in the conversation the model
+  sees; tool results are the only other patient data it receives.
+- Tests and CI never reach a vendor: the model is scripted, speech-to-text is replaced, and
+  CI's forced-relay calls run with the vendor hosts pointed at the app's own loopback. The
+  proof with the vendors is a real call on the server.
+
+What has been run: the test suite on Windows 10. `scripts/relay_probe.py` (an aiortc client
+that sends a tone and reads the server's receiver reports for it, since nothing comes back)
+runs in CI against the app forced through coturn, with only the networking changed
+(`deploy/docker-compose.relay-test.yml`: app and coturn on 203.0.113.0/24, which coturn does
+not deny, and the vendor hosts on the app's loopback).
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
@@ -280,7 +335,7 @@ A generated slot never replaces an existing slot at the same doctor and time.
 ### Call state and the tool gate
 
 The tools registered so far are the two of identity verification and the five serving tools
-(below); nothing wires dispatch to the model yet.
+(below); a call's turns (above) offer them to the model through the gate.
 
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
@@ -452,8 +507,6 @@ Limits, stated plainly:
   the step.
 - `pydantic`'s `errors()` returns a rejected value when asked for its input; the error's text
   form does not. No application code reads `errors()` of a state.
-- `IDENTITY_HASH_KEY` and `AUDIT_HMAC_KEY` are checked as settings; building the hasher and the
-  audit log from them comes with the wiring of the call pipeline.
 ### Serving tools
 
 Five tools for a verified caller, in `app/agent/serving.py`, registered by `register_tools()`.
@@ -515,9 +568,9 @@ for a verified patient and for a first-time caller. All need the office open.
   `self_pay: true`, and `reason_short` (1 to 120 characters, SSNs masked). No text may hold a
   Unicode control or format character (bidi overrides, zero-width characters), a line or
   paragraph separator, or a private-use or unassigned one; the doctor-message text follows the
-  same rule. Nothing else is accepted. The details are kept in the call's state only, hidden from its text
-  form, its dumps, logs and errors; a second call replaces them and forgets the slots offered.
-  The answer is the email spelled letter by letter for reading back.
+  same rule. Nothing else is accepted. The details are kept in the call's state only, hidden
+  from its text form, its dumps, logs and errors; a second call replaces them and forgets the
+  slots offered. The answer is the email spelled letter by letter for reading back.
 - `find_slots(doctor?, preferred_days?, preferred_time_of_day?)` (serving or booking, a
   verified patient or a new patient with details): at most three open slots after the moment of
   the question, earliest first, as `{slot_id, doctor, date, time}` in clinic time. The doctor is
@@ -563,6 +616,70 @@ for a verified patient and for a first-time caller. All need the office open.
     milliseconds (a slot never offered is refused before any database read).
   - Slot times are rendered without the year to the caller; the staff summary carries it.
 
+### Admin API
+
+A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages
+and audit log can be read and the chain checked without opening the database. It is off
+unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
+answer `404` and the app logs `admin_api_off` once at start.
+
+| Route (all `GET`) | Returns |
+|---|---|
+| `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
+| `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
+| `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
+| `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
+
+```sh
+curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?limit=20'
+```
+
+- Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`. The user name and the password
+  are each compared as a SHA-256 digest in constant time, both always. Anything else (no
+  header, a wrong part, a malformed or non-UTF-8 header, an `Authorization` header over 1024
+  characters) gets the same `401` and `WWW-Authenticate` challenge, and is logged as
+  `admin_sign_in_failed failures=<n>`, never the name or password tried.
+- Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): after five
+  inside a sliding minute the address gets `429`, before its credentials are looked at, until
+  the oldest of them is a minute old. A correct sign-in is not counted. Failed sign-ins are
+  not audited, so a stranger cannot make the audit chain grow.
+- Paging: newest first; `limit` 1 to 100 (default 50); `before=<id or seq>` for the next page,
+  the last id or seq of the page before. An unknown or repeated parameter, a value out of range
+  or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
+  route takes no parameters.
+- One verification runs at a time: another asked for meanwhile gets `429` with `Retry-After: 5`,
+  does no work and writes no event. It reads the whole chain, 1000 events a round trip, on the
+  one worker that also carries the calls, so on a large chain it costs that worker and the
+  database real time; run it when it is needed, not on a timer.
+- Every successful read appends one audit event (actor `admin:<ADMIN_USER>`, action
+  `admin_read_requests`, `admin_read_messages`, `admin_read_audit` or `admin_verify_audit`,
+  resource type `request`, `message` or `audit_event`, no resource id, outcome `success`) in
+  the transaction that read the rows. If the event cannot be written the answer is `503` and
+  no rows. A database that cannot be reached is `503` too, with no detail.
+- Every text value from the database passes the log masking (`mask`): SSNs, dates and email
+  addresses in a summary or body are hidden. Patient ids and call ids come out as stored.
+  Timestamps are ISO 8601.
+- A callback number shows as `***-***-` and its last four digits, whatever its shape
+  (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
+  `***-***-****`.
+- Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
+  in the API schema, and `/docs` stays off outside dev.
+- The runtime role needs no new privilege: it already reads these tables and appends events.
+- Limits:
+  - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
+    sign-in limit is shared by everyone. Refused requests are not counted, so each failure
+    ages out after a minute and is replaced by the next: one wrong password every 12 seconds,
+    from anyone, keeps the admin locked out for as long as it goes on. A sustained lockout
+    costs an attacker five requests a minute. It delays the admin; it is not a way in, and the
+    password's strength is the real control. Trusting the proxy's forwarded address is left to
+    the deploy set-up. The limit is held in memory, so a restart clears it, and it keeps at
+    most 10,000 addresses, dropping the one that failed longest ago.
+  - A real console would reveal a callback number only on an explicit, audited action; this
+    API never reveals one, it shows the masked form with the last four digits.
+  - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
+    number written another way (spelled out without a cue, for example) is shown as written.
+  - A read event records which list was read, not which rows.
+
 ## Configuration
 
 | Variable            | Allowed values                      | Default        |
@@ -584,6 +701,11 @@ for a verified patient and for a first-time caller. All need the office open.
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
+| `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
+| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off) |
+| `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
+| `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
+| `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup, and
 an empty value counts as unset. Environment variables take precedence over `.env`. The same
@@ -598,8 +720,8 @@ its settings before it touches the database (`python -m app.config`); the app ch
 when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
-`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`) must also not start or end with
-whitespace and must
+`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
+`DEEPGRAM_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -612,6 +734,12 @@ log fail verification.
 `IDENTITY_HASH_KEY` follows the same rules as `AUDIT_HMAC_KEY` (its own placeholder). It keys
 the hashes under which failed identity checks are counted across calls; choose one different
 from the audit key. Changing it starts every count again.
+
+`ADMIN_PASSWORD`, when set, needs `ADMIN_USER`, in every environment, and unless `APP_ENV=dev`
+at least 16 characters. In every environment it must differ from every other secret of the
+application's settings: every secret field of `Settings`, found from the class, so a secret
+added later is covered too. A clash is reported by field name only. The owner's
+`POSTGRES_PASSWORD` never reaches the app, so it cannot be compared there: choose another.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -657,7 +785,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the
@@ -699,11 +827,12 @@ uv run mypy --strict app tests scripts
 uv run pytest
 ```
 
-Echo probe, against a running app (`--relay` restricts it to TURN relay candidates; the token,
-if one is set, comes from the `PROBE_TOKEN` environment variable):
+Relay probe, against a running app (`--relay` restricts it to TURN relay candidates; the
+token, if one is set, comes from the `PROBE_TOKEN` environment variable). Each call starts
+speech-to-text, so run it with real keys, or where the vendor hosts cannot be reached:
 
 ```sh
-uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2
+uv run python scripts/relay_probe.py --url http://127.0.0.1:8000 --calls 2
 ```
 
 The tests need a running database server and read its address from the `POSTGRES_*`

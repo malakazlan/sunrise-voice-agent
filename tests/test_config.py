@@ -6,11 +6,11 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from conftest import OFFLINE_DB_ENV, VOICE_SECRETS
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
@@ -41,6 +41,11 @@ APPLICATION_FIELDS = {
     "turn_shared_secret",
     "turn_host",
     "demo_access_token",
+    "admin_password",
+    "admin_user",
+    "anthropic_api_key",
+    "deepgram_api_key",
+    "llm_model",
 }
 # The start-up steps' settings: the same database, the runtime role they set up, the owner.
 STARTUP_FIELDS = {
@@ -562,10 +567,75 @@ def test_voice_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.demo_access_token is None
     assert settings.turn_host is None
     assert settings.turn_shared_secret is None
+    assert settings.anthropic_api_key is None
+    assert settings.deepgram_api_key is None
+    assert settings.llm_model == "claude-haiku-5-5"
 
 
 # The order Settings checks the voice fields in.
-VOICE_FIELD_ORDER = ["TURN_SHARED_SECRET", "TURN_HOST", "DEMO_ACCESS_TOKEN"]
+VOICE_FIELD_ORDER = [
+    "TURN_SHARED_SECRET",
+    "TURN_HOST",
+    "DEMO_ACCESS_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "DEEPGRAM_API_KEY",
+]
+VENDOR_KEYS = ["ANTHROPIC_API_KEY", "DEEPGRAM_API_KEY"]
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize("app_env", ["demo", "prod"])
+@pytest.mark.parametrize(
+    "missing",
+    [["ANTHROPIC_API_KEY"], ["DEEPGRAM_API_KEY"], VENDOR_KEYS],
+    ids=["anthropic", "deepgram", "both"],
+)
+def test_app_will_not_start_without_vendor_keys_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, app_env: str, missing: list[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", app_env)
+    for key, value in VOICE_SECRETS.items():
+        if key not in missing:
+            monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        create_app()
+
+    assert [(error["loc"], error["msg"]) for error in excinfo.value.errors()] == [
+        ((key.lower(),), f"Value error, {key.lower()} is required unless app_env is dev")
+        for key in VENDOR_KEYS
+        if key in missing
+    ]
+    for key in VENDOR_KEYS:
+        assert VOICE_SECRETS[key] not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    "model", ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-4-8", "claude-3.5-x"]
+)
+def test_llm_model_takes_a_claude_model_id(monkeypatch: pytest.MonkeyPatch, model: str) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("LLM_MODEL", model)
+
+    assert Settings(_env_file=None).llm_model == model
+
+
+@pytest.mark.usefixtures("db_env")
+@pytest.mark.parametrize(
+    "model", ["gpt-5", "Claude-haiku-5-5", "claude-", "claude-haiku 5", "claude-" + "a" * 61]
+)
+def test_llm_model_refuses_anything_else(monkeypatch: pytest.MonkeyPatch, model: str) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("LLM_MODEL", model)
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+
+    assert [(error["type"], error["loc"]) for error in excinfo.value.errors()] == [
+        ("string_pattern_mismatch", ("llm_model",))
+    ]
 
 
 @pytest.mark.usefixtures("db_env")
@@ -731,7 +801,7 @@ def test_short_secrets_are_refused(monkeypatch: pytest.MonkeyPatch, key: str, ap
 
 @pytest.mark.usefixtures("db_env")
 @pytest.mark.parametrize("app_env", ["demo", "prod"])
-@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET", "TURN_HOST"])
+@pytest.mark.parametrize("key", VOICE_FIELD_ORDER)
 def test_empty_voice_values_count_as_missing_outside_dev(
     monkeypatch: pytest.MonkeyPatch, app_env: str, key: str
 ) -> None:
@@ -758,11 +828,13 @@ def test_empty_voice_values_in_dev_leave_voice_unconfigured(
 
     settings = Settings(_env_file=None)
 
-    assert (settings.demo_access_token, settings.turn_host, settings.turn_shared_secret) == (
-        None,
-        None,
-        None,
-    )
+    assert (
+        settings.demo_access_token,
+        settings.turn_host,
+        settings.turn_shared_secret,
+        settings.anthropic_api_key,
+        settings.deepgram_api_key,
+    ) == (None, None, None, None, None)
 
 
 @pytest.mark.usefixtures("db_env")
@@ -832,6 +904,8 @@ TEN_DISTINCT = "abcdefghij" * 4
         ("TURN_SHARED_SECRET", Settings),
         ("AUDIT_HMAC_KEY", Settings),
         ("IDENTITY_HASH_KEY", Settings),
+        ("ANTHROPIC_API_KEY", Settings),
+        ("DEEPGRAM_API_KEY", Settings),
     ],
 )
 def test_secrets_need_ten_distinct_characters_outside_dev(
@@ -1188,6 +1262,133 @@ def test_simulated_now_accepts_only_an_iso_date_and_time(monkeypatch: pytest.Mon
         monkeypatch.setenv("SIMULATED_NOW", value)
 
         assert Settings(_env_file=None).simulated_now == expected, value
+
+
+ADMIN_PASSWORD = "-".join(["admin", "pass", "not", "for", "logs"])
+
+
+def admin_errors(monkeypatch: pytest.MonkeyPatch, **values: str) -> list[tuple[Any, str]]:
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    for value in values.values():
+        if len(value) >= 4:
+            assert value.strip() not in str(excinfo.value), value
+    return [(error["loc"], error["msg"]) for error in excinfo.value.errors()]
+
+
+@pytest.mark.usefixtures("offline_env")
+def test_admin_settings_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Off by default: neither is required.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        settings = Settings(_env_file=None)
+        assert (settings.admin_user, settings.admin_password) == (None, None)
+
+    # A password needs a user, in every environment; a user alone leaves admin off.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        monkeypatch.delenv("ADMIN_USER", raising=False)
+        assert admin_errors(monkeypatch, ADMIN_PASSWORD=ADMIN_PASSWORD) == [
+            (("admin_user",), "Value error, admin_user is required when admin_password is set")
+        ]
+        monkeypatch.delenv("ADMIN_PASSWORD")
+        monkeypatch.setenv("ADMIN_USER", "clinic_admin")
+        assert Settings(_env_file=None).admin_user == "clinic_admin"
+        monkeypatch.delenv("ADMIN_USER")
+
+    # The user name: the audit log's admin name, 1 to 32 letters and underscores, starting
+    # with a letter.
+    monkeypatch.setenv("ADMIN_PASSWORD", ADMIN_PASSWORD)
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for refused in (
+            "admin-1",
+            "1admin",
+            "_admin",
+            "admin user",
+            "admin:root",
+            "admin;",
+            "admin'",
+            "ädmin",
+            "a" * 33,
+        ):
+            assert admin_errors(monkeypatch, ADMIN_USER=refused) == [
+                (
+                    ("admin_user",),
+                    "Value error, admin_user must be 1 to 32 letters and underscores,"
+                    " starting with a letter",
+                )
+            ], refused
+        for accepted in ("a", "Z" * 32, "clinic_admin", "Front_Desk"):
+            monkeypatch.setenv("ADMIN_USER", accepted)
+            assert Settings(_env_file=None).admin_user == accepted
+
+    # Outside dev the password is as strong as a database password: 16 characters, 10
+    # different ones, no surrounding whitespace.
+    monkeypatch.setenv("ADMIN_USER", "clinic_admin")
+    for app_env in ("demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for refused in ("fifteen-chars-x", NINE_DISTINCT, " " + TEN_DISTINCT, TEN_DISTINCT + " "):
+            assert [loc for loc, _ in admin_errors(monkeypatch, ADMIN_PASSWORD=refused)] == [
+                ("admin_password",)
+            ], refused
+        for accepted in ("sixteen-chars-xx", TEN_DISTINCT):
+            monkeypatch.setenv("ADMIN_PASSWORD", accepted)
+            settings = Settings(_env_file=None)
+            assert settings.admin_password is not None
+            assert settings.admin_password.get_secret_value() == accepted
+            assert accepted not in repr(settings) + str(settings.model_dump())
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ADMIN_PASSWORD", "short")
+    settings = Settings(_env_file=None)
+    assert settings.admin_password is not None
+    assert settings.admin_password.get_secret_value() == "short"
+
+    # Passed directly, an empty password reaches the validator, in every environment.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        with pytest.raises(ValidationError, match="must not be empty") as empty:
+            Settings(_env_file=None, admin_password="")
+        assert [error["loc"] for error in empty.value.errors()] == [("admin_password",)]
+
+
+@pytest.mark.usefixtures("offline_env")
+def test_admin_password_differs_from_every_other_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every secret field of Settings, found from the class, so a new one is covered as soon as
+    # it is declared; written out here so that a new one is also noticed.
+    secret_fields = {
+        name
+        for name, field in Settings.model_fields.items()
+        if SecretStr in (field.annotation, *get_args(field.annotation))
+    }
+    assert secret_fields - {"admin_password"} == {
+        "app_db_password",
+        "audit_hmac_key",
+        "identity_hash_key",
+        "turn_shared_secret",
+        "demo_access_token",
+        "anthropic_api_key",
+        "deepgram_api_key",
+    }
+    monkeypatch.setenv("ADMIN_USER", "clinic_admin")
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for name in (
+            "APP_DB_PASSWORD",
+            "AUDIT_HMAC_KEY",
+            "IDENTITY_HASH_KEY",
+            "TURN_SHARED_SECRET",
+            "DEMO_ACCESS_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "DEEPGRAM_API_KEY",
+        ):
+            assert admin_errors(monkeypatch, ADMIN_PASSWORD=os.environ[name]) == [
+                ((), f"Value error, admin_password must differ from {name.lower()}")
+            ], (app_env, name)
+        monkeypatch.setenv("ADMIN_PASSWORD", ADMIN_PASSWORD)
+        assert Settings(_env_file=None).admin_user == "clinic_admin"
 
 
 @pytest.mark.usefixtures("offline_env")

@@ -42,6 +42,11 @@ LINES = [
         False,
     ),
     (
+        "fallback",
+        "I'm sorry, I can't help with that. I can take a message for our staff instead.",
+        True,
+    ),
+    (
         "booking_instructions",
         "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
         " receive a confirmation by email.",
