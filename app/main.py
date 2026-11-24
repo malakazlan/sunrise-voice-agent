@@ -15,6 +15,7 @@ from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import drain_guard_audits
+from app.agent.turn_record import TurnRecorder
 from app.api.admin import PREFIX as ADMIN_PREFIX
 from app.api.admin import build_admin_app
 from app.api.offer import OpenCall, build_router
@@ -52,8 +53,10 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     engine = create_database_engine(settings)
     deps = build_deps(settings, engine)
     model = anthropic_model(settings)
+    # Every call's turn rows, written in the background with the call's clock.
+    turns = TurnRecorder(deps.sessions, deps.now)
     if open_call is None:
-        open_call = partial(open_agent_call, settings, deps, model)
+        open_call = partial(open_agent_call, settings, deps, model, turns=turns)
     # A call says goodbye and ends itself at MAX_CALL_SECONDS; the registry stops one that has
     # not, END_GRACE_SECONDS later.
     calls = CallRegistry(
@@ -69,8 +72,9 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         # engine goes.
         await drain_call_events()
         await drain_guard_audits()
-        # And the call records still being masked and stored.
+        # And the call records still being masked and stored, and the turn rows still queued.
         await drain_call_records()
+        await turns.drain()
         if model is not None:
             await model.close()
         await engine.dispose()
@@ -85,6 +89,7 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     )
     app.state.calls = calls
     app.state.deps = deps
+    app.state.turns = turns
 
     @app.get("/health")
     def health() -> dict[str, str]:
