@@ -169,6 +169,7 @@ async def submit_identity(
         return ToolResult(
             transition=Verify(patient_id=patient.id, first_name=patient.first_name),
             script=ScriptId.VERIFIED,
+            script_values={"first_name": patient.first_name},
             audit_action=Action.IDENTITY_VERIFIED,
         )
     if locks_the_call(state):

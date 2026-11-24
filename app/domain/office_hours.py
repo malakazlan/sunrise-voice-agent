@@ -5,6 +5,8 @@ from app.domain.clinic import CLINIC_TZ
 
 OPENS = time(9, 0)
 CLOSES = time(17, 0)
+# Where the after-hours line's night ends.
+DAWN = time(5, 0)
 FRIDAY = 4
 
 
@@ -24,11 +26,11 @@ def is_open(at: datetime) -> bool:
 
 
 def part_of_day(at: datetime) -> str:
-    """`day` before 17:00 in clinic time, `night` from then to midnight, for the after-hours
+    """`day` from 05:00 up to 17:00 in clinic time, `night` otherwise, for the after-hours
     line's good-bye."""
     if at.utcoffset() is None:
         raise ValueError("part_of_day needs a timezone-aware datetime")
-    return "day" if at.astimezone(CLINIC_TZ).time() < CLOSES else "night"
+    return "day" if DAWN <= at.astimezone(CLINIC_TZ).time() < CLOSES else "night"
 
 
 def clinic_now(settings: ClockSettings) -> datetime:

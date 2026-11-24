@@ -11,6 +11,7 @@ hand-off.
 
 from app.agent.endings import (
     ENDING_TOOLS,
+    HAND_OFF_REASONS,
     REPORT_EMERGENCY,
     TAKE_MESSAGE,
     TOOL_PHASES,
@@ -21,6 +22,8 @@ from app.agent.scripts import ScriptId
 from app.agent.serving import SERVING_TOOLS
 from app.agent.state import CallState, Phase, drop_claim
 from app.agent.tool_registry import (
+    MAX_TOOL_ERRORS,
+    MAX_TOOL_REFUSALS,
     REGISTRY,
     Deps,
     Grant,
@@ -50,6 +53,7 @@ VERIFY_IDENTITY = Tool(
     takes_identity_claim=True,
     audit_action=Action.IDENTITY_CLAIMED,
     outcome_actions={Action.IDENTITY_LOCKED: Outcome.REFUSED},
+    audit_reasons=frozenset(),
     resource_type=ResourceType.TOOL,
 )
 
@@ -69,6 +73,7 @@ SUBMIT_IDENTITY = Tool(
         Action.IDENTITY_REFUSED: Outcome.REFUSED,
         Action.IDENTITY_LOCKED: Outcome.REFUSED,
     },
+    audit_reasons=frozenset(),
     resource_type=ResourceType.PATIENT,
 )
 
@@ -85,6 +90,7 @@ HAND_OFF_TO_STAFF = Tool(
     takes_identity_claim=False,
     audit_action=Action.TRANSFER_REQUESTED,
     outcome_actions={},
+    audit_reasons=HAND_OFF_REASONS,
     resource_type=ResourceType.CALL,
 )
 
@@ -101,19 +107,32 @@ def register_tools() -> Registry:
     return REGISTRY
 
 
+def _reaches_the_limit(before: CallState, after: CallState) -> bool:
+    """Whether this tool call's failure or refusal is the one that reaches its limit."""
+    return (
+        after.tool_errors >= MAX_TOOL_ERRORS > before.tool_errors
+        or after.tool_refusals >= MAX_TOOL_REFUSALS > before.tool_refusals
+    )
+
+
 async def call_tool(
     state: CallState, name: object, raw_args: object, deps: Deps
 ) -> tuple[CallState, ToolOutcome]:
-    """The model's tool call, and what code does about its outcome. A report of an emergency
-    that dispatch could not carry out (the database is down) moves the call and gives the
-    emergency line all the same. An outcome that asks for a hand-off moves a call to the staff
-    while the office is open, and offers a closed office's caller the message instead; a call
-    already on its way out is left to go."""
+    """The model's tool call, and what code does about its outcome.
+
+    A report of an emergency comes first, whatever its arguments: wherever the tool is offered
+    it moves the call to emergency and gives the 911 line before any database work, without a
+    tool transaction, counting nothing and never handing off. Elsewhere it is refused like any
+    tool. The outcome that reaches the limit of failures or refusals hands the call to the staff
+    while the office is open, and offers a closed office's caller the message instead, once; a
+    call already on its way out is left to go."""
+    if name == REPORT_EMERGENCY.name and is_available(REPORT_EMERGENCY, state):
+        after, script = await emergency(state, Reason.MODEL, deps)
+        return after, ToolOutcome(
+            status=Status.DONE, message=None, data={}, hand_off=False, script=script
+        )
     after, outcome = await REGISTRY.dispatch(state, name, raw_args, deps)
-    if name == REPORT_EMERGENCY.name and outcome.status is Status.FAILED:
-        after, script = await emergency(after, Reason.MODEL, deps)
-        return after, outcome.model_copy(update={"script": script})
-    if not outcome.hand_off:
+    if not _reaches_the_limit(state, after):
         return after, outcome
     if is_available(HAND_OFF_TO_STAFF, after):
         return await REGISTRY.dispatch(

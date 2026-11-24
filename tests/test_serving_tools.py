@@ -775,6 +775,12 @@ async def test_message_bounds(
         "tab\there",
         "hi\x1fthere",
         "hi\x7fthere",
+        # C1 controls and format characters: zero-width, bidi overrides and isolates.
+        "hi\x85there",
+        "hi​there",
+        "‮ereht ih",
+        "hi⁧there",
+        "hi­there",
     ]
     for body in (too_long, grows, "", "   ", "\n\t", *control):
         for confirmed in (None, True):

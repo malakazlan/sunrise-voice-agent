@@ -44,7 +44,7 @@ from sqlalchemy import Connection, Text, cast, event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.claims import ClaimKeys
-from app.agent.scripts import ScriptId
+from app.agent.scripts import ScriptId, placeholders
 from app.agent.state import (
     CallState,
     EndClaim,
@@ -59,6 +59,7 @@ from app.agent.state import (
 )
 from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.domain.clinic import CLINIC_TZ
+from app.guard.text import has_hidden_characters
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,9 @@ MAX_TOOL_REFUSALS = 5
 DISPATCH_DEADLINE_SECONDS = 10
 # Arguments larger than this, serialized as JSON, are refused before they are validated.
 MAX_ARGUMENT_BYTES = 16 * 1024
+
+# A value a line is spoken with is at most this many characters.
+MAX_SCRIPT_VALUE = 80
 
 REFUSED_MESSAGE = "That is not available right now."
 FAILED_MESSAGE = "That could not be done right now."
@@ -174,6 +178,8 @@ class Tool(BaseModel):
     # of outcome_actions, each with its fixed outcome.
     audit_action: Action
     outcome_actions: dict[Action, Outcome]
+    # The reasons the tool's events may carry, each one the handler names; none otherwise.
+    audit_reasons: frozenset[Reason]
     resource_type: ResourceType
 
 
@@ -339,10 +345,14 @@ def check_declaration(tool: Tool) -> Tool:
         raise DeclarationError("a phi tool runs only while the office is open")
 
     if declared.may_verify and (
-        declared.phi or declared.phases != {Phase.INTAKE} or declared.model_callable
+        declared.phi
+        or declared.phases != {Phase.INTAKE}
+        or declared.closed_phases
+        or declared.model_callable
     ):
         raise DeclarationError(
-            "a tool that may verify is not a phi tool, is in intake only and is code-only"
+            "a tool that may verify is not a phi tool, is in intake only with the office open"
+            " and is code-only"
         )
 
     # The caller confirms what the model asks to write. Code calls a code-only tool on its own
@@ -392,6 +402,19 @@ def _resource_id(tool: Tool, state: CallState, result: ToolResult) -> str | None
             raise ValueError("a handler does not name the tool or the patient")
         return tool.name if tool.resource_type is ResourceType.TOOL else state.patient_id
     return result.resource_id
+
+
+def _check_said(tool: Tool, result: ToolResult) -> None:
+    """A line's values are exactly its placeholders, each short plain text; a reason is one the
+    tool declares."""
+    expected = frozenset() if result.script is None else placeholders(result.script)
+    if set(result.script_values) != expected:
+        raise PermissionError("a line's values are exactly its placeholders")
+    for value in result.script_values.values():
+        if len(value) > MAX_SCRIPT_VALUE or has_hidden_characters(value):
+            raise ValueError("a line's value is short plain text")
+    if result.audit_reason is not None and result.audit_reason not in tool.audit_reasons:
+        raise PermissionError("a handler names only a reason its tool declares")
 
 
 def _event(tool: Tool, result: ToolResult) -> tuple[Action, Outcome]:
@@ -537,6 +560,7 @@ class Registry:
                         and not tool.takes_identity_claim
                     ):
                         raise PermissionError("only the tool declared to take a claim may")
+                    _check_said(tool, result)
                     action, outcome = _event(tool, result)
                     after = state if result.transition is None else apply(state, result.transition)
                     resource_id = _resource_id(tool, after, result)

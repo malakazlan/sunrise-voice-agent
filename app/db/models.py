@@ -42,6 +42,8 @@ REQUEST_TYPES = ("refill", "doctor_message", "callback", "transfer")
 MESSAGE_KINDS = ("doctor_message", "callback")
 MAX_REQUEST_SUMMARY = 200
 MAX_MESSAGE_BODY = 120
+# What makes two messages of one call the same message.
+MESSAGE_KEY = ["call_id", "kind", "body", "name", "callback_number"]
 
 
 class Base(DeclarativeBase):
@@ -151,11 +153,14 @@ class Request(Base):
 
 class Message(Base):
     """A message a caller left for the clinic. The body is the caller's text. A call leaves
-    the same message once. `after_hours` says the office was closed when the call started."""
+    the same message once: the same kind and text, and for a call back the same name and
+    number (a doctor's message has neither; two missing values count as the same). A corrected
+    name or number is a message of its own. `after_hours` says the office was closed when the
+    call started."""
 
     __tablename__ = "messages"
     __table_args__ = (
-        UniqueConstraint("call_id", "kind", "body"),
+        UniqueConstraint(*MESSAGE_KEY, postgresql_nulls_not_distinct=True),
         CheckConstraint(literal_column("kind").in_(MESSAGE_KINDS), name="kind"),
         _length_between("body", MAX_MESSAGE_BODY, "body_length"),
     )

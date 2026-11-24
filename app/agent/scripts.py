@@ -2,13 +2,17 @@
 
 A tool outcome or a guard decision names a line by its id; the text is never the model's.
 `verified` carries the caller's first name in `{first_name}`; `after_hours_close` the name the
-caller left in `{name}` and `day` or `night` in `{part_of_day}`, which the outcome that names it
-gives as its script values.
+caller left in `{name}` and `day` or `night` in `{part_of_day}`. The outcome that names a line
+gives exactly its placeholders' values.
 """
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
+
+# A value's place in a line: its name in braces.
+PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 
 
 class ScriptId(StrEnum):
@@ -90,3 +94,8 @@ SCRIPTS = MappingProxyType(
         ),
     }
 )
+
+
+def placeholders(script: ScriptId) -> frozenset[str]:
+    """The names of the values the line is spoken with."""
+    return frozenset(PLACEHOLDER.findall(SCRIPTS[script].text))

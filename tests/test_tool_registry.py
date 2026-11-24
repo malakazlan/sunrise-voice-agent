@@ -23,7 +23,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.agent import tool_registry
 from app.agent.claims import ClaimKeys
-from app.agent.state import CallState, IdentityClaim, Move, Phase, Verify, move, new_call, verify
+from app.agent.scripts import ScriptId
+from app.agent.state import (
+    CallState,
+    IdentityClaim,
+    Move,
+    Phase,
+    Verify,
+    count_tool_error,
+    move,
+    new_call,
+    verify,
+)
 from app.agent.tool_registry import (
     REGISTRY,
     DeclarationError,
@@ -41,7 +52,7 @@ from app.agent.tool_registry import (
     is_available,
 )
 from app.agent.tools import register_tools
-from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
+from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.config import StartupSettings
 from app.db.session import create_database_engine, create_session_factory
 from app.voice.calls import CallRegistry
@@ -141,6 +152,7 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "takes_identity_claim": False,
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
+        "audit_reasons": frozenset(),
         "resource_type": ResourceType.TOOL,
     }
     values.update(overrides)
@@ -688,6 +700,7 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "takes_identity_claim": False,
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
+        "audit_reasons": frozenset(),
         "resource_type": ResourceType.PATIENT,
     }
     values.update(overrides)
@@ -808,8 +821,11 @@ def test_registration_rules() -> None:
                 "model_callable",
                 "takes_identity_claim",
                 "outcome_actions",
+                "audit_reasons",
             )
         ],
+        ("declare", Tool.model_construct(**valid(audit_reasons={Reason.OTHER}))),
+        ("declare", Tool.model_construct(**valid(audit_reasons=frozenset({"other"})))),
         ("declare", Tool.model_construct(**valid(model_callable="no"))),
         ("declare", Tool.model_construct(**valid(outcome_actions={"tool_called": "success"}))),
         ("declare", Tool.model_construct(**valid(outcome_actions={Action.TOOL_CALLED: "ok"}))),
@@ -916,6 +932,11 @@ def test_registration_rules() -> None:
             for phases in ({INTAKE, SERVING}, {SERVING}, {INTAKE, GREETING}, set(Phase))
         ],
         ("verif", Tool(**VERIFIER)),
+        # And it runs only while the office is open.
+        (
+            "verif",
+            Tool(**{**VERIFIER, "model_callable": False, "closed_phases": frozenset({INTAKE})}),
+        ),
         # The tool that takes an identity claim: not a patient-data tool, intake only, office
         # open only, callable by the model, and it may not verify.
         *[
@@ -1109,6 +1130,7 @@ def test_application_registry_obeys_the_gate() -> None:
             "check_identity",
             noop,
             phases=frozenset({INTAKE}),
+            closed_phases=frozenset(),
             may_verify=True,
             model_callable=False,
         ),
@@ -1311,6 +1333,7 @@ async def test_only_the_verifying_tool_can_verify(deps: Deps, owner_engine: Engi
             claims_identity,
             arguments=Member,
             phases=frozenset({INTAKE}),
+            closed_phases=frozenset(),
             may_verify=True,
             model_callable=False,
         ),
@@ -1608,6 +1631,63 @@ async def test_events_carry_only_declared_actions(deps: Deps, owner_engine: Engi
         ("tool_failed", "tool", "undeclared", "failure", call),
         ("tool_failed", "tool", "reserved", "failure", call),
     ]
+
+
+async def test_scripts_and_reasons_keep_to_their_declarations(
+    deps: Deps, owner_engine: Engine
+) -> None:
+    # A line's values are exactly its placeholders, each at most 80 characters of plain text;
+    # an event's reason is one its tool declares. Anything else fails the call.
+    verified = ScriptId.VERIFIED
+    after_hours = ScriptId.AFTER_HOURS_CLOSE
+    results: list[tuple[ToolResult, bool]] = [
+        (ToolResult(), True),
+        (ToolResult(script=ScriptId.GOODBYE), True),
+        (ToolResult(script=verified, script_values={"first_name": "s" * 80}), True),
+        (ToolResult(script=after_hours, script_values={"name": "Ana", "part_of_day": "day"}), True),
+        (ToolResult(audit_reason=Reason.OTHER), True),
+        (ToolResult(script=verified), False),
+        (ToolResult(script=verified, script_values={"name": "Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "S", "last_name": "J"}), False),
+        (ToolResult(script=after_hours, script_values={"name": "Ana"}), False),
+        (ToolResult(script_values={"first_name": "Sarah"}), False),
+        (ToolResult(script=ScriptId.GOODBYE, script_values={"first_name": "Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "s" * 81}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa​rah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "‮Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa\nrah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa\x85rah"}), False),
+        (ToolResult(audit_reason=Reason.GUARD), False),
+    ]
+    registry = Registry()
+    names_of = []
+    for index, (result, _done) in enumerate(results):
+        name = "case_" + "abcdefghijklmnopqrstuvwxyz"[index]
+        registry.register(
+            declared(name, recording([], result), audit_reasons=frozenset({Reason.OTHER}))
+        )
+        names_of.append(name)
+    # A tool that declares no reason attaches none.
+    registry.register(declared("no_reason", recording([], ToolResult(audit_reason=Reason.OTHER))))
+    state = intake()
+    for name, (result, done) in zip(names_of, results, strict=True):
+        after, outcome = await registry.dispatch(state, name, {}, deps)
+        if done:
+            assert (after, outcome.status) == (state, Status.DONE), name
+            assert outcome.script_values == result.script_values
+        else:
+            assert (after, outcome) == (count_tool_error(state), FAILED), name
+    after, outcome = await registry.dispatch(state, "no_reason", {}, deps)
+    assert (after, outcome) == (count_tool_error(state), FAILED)
+
+    reasons = text("SELECT resource_id, action, reason FROM audit_events ORDER BY seq")
+    with owner_engine.connect() as connection:
+        written = [tuple(row) for row in connection.execute(reasons)]
+    expected = [
+        (name, "tool_called" if done else "tool_failed", "other" if name == "case_e" else None)
+        for name, (_result, done) in zip(names_of, results, strict=True)
+    ]
+    assert written == [*expected, ("no_reason", "tool_failed", None)]
 
 
 class NestedDob(BaseModel):

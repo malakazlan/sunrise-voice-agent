@@ -147,10 +147,16 @@ def test_migration_matches_models(
         "ck_verification_attempts_claim_key",
         "CHECK ((claim_key ~ '^[0-9a-f]{64}$'::text))",
     ) in migrated_constraints
-    # A call asks for the same thing once, and leaves the same message once.
+    # A call asks for the same thing once, and leaves the same message once: the same text, and
+    # for a call back the same name and number too (a doctor's message has neither, and two
+    # missing values count as the same).
     assert {
         ("requests", "uq_requests_call_id_type_summary", "UNIQUE (call_id, type, summary)"),
-        ("messages", "uq_messages_call_id_kind_body", "UNIQUE (call_id, kind, body)"),
+        (
+            "messages",
+            "uq_messages_call_id_kind_body_name_callback_number",
+            "UNIQUE NULLS NOT DISTINCT (call_id, kind, body, name, callback_number)",
+        ),
     } <= migrated_constraints
 
     # The kinds of request and message, and whether a message was left after hours.

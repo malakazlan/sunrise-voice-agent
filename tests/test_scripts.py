@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from app.agent.scripts import SCRIPTS, ScriptId
+from app.agent.scripts import SCRIPTS, ScriptId, placeholders
 from app.domain.office_hours import part_of_day
 
 # Every scripted line, written by hand from the spec: id, text, whether it may be interrupted.
@@ -62,16 +62,20 @@ LINES = [
     ),
 ]
 
-# The part of the day the after-hours line wishes the caller, written by hand: `day` before
-# 5 PM clinic time, `night` from then on, in winter (UTC-5) and summer (UTC-4) alike.
+# The part of the day the after-hours line wishes the caller, written by hand: `day` from 5 AM
+# up to 5 PM clinic time, `night` otherwise, in winter (UTC-5) and summer (UTC-4) alike.
 PARTS_OF_DAY = [
-    # Tuesday 24 November 2026, in clinic time.
+    # Tuesday 24 November 2026, in clinic time: 16:59:59.999999 and 17:00.
     (datetime(2026, 11, 24, 21, 59, 59, 999999, tzinfo=UTC), "day"),
     (datetime(2026, 11, 24, 22, 0, tzinfo=UTC), "night"),
     (datetime(2026, 11, 25, 4, 30, tzinfo=UTC), "night"),
-    # 02:00 and 07:00 on Wednesday: before 5 PM.
-    (datetime(2026, 11, 25, 7, 0, tzinfo=UTC), "day"),
+    # 02:00, 04:59:59.999999, 05:00 and 07:00 on Wednesday.
+    (datetime(2026, 11, 25, 7, 0, tzinfo=UTC), "night"),
+    (datetime(2026, 11, 25, 9, 59, 59, 999999, tzinfo=UTC), "night"),
+    (datetime(2026, 11, 25, 10, 0, tzinfo=UTC), "day"),
     (datetime(2026, 11, 25, 12, 0, tzinfo=UTC), "day"),
+    # 16:59 on Wednesday.
+    (datetime(2026, 11, 25, 21, 59, tzinfo=UTC), "day"),
     # Saturday 28 November, 10:00 and 18:00.
     (datetime(2026, 11, 28, 15, 0, tzinfo=UTC), "day"),
     (datetime(2026, 11, 28, 23, 0, tzinfo=UTC), "night"),
@@ -90,6 +94,23 @@ def test_lines_are_exact() -> None:
     ] == LINES
     # The table cannot be changed while the application runs.
     assert type(SCRIPTS).__name__ == "mappingproxy"
+
+
+def test_lines_name_their_values() -> None:
+    assert {script.value: placeholders(script) for script in ScriptId} == {
+        "greeting": frozenset(),
+        "closed": frozenset(),
+        "ssn_ask": frozenset(),
+        "ssn_too_long": frozenset(),
+        "verified": frozenset({"first_name"}),
+        "verify_fail": frozenset(),
+        "verify_locked": frozenset(),
+        "emergency": frozenset(),
+        "transfer": frozenset(),
+        "goodbye": frozenset(),
+        "after_hours_close": frozenset({"name", "part_of_day"}),
+        "guard_fallback": frozenset(),
+    }
 
 
 def test_after_hours_line_follows_clinic_time() -> None:

@@ -298,9 +298,10 @@ model yet.
   (`model_construct`, `object.__setattr__`) can still forge a state.
 - `app/agent/tool_registry.py`: a tool is declared once (name, argument model, handler,
   whether it touches patient data, its phases while the office is open and its phases while it
-  is closed (none for a tool that needs the office open), whether it writes, whether the model may call it, whether it may verify the caller, whether it takes
-  an identity claim, its audit action, any other actions its events may carry with each one's
-  fixed outcome, and its resource type). Registration
+  is closed (none for a tool that needs the office open), whether it writes, whether the model
+  may call it, whether it may verify the caller, whether it takes an identity claim, its audit
+  action, any other actions its events may carry with each one's fixed outcome, the reasons
+  its events may carry, and its resource type). Registration
   refuses a declaration that breaks a rule: every field given and of the right kind, the
   audit action from the audit registry and not one dispatch or the call writes itself
   (`tool_refused`, `tool_failed`, `call_started`, `call_ended`); no argument naming a patient
@@ -311,7 +312,8 @@ model yet.
   and never with the office closed; a
   writing tool the model can call has `confirmed: bool = False` among its arguments (a
   code-only tool is never called on the model's word); a tool that may verify is not a
-  patient-data tool, is in `intake` only, is code-only, and there is at most one; a tool that
+  patient-data tool, is in `intake` only with the office open, is code-only, and there is at
+  most one; a tool that
   takes an identity claim is not a patient-data tool, is in `intake` only with the office
   open, is callable by the model, may not verify, and there is at most one: it alone may have
   a `dob` argument; a code-only tool is registered with a grant of its own (`Grant`), a
@@ -328,14 +330,16 @@ model yet.
 - The gate: no tool at all in `greeting`, `emergency`, `handoff`, `closing` or
   `ended`; a tool only in the phases it declares for the office's state, open or closed (the
   state's `office_open`, decided when the call starts); a patient-data tool only for a verified
-  caller with a patient id, while the office is open. Since such a tool can only be declared for `serving` and `booking`, it is never
-  offered anywhere else.
+  caller with a patient id, while the office is open. Since such a tool can only be declared
+  for `serving` and `booking`, it is never offered anywhere else.
 - `dispatch` is the only caller of a handler. It refuses a tool name that is not a registered
   one (or not text), a tool the gate does not allow, arguments larger than 16 KiB as JSON (or
   not JSON at all) and arguments that do not validate, without running the handler.
   Otherwise, in one transaction and within 10 seconds, the handler runs (it gets the patient
   id from the state, never from the arguments), the transition it asks for is applied (a
-  `Verify` only from the tool declared to verify), the transaction is checked to be the one
+  `Verify` only from the tool declared to verify; a line's values exactly its placeholders,
+  each at most 80 characters with no control or format character; a reason only one the tool
+  declares), the transaction is checked to be the one
   the handler was given, the audit event is appended, and it commits. The check reads the
   transaction's id (`pg_current_xact_id`, unique for the life of the server) before the
   handler and again after, so a handler that commits or rolls back, with SQLAlchemy or with
@@ -413,8 +417,9 @@ model. Code decides; the model only relays the name and the date.
   audit event. Before anything else that transaction takes an advisory lock on the claim's
   key and counts its failures again: calls armed at the same moment submit one after another,
   and once the identity has five failures a submit returns `verify_locked` and counts
-  nothing, so no more than five failures are recorded in the hour. A submit that does not run to an outcome (the database is down) counts
-  nothing and verifies nothing, and `submit_claim` drops the claim and the digits.
+  nothing, so no more than five failures are recorded in the hour. A submit that does not run
+  to an outcome (the database is down) counts nothing and verifies nothing, and
+  `submit_claim` drops the claim and the digits.
 - `verification_attempts` holds the claim's keyed hash (HMAC-SHA256 under
   `IDENTITY_HASH_KEY` over the name's letters and the ISO date), the call id, whether it
   matched and when; never a name, a date or a digit. The runtime role may only read and
@@ -468,13 +473,15 @@ name, message text, balance or status reaches the audit log or the logs.
   against the caller's own medications only. No match, or more than one: `not_found` and
   nothing else, no list. A match without `confirmed: true`: `needs_confirmation` with the
   medication and pharmacy to read back. Confirmed: a `requests` row (type `refill`, summary
-  `<medication> at <pharmacy>`, built by code and cut to its first 200 characters) and `requested`, or `sent_to_doctor` when no
-  refills are left, with the medication and pharmacy. The refill count is never returned.
+  `<medication> at <pharmacy>`, built by code and cut to its first 200 characters) and
+  `requested`, or `sent_to_doctor` when no refills are left, with the medication and
+  pharmacy. The refill count is never returned.
 - `get_lab_status`: the stored status text only; the clinic stores no results.
 - `get_balance`: the balance as an exact two-decimal string (`45.00`).
 - `send_message_to_doctor(summary_short, confirmed)`: 1 to 120 characters after trimming, with
-  no control character (C0, NUL included, or DEL) inside; anything else is refused without
-  echoing it. Without `confirmed: true`:
+  no control character (C0, NUL included, DEL or C1) or format character (zero-width ones,
+  bidi overrides, embeddings and isolates, the soft hyphen) inside; anything else is refused
+  without echoing it. Without `confirmed: true`:
   `needs_confirmation` with the text as it will be stored. Confirmed: a `messages` row (kind
   `doctor_message`), a `requests` row (type `doctor_message`, the same text) and the message's
   id.
@@ -482,7 +489,8 @@ name, message text, balance or status reaches the audit log or the logs.
 - A call asks for the same thing once. The same refill again in one call (the same medication,
   however it is said) or the same message again returns what the first did and writes nothing:
   the database's unique constraints decide (`requests` on call, type and summary; `messages` on
-  call, kind and body). A later call is a new request.
+  call, kind, body, name and number, two missing values counting as the same). A later call is
+  a new request.
 - A failure part-way (a database error, or the audit event not written) leaves nothing
   written, gives the model the generic failure and counts toward a hand-off.
 - Limits:
@@ -503,54 +511,65 @@ declares its closed-office phases, and every other tool declares none.
 
 - `take_message(name, callback_number, reason_short, confirmed)`: in `intake` with the office
   closed, and in `serving`. The name is 1 to 80 characters and the reason 1 to 120, each
-  trimmed, with no control character, SSNs masked and the bound checked after masking; the
-  number is exactly ten digits once spaces, hyphens, dots and brackets are taken out, and is
-  stored as those digits (staff call back). Without `confirmed: true`: `needs_confirmation`
-  with the three to read back, nothing written. Confirmed: a `messages` row (kind `callback`,
-  `after_hours` when the office was closed at the start of the call, the state's patient id
-  for a verified caller and none otherwise) and a `requests` row (type `callback`, the reason).
-  It never reads `patients`. With the office closed the call then moves to `closing` and the
-  outcome names `after_hours_close`, with the name and `day` or `night` (before or from 5 PM
-  clinic time) as its script values.
+  trimmed, with no control or format character (the same check as the doctor's message), SSNs
+  masked and the bound checked after masking; the number is exactly ten digits once spaces,
+  hyphens, dots and brackets are taken out, and is stored as those digits (staff call back).
+  Without `confirmed: true`: `needs_confirmation` with the three to read back, nothing
+  written. Confirmed: a `messages` row (kind `callback`, `after_hours` when the office was
+  closed at the start of the call, the state's patient id for a verified caller and none
+  otherwise) and a `requests` row (type `callback`, the reason). The same message again writes
+  nothing; a corrected name or number is a message of its own, under the one request for the
+  same reason. It never reads `patients`. With the office closed the call then moves to
+  `closing` and the outcome names `after_hours_close`, with the name and `day` (05:00 up to
+  17:00 clinic time) or `night` as its values.
 - `transfer_to_staff(reason, confirmed)`: in `intake`, `serving` and `booking`, office open
   only. The reason is one of `caller_request`, `frustration`, `verification_locked` (the
   caller accepts the transfer the locked line offers) and `other`. Confirmed: a `requests` row
   (type `transfer`, the reason), the call moves to `handoff` and the outcome names `transfer`.
-- `report_emergency()`: in every phase that has tools, open or closed. The call moves to
-  `emergency` and the outcome names `emergency`. After that no tool runs, a second report
-  included, and the only move left is to `ended`.
+- `report_emergency()`: offered in every phase that has tools, open or closed. After the
+  emergency no tool runs, a second report included, and the only move left is to `ended`.
 - `close_call()`: in `intake`, `serving` and `booking` (`intake` only when closed). The call
   moves to `closing`, which ends any identity claim and SSN step, and the outcome names
   `goodbye`.
 - `call_tool(state, name, args, deps)` in `app/agent/tools.py` is the model's tool call as the
-  pipeline is to make it: dispatch, then code's part. When an outcome asks for a hand-off (two
-  failures, five refusals), code runs the code-only `hand_off_to_staff` with the office open
-  (a `transfer` request, reason `verification_locked` for a locked call and `other`
-  otherwise); with the office closed the call stays where it is and the outcome names
-  `guard_fallback`, which offers the message. A call already in `closing`, `emergency` or
-  `handoff` is left to go.
-- `emergency(state, trigger, deps)`: the input guard's emergency, applied by code. Every live
-  phase moves to `emergency` and the line is `emergency`; the event is `emergency_detected`
-  with reason `guard`, as the tool's has `model`.
+  pipeline is to make it. A call naming `report_emergency` is decided first, whatever its
+  arguments: where the tool is offered, it goes the emergency's one way (below), with no tool
+  transaction, nothing counted and no hand-off; elsewhere it is refused like any tool. Any
+  other call goes to dispatch. The outcome whose failure or refusal reaches the limit (the
+  second failure, the fifth refusal) acts once: with the office open, code runs the code-only
+  `hand_off_to_staff` (a `transfer` request, reason `verification_locked` for a locked call
+  and `other` otherwise); with it closed the call stays where it is and the outcome names
+  `guard_fallback`, which offers the message. Later outcomes are returned as they are, and a
+  call already in `closing`, `emergency` or `handoff` is left to go.
+- `emergency(state, trigger, deps)`: the one way to the emergency line, for the input guard
+  (`guard`) and the model's report (`model`). Every live phase moves to `emergency` and the
+  line is `emergency`; the event is `emergency_detected` with the trigger as its reason.
 - `start_call(call_id, deps)`: the call's first state, `office_open` from the call's clock,
-  and its first line, `greeting` or `closed`; it writes `call_started`.
+  and its first line, `greeting` or `closed`; its event is `call_started`.
 - `end_call(state, reason, deps)`: the one way a call ends. `completed` from `closing`,
   `emergency` from `emergency`, `transferred` from `handoff`; `caller_hung_up`,
   `idle_timeout`, `max_duration` and `error` from any live phase. Anything else is refused,
-  and a reason is a member of the audit registry's `Reason`, never text. It writes
-  `call_ended` with the reason once per call, however many times it is called.
-- Every tool call's work, state change and event commit together, as for every tool. The
-  call's own events (`call_started`, `call_ended`, `emergency_detected` from the guard) are
-  written in their own transaction within 2 seconds; one that fails or runs out of time is
-  logged (`call_audit_failed`) and nothing else changes: the 911 line never depends on the
-  database. When dispatch cannot carry out `report_emergency`, `call_tool` moves the call and
-  names the line all the same.
+  and a reason is a member of the audit registry's `Reason`, never text. Its event,
+  `call_ended` with the reason, is written once per call, however many times it is called.
+- The emergency line, the start and the end never wait on the database: each returns its
+  state and line before any database work, and its event is written by a task of its own that
+  nobody waits for. A call's events are written in the order they happened. A write is given
+  up after 2 seconds, its clean-up included (it is cancelled, then cancelled again every 0.1
+  second; the driver, interrupted while it waits on the server, closes the connection), and a
+  write that fails or is given up is logged as `call_audit_failed` with the event's name and
+  the error's class. `drain_call_events()` waits for the writes still running, for tests and
+  for shutdown. Measured with a warm pool and a server that has stopped answering, and with
+  the audit chain's lock held by another transaction: the guard's and the model's emergency,
+  the start and the end return in well under a millisecond, and the stalled writes are given
+  up within about 2.1 seconds.
+- Every other tool call's work, state change and event commit together, as for every tool.
 - Events: `message_taken`, `message_previewed`, `transfer_requested` (with its reason),
   `transfer_previewed`, `emergency_detected` (`guard` or `model`), `call_closed`,
   `call_started`, `call_ended` (with its reason), each on resource type `call` with the call
   id. No name, number or message text reaches an event or a log line.
-- Schema: `messages.after_hours` (false by default), the message kind `callback`, and the
-  request types `callback` and `transfer`.
+- Schema: `messages.after_hours` (false by default), the message kind `callback`, the request
+  types `callback` and `transfer`, and the messages' unique constraint on call, kind, body,
+  name and number, with two missing values counting as the same.
 
 Limits, stated plainly:
 
@@ -559,14 +578,15 @@ Limits, stated plainly:
   `handoff`.
 - A transfer the model asks for needs `confirmed: true` like any other write the model asks
   for; the code-only hand-off does not.
-- `end_call` writes `call_ended` only for a call `start_call` started in the same process; the
-  calls started and not yet ended are held in memory, so a restart forgets them.
-- With the database not answering, `report_emergency` through `call_tool` waits for dispatch
-  to fail (up to its connect and statement limits) before it moves the call; the input guard's
-  emergency waits at most the 2 seconds of its event's write.
-- `part_of_day` is `day` for any time before 5 PM clinic time, the small hours included.
+- The calls started and not yet ended are held in memory, per process, at most 1000 of them;
+  past that the oldest is forgotten (`live_call_dropped`) and its end writes no event. A
+  restart forgets them all. A `call_ended` write that fails is not tried again.
+- A call event that cannot be written within its 2 seconds is lost, and the log says so; the
+  call goes on. Events still being written when the process stops are lost unless shutdown
+  waits for `drain_call_events()`.
 - Nothing calls `start_call`, `end_call`, `emergency` or `call_tool` yet; the voice pipeline
-  will, with the idle and maximum-duration timers.
+  will, with the idle and maximum-duration timers, and its shutdown with
+  `drain_call_events()`.
 
 ## Configuration
 

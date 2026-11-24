@@ -9,15 +9,17 @@ message closes the call. `transfer_to_staff` needs the office open; the transfer
 the request row and the event are real, there is no phone system behind them.
 
 `start_call` creates the call, deciding once from the call's clock whether the office is open,
-and `end_call` is the one way it ends; `emergency` is the input guard's way to the emergency
-line. Their events (`call_started`, `call_ended`, `emergency_detected`) are written in a
-transaction of their own within RECORD_DEADLINE_SECONDS. A write that fails or runs out of time
-is logged and changes nothing else: the state and the line are returned all the same, so the
-emergency line never depends on the database.
+and `end_call` is the one way it ends; `emergency` is the one way to the emergency line, for the
+input guard and for the model's report alike (`call_tool` in app/agent/tools.py). Each returns
+the state and the line before any database work: its event (`call_started`, `call_ended`,
+`emergency_detected`) is written by a task of its own that nobody waits for. The write is given
+up after RECORD_DEADLINE_SECONDS, its clean-up included, and a write that fails or is given up
+is logged; nothing else changes. `drain_call_events` waits for the writes still running, for
+tests and for shutdown.
 
 `end_call` writes `call_ended` once per call: for a call `start_call` started in this process,
 the first `end_call` that ends it. The calls this process has started and not ended are held
-in memory.
+in memory, at most MAX_LIVE_CALLS of them; a failed `call_ended` write is not tried again.
 
 Logs carry event names, call ids, reasons and exception class names; never a name, a number or
 message text.
@@ -25,6 +27,7 @@ message text.
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -32,13 +35,14 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.scripts import ScriptId
-from app.agent.serving import CONTROL_CHARACTER, NEEDS_CONFIRMATION
+from app.agent.serving import NEEDS_CONFIRMATION
 from app.agent.state import CallState, IllegalTransitionError, Move, Phase, move, new_call
 from app.agent.tool_registry import Deps, HandlerContext, NoArguments, Tool, ToolResult
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
-from app.db.models import MAX_MESSAGE_BODY, Message, Request
+from app.db.models import MAX_MESSAGE_BODY, MESSAGE_KEY, Message, Request
 from app.domain.office_hours import is_open, part_of_day
 from app.guard.mask import mask_ssns
+from app.guard.text import has_hidden_characters
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +56,15 @@ CALLBACK_DIGITS = 10
 # What a caller may say between the digits of a callback number.
 NUMBER_SEPARATORS = frozenset(" -.()")
 
-# A call event's write ends within this many seconds, or it is given up and logged.
+# A call event's write is given up after this many seconds: it is cancelled, then cancelled
+# again every CANCEL_INTERVAL_SECONDS until it has ended. The driver, interrupted a second time
+# while it waits on the server, closes the connection, which ends every wait on it.
 RECORD_DEADLINE_SECONDS = 2
+CANCEL_INTERVAL_SECONDS = 0.1
+
+# The calls held as started and not ended: far above any number of calls at once
+# (MAX_CONCURRENT_CALLS is at most 20). Past it the oldest is forgotten.
+MAX_LIVE_CALLS = 1000
 
 # The phases the model has tools in.
 TOOL_PHASES = frozenset({Phase.INTAKE, Phase.SERVING, Phase.BOOKING})
@@ -72,15 +83,25 @@ END_PHASES: dict[Reason, frozenset[Phase]] = {
     Reason.ERROR: _LIVE_PHASES,
 }
 EMERGENCY_TRIGGERS = frozenset({Reason.GUARD, Reason.MODEL})
+TRANSFER_REASONS = frozenset(
+    {Reason.CALLER_REQUEST, Reason.FRUSTRATION, Reason.VERIFICATION_LOCKED, Reason.OTHER}
+)
+HAND_OFF_REASONS = frozenset({Reason.VERIFICATION_LOCKED, Reason.OTHER})
 
-_LIVE_CALLS: set[str] = set()
+# Started and not ended, oldest first.
+_LIVE_CALLS: dict[str, None] = {}
+# The call event writes still running, and what bounds them: held until each has ended.
+_PENDING: set[asyncio.Future[None]] = set()
+# Each call's latest event write still running: the next one waits for it, so a call's events
+# are written in the order they happened.
+_LATEST: dict[str, asyncio.Future[None]] = {}
 
 
 def _as_stored(value: str, longest: int, field: str) -> str:
-    """Caller text as it is read back and stored: no control character, SSNs masked, and at most
-    `longest` characters once masked. Masking makes text longer, never empty."""
-    if CONTROL_CHARACTER.search(value):
-        raise ValueError(f"{field} must not contain control characters")
+    """Caller text as it is read back and stored: no control or format character, SSNs masked,
+    and at most `longest` characters once masked. Masking makes text longer, never empty."""
+    if has_hidden_characters(value):
+        raise ValueError(f"{field} must not contain control or format characters")
     stored = mask_ssns(value)
     if len(stored) > longest:
         raise ValueError(f"{field} must be at most {longest} characters once SSNs are masked")
@@ -176,7 +197,7 @@ async def take_message(
             body=arguments.reason_short,
             after_hours=not state.office_open,
         )
-        .on_conflict_do_nothing(index_elements=["call_id", "kind", "body"])
+        .on_conflict_do_nothing(index_elements=MESSAGE_KEY)
     )
     await _record_request(session, state, CALLBACK, arguments.reason_short)
     if state.office_open:
@@ -254,6 +275,7 @@ TAKE_MESSAGE = Tool(
     takes_identity_claim=False,
     audit_action=Action.MESSAGE_TAKEN,
     outcome_actions={Action.MESSAGE_PREVIEWED: Outcome.SUCCESS},
+    audit_reasons=frozenset(),
     resource_type=ResourceType.CALL,
 )
 
@@ -270,6 +292,7 @@ TRANSFER_TO_STAFF = Tool(
     takes_identity_claim=False,
     audit_action=Action.TRANSFER_REQUESTED,
     outcome_actions={Action.TRANSFER_PREVIEWED: Outcome.SUCCESS},
+    audit_reasons=TRANSFER_REASONS,
     resource_type=ResourceType.CALL,
 )
 
@@ -286,6 +309,7 @@ REPORT_EMERGENCY = Tool(
     takes_identity_claim=False,
     audit_action=Action.EMERGENCY_DETECTED,
     outcome_actions={},
+    audit_reasons=frozenset({Reason.MODEL}),
     resource_type=ResourceType.CALL,
 )
 
@@ -302,38 +326,87 @@ CLOSE_CALL = Tool(
     takes_identity_claim=False,
     audit_action=Action.CALL_CLOSED,
     outcome_actions={},
+    audit_reasons=frozenset(),
     resource_type=ResourceType.CALL,
 )
 
 ENDING_TOOLS = (TAKE_MESSAGE, TRANSFER_TO_STAFF, REPORT_EMERGENCY, CLOSE_CALL)
 
 
-async def _record(state: CallState, action: Action, reason: Reason | None, deps: Deps) -> None:
-    """A call event, in a transaction of its own, within RECORD_DEADLINE_SECONDS. If it cannot
-    be written the failure is logged and nothing else changes."""
+def _failed(action: Action, call_id: str, error: BaseException) -> None:
+    logger.error(
+        "call_audit_failed action=%s call_id=%s error=%s",
+        action.value,
+        call_id,
+        type(error).__name__,
+    )
+
+
+def _held(task: "asyncio.Future[None]") -> None:
+    """Hold the task until it has ended."""
+    _PENDING.add(task)
+    task.add_done_callback(_PENDING.discard)
+
+
+async def _write(
+    event: Event, now: datetime, deps: Deps, before: "asyncio.Future[None] | None"
+) -> None:
+    if before is not None:
+        await asyncio.wait({before})
+    async with deps.sessions() as session:
+        await deps.audit.append(session, event, now=now)
+        await session.commit()
+
+
+async def _bound(write: "asyncio.Future[None]", action: Action, call_id: str) -> None:
+    """Give the write up after RECORD_DEADLINE_SECONDS and see it end; log how it failed."""
+    done, _pending = await asyncio.wait({write}, timeout=RECORD_DEADLINE_SECONDS)
+    given_up = not done
+    while not done:
+        write.cancel()
+        done, _pending = await asyncio.wait({write}, timeout=CANCEL_INTERVAL_SECONDS)
+    error = asyncio.CancelledError() if write.cancelled() else write.exception()
+    if given_up:
+        error = TimeoutError()
+    if error is not None:
+        _failed(action, call_id, error)
+
+
+def _record_later(state: CallState, action: Action, reason: Reason | None, deps: Deps) -> None:
+    """Write the call's event by a task of its own; the caller does not wait for it. Nothing
+    here raises: a failure is logged."""
     try:
-        async with asyncio.timeout(RECORD_DEADLINE_SECONDS), deps.sessions() as session:
-            await deps.audit.append(
-                session,
-                Event(
-                    actor=AGENT,
-                    action=action,
-                    resource_type=ResourceType.CALL,
-                    outcome=Outcome.SUCCESS,
-                    call_id=state.call_id,
-                    resource_id=state.call_id,
-                    reason=reason,
-                ),
-                now=deps.now(),
-            )
-            await session.commit()
-    except Exception as error:
-        logger.error(
-            "call_audit_failed action=%s call_id=%s error=%s",
-            action.value,
-            state.call_id,
-            type(error).__name__,
+        event = Event(
+            actor=AGENT,
+            action=action,
+            resource_type=ResourceType.CALL,
+            outcome=Outcome.SUCCESS,
+            call_id=state.call_id,
+            resource_id=state.call_id,
+            reason=reason,
         )
+        now = deps.now()
+    except Exception as error:
+        _failed(action, state.call_id, error)
+        return
+    call_id = state.call_id
+    write = asyncio.ensure_future(_write(event, now, deps, _LATEST.get(call_id)))
+    _LATEST[call_id] = write
+
+    def forget(_ended: "asyncio.Future[None]") -> None:
+        if _LATEST.get(call_id) is write:
+            del _LATEST[call_id]
+
+    write.add_done_callback(forget)
+    _held(write)
+    _held(asyncio.ensure_future(_bound(write, action, call_id)))
+
+
+async def drain_call_events() -> None:
+    """Wait until every call event write still running has been written or given up: for tests,
+    and for shutdown."""
+    while _PENDING:
+        await asyncio.wait(set(_PENDING))
 
 
 async def start_call(call_id: str, deps: Deps) -> tuple[CallState, ScriptId]:
@@ -343,9 +416,13 @@ async def start_call(call_id: str, deps: Deps) -> tuple[CallState, ScriptId]:
         raise ValueError("the call has already started")
     started_at = deps.now()
     state = new_call(call_id=call_id, started_at=started_at, office_open=is_open(started_at))
-    _LIVE_CALLS.add(state.call_id)
+    if len(_LIVE_CALLS) >= MAX_LIVE_CALLS:
+        oldest = next(iter(_LIVE_CALLS))
+        del _LIVE_CALLS[oldest]
+        logger.warning("live_call_dropped call_id=%s", oldest)
+    _LIVE_CALLS[state.call_id] = None
     logger.info("call_started call_id=%s office_open=%s", state.call_id, state.office_open)
-    await _record(state, Action.CALL_STARTED, None, deps)
+    _record_later(state, Action.CALL_STARTED, None, deps)
     return state, ScriptId.GREETING if state.office_open else ScriptId.CLOSED
 
 
@@ -361,16 +438,16 @@ async def end_call(state: CallState, reason: Reason, deps: Deps) -> CallState:
         raise IllegalTransitionError(f"{state.phase.value} -> ended is refused for {reason.value}")
     ended = move(state, Phase.ENDED)
     if state.call_id in _LIVE_CALLS:
-        _LIVE_CALLS.discard(state.call_id)
-        await _record(ended, Action.CALL_ENDED, reason, deps)
+        del _LIVE_CALLS[state.call_id]
+        _record_later(ended, Action.CALL_ENDED, reason, deps)
     return ended
 
 
 async def emergency(state: CallState, trigger: Reason, deps: Deps) -> tuple[CallState, ScriptId]:
-    """The call moved to emergency, and the emergency line, whatever the database does."""
+    """The call moved to emergency, and the emergency line, before any database work."""
     if not isinstance(trigger, Reason) or trigger not in EMERGENCY_TRIGGERS:
         raise ValueError("an emergency is detected by the guard or the model")
     after = move(state, Phase.EMERGENCY)
     logger.warning("emergency_detected call_id=%s trigger=%s", state.call_id, trigger.value)
-    await _record(after, Action.EMERGENCY_DETECTED, trigger, deps)
+    _record_later(after, Action.EMERGENCY_DETECTED, trigger, deps)
     return after, ScriptId.EMERGENCY

@@ -14,7 +14,6 @@ written or already there.
 handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
-import re
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -28,6 +27,7 @@ from app.audit.log import Action, Outcome, ResourceType
 from app.db.models import (
     MAX_MESSAGE_BODY,
     MAX_REQUEST_SUMMARY,
+    MESSAGE_KEY,
     SCHEDULED,
     Appointment,
     Medication,
@@ -38,6 +38,7 @@ from app.db.models import (
 from app.domain.clinic import CLINIC_TZ
 from app.domain.matching import match_medication
 from app.guard.mask import mask_ssns
+from app.guard.text import has_hidden_characters
 
 REFILL = "refill"
 DOCTOR_MESSAGE = "doctor_message"
@@ -47,9 +48,6 @@ NOT_FOUND = "not_found"
 REQUESTED = "requested"
 SENT_TO_DOCTOR = "sent_to_doctor"
 SENT = "sent"
-
-# C0 control characters, NUL included, and DEL: never in a stored message.
-CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 
 DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 MONTHS = (
@@ -91,8 +89,8 @@ class MessageArguments(BaseModel):
     @classmethod
     def _as_stored(cls, value: str) -> str:
         """The text as it is read back and stored: trimmed, SSNs masked, still in bounds."""
-        if CONTROL_CHARACTER.search(value):
-            raise ValueError("summary_short must not contain control characters")
+        if has_hidden_characters(value):
+            raise ValueError("summary_short must not contain control or format characters")
         stored = mask_ssns(value)
         if not 1 <= len(stored) <= MAX_MESSAGE_BODY:
             raise ValueError(f"summary_short must be 1 to {MAX_MESSAGE_BODY} characters")
@@ -214,7 +212,7 @@ async def send_message_to_doctor(
     message_id = await session.scalar(
         insert(Message)
         .values(call_id=state.call_id, patient_id=patient_id, kind=DOCTOR_MESSAGE, body=body)
-        .on_conflict_do_nothing(index_elements=["call_id", "kind", "body"])
+        .on_conflict_do_nothing(index_elements=MESSAGE_KEY)
         .returning(Message.id)
     )
     if message_id is None:
@@ -255,6 +253,7 @@ def _serving_tool(
         takes_identity_claim=False,
         audit_action=action,
         outcome_actions={} if outcome_actions is None else outcome_actions,
+        audit_reasons=frozenset(),
         resource_type=ResourceType.PATIENT,
     )
 

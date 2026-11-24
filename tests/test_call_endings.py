@@ -6,7 +6,8 @@ through the application registry's dispatch."""
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
@@ -18,8 +19,15 @@ from pydantic import SecretStr
 from sqlalchemy import Engine, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app.agent import endings
 from app.agent.claims import ClaimKeys
-from app.agent.endings import emergency, end_call, start_call
+from app.agent.endings import (
+    MAX_LIVE_CALLS,
+    drain_call_events,
+    emergency,
+    end_call,
+    start_call,
+)
 from app.agent.scripts import ScriptId
 from app.agent.state import (
     CallState,
@@ -36,7 +44,7 @@ from app.agent.state import (
 )
 from app.agent.tool_registry import Deps, Registry, Status, ToolOutcome
 from app.agent.tools import call_tool, register_tools
-from app.audit.log import Action, AuditLog, Event, Outcome, Reason, ResourceType
+from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.config import StartupSettings
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
@@ -173,7 +181,9 @@ def rows(engine: Engine, query: Any) -> list[tuple[Any, ...]]:
         return [tuple(row) for row in connection.execute(query)]
 
 
-def events_of(engine: Engine, state: CallState) -> list[tuple[Any, ...]]:
+async def events_of(engine: Engine, state: CallState) -> list[tuple[Any, ...]]:
+    """The call's events, once every call event still being written is in."""
+    await drain_call_events()
     return [row for row in rows(engine, EVENTS) if row[4] == state.call_id]
 
 
@@ -217,6 +227,8 @@ def clock() -> Clock:
 @pytest.fixture
 async def deps(runtime: AsyncEngine, clock: Clock) -> AsyncIterator[Deps]:
     yield deps_with(runtime, clock)
+    # No call event is left being written once the test's engine goes.
+    await drain_call_events()
 
 
 @pytest.fixture
@@ -243,6 +255,75 @@ class AuditThatFails(AuditLog):
         raise OSError("the database is down")
 
 
+class AuditThatRefuses(AuditLog):
+    """The real append, except for events of one action, which fail before anything is
+    written."""
+
+    def __init__(self, key: SecretStr, action: Action) -> None:
+        super().__init__(key)
+        self.refused = action
+
+    async def append(self, session: AsyncSession, event: Event, *, now: datetime) -> int:
+        if event.action is self.refused:
+            raise OSError("this event cannot be written")
+        return await super().append(session, event, now=now)
+
+
+class StallingProxy:
+    """A relay between the application and the database that can stop passing bytes, both
+    ways, on every connection, open or new: a server that has stopped answering while the
+    pool's connections stay open. A cancel request, which libpq sends on a connection of its
+    own, stalls the same way."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._target = (host, port)
+        self._flowing = asyncio.Event()
+        self._flowing.set()
+        self._writers: list[asyncio.StreamWriter] = []
+        self._server: asyncio.Server | None = None
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        return int(self._server.sockets[0].getsockname()[1])
+
+    def stall(self) -> None:
+        self._flowing.clear()
+
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        upstream_reader, upstream_writer = await asyncio.open_connection(*self._target)
+        self._writers.append(upstream_writer)
+        await asyncio.gather(
+            self._relay(reader, upstream_writer), self._relay(upstream_reader, writer)
+        )
+
+    async def _relay(self, source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+        try:
+            while data := await source.read(65536):
+                await self._flowing.wait()
+                sink.write(data)
+                await sink.drain()
+        except ConnectionError:
+            pass
+        finally:
+            sink.close()
+
+    async def close(self) -> None:
+        assert self._server is not None
+        self._server.close()
+        self._flowing.set()
+        for writer in self._writers:
+            writer.close()
+        await self._server.wait_closed()
+
+
+async def timed[Result](call: Awaitable[Result]) -> tuple[Result, float]:
+    """The call's result and how many seconds it took to return."""
+    started = time.perf_counter()
+    result = await call
+    return result, time.perf_counter() - started
+
+
 # --- R1, R2: the emergency line ----------------------------------------------------------------
 
 
@@ -265,7 +346,9 @@ async def test_emergency_everywhere(
             reported.append(state)
     assert len(reported) == 6
     for state in reported:
-        assert events_of(owner_engine, state) == [call_event("emergency_detected", state, "model")]
+        assert await events_of(owner_engine, state) == [
+            call_event("emergency_detected", state, "model")
+        ]
 
     # The input guard's emergency moves every live call, in every phase, open or closed.
     guarded = []
@@ -282,13 +365,15 @@ async def test_emergency_everywhere(
     after, script = await emergency(verified, Reason.GUARD, deps)
     assert (after.phase, after.patient_id, script) == (EMERGENCY, "P001", ScriptId.EMERGENCY)
     for state in [*guarded, verified]:
-        assert events_of(owner_engine, state) == [call_event("emergency_detected", state, "guard")]
+        assert await events_of(owner_engine, state) == [
+            call_event("emergency_detected", state, "guard")
+        ]
 
     # A call that has ended has no line to speak.
     gone = reach(ENDED, True)
     with pytest.raises(IllegalTransitionError):
         await emergency(gone, Reason.GUARD, deps)
-    assert events_of(owner_engine, gone) == []
+    assert await events_of(owner_engine, gone) == []
 
 
 async def test_emergency_is_terminal(
@@ -313,7 +398,7 @@ async def test_emergency_is_terminal(
                 move(state, phase)
         assert move(state, ENDED).phase is ENDED
     for state in states:
-        assert [row[0] for row in events_of(owner_engine, state)] == [
+        assert [row[0] for row in await events_of(owner_engine, state)] == [
             "emergency_detected",
             *["tool_refused"] * len(every_tool),
         ]
@@ -349,7 +434,7 @@ async def test_closed_office_tools(
             closed, name, arguments if name == "verify_identity" else {}, deps
         )
         assert (after.phase, outcome) == (INTAKE, REFUSED), name
-    assert [row[0] for row in events_of(owner_engine, closed)] == ["tool_refused"] * 4
+    assert [row[0] for row in await events_of(owner_engine, closed)] == ["tool_refused"] * 4
 
 
 # --- R4 to R6: the message ---------------------------------------------------------------------
@@ -447,6 +532,10 @@ async def test_message_rules(
         message(name=name_grows),
         message(name="Ana\x00Diaz"),
         message(name="Ana\nDiaz"),
+        # Format characters: zero-width, and the bidi overrides and isolates.
+        message(name="Ana​Diaz"),
+        message(name="‮Ana Diaz"),
+        message(name="Ana﻿"),
         message(name=12),
         # Seven digits: the model asks for the area code.
         message(number="555-2013"),
@@ -465,6 +554,9 @@ async def test_message_rules(
         message(reason=grows),
         message(reason=grows_by_one),
         message(reason="call\x07me"),
+        message(reason="call\x85me"),
+        message(reason="call me⁦ back"),
+        message(reason="call me‍ back"),
     ]
     for arguments in refused:
         for confirmed in (False, True):
@@ -537,14 +629,16 @@ async def test_message_rules(
         (closed.call_id, None, "callback", NOTE),
         (verified.call_id, "P001", "callback", "Lab question"),
     ]
-    assert [row[0] for row in events_of(owner_engine, closed) if row[0] != "tool_refused"] == [
+    assert [
+        row[0] for row in await events_of(owner_engine, closed) if row[0] != "tool_refused"
+    ] == [
         "message_previewed",
         "message_previewed",
         *["message_previewed"] * len(accepted),
         "message_taken",
         "message_taken",
     ]
-    assert events_of(owner_engine, verified) == [call_event("message_taken", verified)]
+    assert await events_of(owner_engine, verified) == [call_event("message_taken", verified)]
 
 
 async def test_message_text_stays_out_of_logs_and_audit(
@@ -629,7 +723,7 @@ async def test_transfer_rules(
         for state, reason in transferred
     ]
     for state, reason in transferred:
-        assert events_of(owner_engine, state) == [
+        assert await events_of(owner_engine, state) == [
             call_event("transfer_requested", state, reason),
             refused_event(state, TRANSFER),
         ]
@@ -647,8 +741,8 @@ async def test_end_call_rules(deps: Deps, clock: Clock, owner_engine: Engine) ->
             state = move(state, phase)
         return state
 
-    def ended_events(state: CallState) -> list[tuple[Any, ...]]:
-        return [row for row in events_of(owner_engine, state) if row[0] == "call_ended"]
+    async def ended_events(state: CallState) -> list[tuple[Any, ...]]:
+        return [row for row in await events_of(owner_engine, state) if row[0] == "call_ended"]
 
     # Each reason from the phases it ends a call from.
     for path, reason in (
@@ -669,11 +763,11 @@ async def test_end_call_rules(deps: Deps, clock: Clock, owner_engine: Engine) ->
         state = await started(*path)
         ended = await end_call(state, reason, deps)
         assert ended.phase is ENDED, (path, reason)
-        assert ended_events(state) == [call_event("call_ended", state, reason.value)]
+        assert await ended_events(state) == [call_event("call_ended", state, reason.value)]
         # Twice, with the ended state or with the one before it: one event.
         assert await end_call(ended, reason, deps) == ended
         assert await end_call(state, reason, deps) == ended
-        assert ended_events(state) == [call_event("call_ended", state, reason.value)]
+        assert await ended_events(state) == [call_event("call_ended", state, reason.value)]
 
     # And a verified caller's call that the model closed.
     state, _script = await start_call(new_call_id(), deps)
@@ -697,7 +791,7 @@ async def test_end_call_rules(deps: Deps, clock: Clock, owner_engine: Engine) ->
         state = await started(*path)
         with pytest.raises(IllegalTransitionError):
             await end_call(state, reason, deps)
-        assert ended_events(state) == [], (path, reason)
+        assert await ended_events(state) == [], (path, reason)
 
     # Two ends of one call at the same moment: one event.
     state = await started(INTAKE, CLOSING)
@@ -705,12 +799,12 @@ async def test_end_call_rules(deps: Deps, clock: Clock, owner_engine: Engine) ->
         end_call(state, Reason.COMPLETED, deps), end_call(state, Reason.CALLER_HUNG_UP, deps)
     )
     assert [item.phase for item in both] == [ENDED, ENDED]
-    assert ended_events(state) == [call_event("call_ended", state, "completed")]
+    assert await ended_events(state) == [call_event("call_ended", state, "completed")]
 
     # A state that start_call did not start is ended without an event.
     stray = move(intake(), CLOSING)
     assert (await end_call(stray, Reason.COMPLETED, deps)).phase is ENDED
-    assert events_of(owner_engine, stray) == []
+    assert await events_of(owner_engine, stray) == []
 
 
 async def test_reasons_are_fixed(
@@ -732,7 +826,7 @@ async def test_reasons_are_fixed(
     for trigger in ("guard", "model", Reason.COMPLETED, Reason.OTHER, None):
         with pytest.raises(ValueError, match="guard or the model"):
             await emergency(closing, trigger, deps)  # type: ignore[arg-type]
-    assert [row[0] for row in events_of(owner_engine, state)] == ["call_started"]
+    assert [row[0] for row in await events_of(owner_engine, state)] == ["call_started"]
 
     # The model is offered the transfer's four reasons, and nothing else is taken.
     (described,) = [item for item in registry.tools_for(intake()) if item.name == TRANSFER]
@@ -772,48 +866,66 @@ async def test_start_call(deps: Deps, clock: Clock, owner_engine: Engine) -> Non
         state, first = await start_call(call_id, deps)
         assert state == new_call(call_id=call_id, started_at=now, office_open=office_open)
         assert first is script
-        assert events_of(owner_engine, state) == [call_event("call_started", state)]
+        assert await events_of(owner_engine, state) == [call_event("call_started", state)]
 
         # The same call is not started twice.
         with pytest.raises(ValueError, match="already"):
             await start_call(call_id, deps)
-        assert events_of(owner_engine, state) == [call_event("call_started", state)]
+        assert await events_of(owner_engine, state) == [call_event("call_started", state)]
 
 
 # --- R11: the automatic hand-off ---------------------------------------------------------------
 
 
-async def test_automatic_handoff(
-    registry: Registry, deps: Deps, clock: Clock, seeded: None, owner_engine: Engine
-) -> None:
-    def refused_four_times(state: CallState) -> CallState:
-        for _ in range(4):
-            state = count_refusal(state)
-        return state
+def refused_four_times(state: CallState) -> CallState:
+    for _ in range(4):
+        state = count_refusal(state)
+    return state
 
+
+async def test_automatic_handoff(
+    registry: Registry,
+    deps: Deps,
+    runtime: AsyncEngine,
+    clock: Clock,
+    seeded: None,
+    owner_engine: Engine,
+) -> None:
     clock.now = OPEN_AT
-    # Open: five refusals, two failures, or a locked call that keeps asking: handoff.
+    # Open: the fifth refusal, or a locked call's fifth: handoff.
     locked = fail_attempt(fail_attempt(fail_attempt(intake())))
     handed = []
     for state, name, reason in (
         (refused_four_times(intake()), "no_such_tool", "other"),
-        (count_tool_error(count_tool_error(sarah())), "verify_identity", "other"),
         (refused_four_times(move(intake(), BOOKING)), "get_balance", "other"),
         (refused_four_times(locked), "get_balance", "verification_locked"),
     ):
         after, outcome = await call_tool(state, name, {}, deps)
         assert after.phase is HANDOFF, reason
         assert outcome == TRANSFERRING.model_copy(update={"hand_off": True})
-        handed.append((state, name, reason))
-    assert rows(owner_engine, REQUESTS) == [
-        (state.call_id, "P001" if state.verified else None, "transfer", reason)
-        for state, _name, reason in handed
-    ]
-    for state, name, reason in handed:
-        assert events_of(owner_engine, state) == [
+        handed.append((state, reason))
+        assert await events_of(owner_engine, state) == [
             refused_event(state, name if name != "no_such_tool" else None),
             call_event("transfer_requested", state, reason),
         ]
+    # The second failure: a goodbye whose event cannot be written fails, and the call goes to
+    # the staff.
+    failing_goodbye = deps_with(
+        runtime, clock, AuditThatRefuses(SecretStr(TEST_AUDIT_KEY), Action.CALL_CLOSED)
+    )
+    state = count_tool_error(sarah())
+    after, outcome = await call_tool(state, CLOSE, {}, failing_goodbye)
+    assert after.phase is HANDOFF
+    assert outcome == TRANSFERRING.model_copy(update={"hand_off": True})
+    handed.append((state, "other"))
+    assert await events_of(owner_engine, state) == [
+        ("tool_failed", "tool", CLOSE, "failure", state.call_id, "agent", None),
+        call_event("transfer_requested", state, "other"),
+    ]
+    assert rows(owner_engine, REQUESTS) == [
+        (state.call_id, "P001" if state.verified else None, "transfer", reason)
+        for state, reason in handed
+    ]
 
     # Closed: never handoff; the caller is offered the message instead.
     clock.now = CLOSED_AT
@@ -823,7 +935,7 @@ async def test_automatic_handoff(
     assert outcome == REFUSED.model_copy(
         update={"hand_off": True, "script": ScriptId.GUARD_FALLBACK}
     )
-    assert events_of(owner_engine, closed) == [refused_event(closed, "verify_identity")]
+    assert await events_of(owner_engine, closed) == [refused_event(closed, "verify_identity")]
 
     # A call already on its way out is left to go: no second move, no request.
     clock.now = OPEN_AT
@@ -835,6 +947,35 @@ async def test_automatic_handoff(
     after, outcome = await call_tool(calm, "get_balance", {}, deps)
     assert (after, outcome) == (count_refusal(calm), REFUSED)
     assert len(rows(owner_engine, REQUESTS)) == len(handed)
+
+
+async def test_hand_off_acts_once(
+    registry: Registry, deps: Deps, clock: Clock, owner_engine: Engine
+) -> None:
+    # Open: the outcome that reaches the limit hands the call off. A call past the limit (its
+    # hand-off could not be done) is not handed off again on every later outcome.
+    clock.now = OPEN_AT
+    past = count_refusal(refused_four_times(intake()))
+    after, outcome = await call_tool(past, "no_such_tool", {}, deps)
+    assert (after, outcome) == (count_refusal(past), REFUSED.model_copy(update={"hand_off": True}))
+    failed_twice = count_tool_error(count_tool_error(intake()))
+    after, outcome = await call_tool(failed_twice, "get_balance", {}, deps)
+    assert after.phase is INTAKE
+    assert outcome == REFUSED.model_copy(update={"hand_off": True})
+
+    # Closed: the message is offered once, not over every later reply.
+    clock.now = CLOSED_AT
+    closed = refused_four_times(intake(office_open=False))
+    first, outcome = await call_tool(closed, "verify_identity", {}, deps)
+    assert outcome.script is ScriptId.GUARD_FALLBACK
+    second, outcome = await call_tool(first, "verify_identity", {}, deps)
+    assert (second, outcome) == (
+        count_refusal(first),
+        REFUSED.model_copy(update={"hand_off": True}),
+    )
+    third, outcome = await call_tool(second, CLOSE, {}, deps)
+    assert (third.phase, outcome) == (CLOSING, GOODBYE.model_copy(update={"hand_off": True}))
+    assert rows(owner_engine, REQUESTS) == []
 
 
 # --- R13: one transaction ----------------------------------------------------------------------
@@ -856,18 +997,19 @@ async def test_endings_are_one_transaction(
         clock.now = OPEN_AT if office_open else CLOSED_AT
         after, outcome = await registry.dispatch(state, name, arguments, failing)
         assert (after, outcome) == (count_tool_error(state), FAILED), name
-        assert events_of(owner_engine, state) == [
+        assert await events_of(owner_engine, state) == [
             ("tool_failed", "tool", name, "failure", state.call_id, "agent", None)
         ]
     assert rows(owner_engine, MESSAGES) == []
     assert rows(owner_engine, REQUESTS) == []
 
-    # And the code-only hand-off, the same.
-    handing = count_tool_error(count_tool_error(intake()))
-    after, outcome = await call_tool(handing, "no_such_tool", {}, failing)
-    assert after.phase is INTAKE
+    # And the code-only hand-off, the same: the second failure asks for it, and it fails too.
+    handing = count_tool_error(intake())
+    after, outcome = await call_tool(handing, CLOSE, {}, failing)
+    assert (after.phase, after.tool_errors) == (INTAKE, 3)
     assert outcome == FAILED.model_copy(update={"hand_off": True})
     assert rows(owner_engine, REQUESTS) == []
+    await drain_call_events()
 
 
 # --- Neighbours --------------------------------------------------------------------------------
@@ -877,51 +1019,202 @@ async def test_emergency_line_without_the_database(
     registry: Registry,
     runtime: AsyncEngine,
     clock: Clock,
-    server_settings: StartupSettings,
-    silent_server: int,
     owner_engine: Engine,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO)
     down = deps_with(runtime, clock, AuditThatFails(SecretStr(TEST_AUDIT_KEY)))
-    # From the guard: the call moves and the line is given; the failure is logged.
+    # From the guard and from the model: the call moves and the line is given; the event's
+    # failure is logged, and nothing is counted.
+    reported = []
     for office_open in (False, True):
         state = intake(office_open)
         after, script = await emergency(state, Reason.GUARD, down)
-        assert (after.phase, script) == (EMERGENCY, ScriptId.EMERGENCY)
+        assert (after, script) == (move(state, EMERGENCY), ScriptId.EMERGENCY)
+        reported.append(state)
+    state = sarah()
+    after, outcome = await call_tool(state, REPORT, {}, down)
+    assert (after, outcome) == (move(state, EMERGENCY), EMERGENCY_LINE)
+    reported.append(state)
+    await drain_call_events()
+    for state in reported:
         assert (
             f"call_audit_failed action=emergency_detected call_id={state.call_id} error=OSError"
             in caplog.text
         )
-    # From the model: dispatch fails, the call moves and the line is given all the same.
-    state = sarah()
-    after, outcome = await call_tool(state, REPORT, {}, down)
-    assert after.phase is EMERGENCY
-    assert outcome == FAILED.model_copy(update={"script": ScriptId.EMERGENCY})
+    assert rows(owner_engine, EVENTS) == []
 
-    # A server that takes the connection and never answers holds the line for at most the
-    # write's own deadline, well inside the 5-second connect timeout.
+
+async def test_report_emergency_comes_first(
+    registry: Registry, deps: Deps, clock: Clock, seeded: None, owner_engine: Engine
+) -> None:
+    clock.now = OPEN_AT
+    # Whatever the model sends with it, the report moves the call and gives the 911 line; it
+    # is never a refusal, never counted, and never a hand-off.
+    stray: list[object] = [{"confirmed": True}, {"reason": "chest pain"}, None, "", [], {}, 1]
+    reported = []
+    for arguments in stray:
+        state = intake()
+        after, outcome = await call_tool(state, REPORT, arguments, deps)
+        assert (after, outcome) == (move(state, EMERGENCY), EMERGENCY_LINE), arguments
+        reported.append(state)
+    for state in (
+        # The report that would have been the fifth refusal.
+        refused_four_times(intake()),
+        # A call already at the failure limit, and one past the refusal limit.
+        count_tool_error(count_tool_error(sarah())),
+        count_refusal(refused_four_times(move(intake(), BOOKING))),
+        intake(office_open=False),
+    ):
+        after, outcome = await call_tool(state, REPORT, {"confirmed": True}, deps)
+        assert (after, outcome) == (move(state, EMERGENCY), EMERGENCY_LINE)
+        reported.append(state)
+    for state in reported:
+        assert await events_of(owner_engine, state) == [
+            call_event("emergency_detected", state, "model")
+        ]
+    assert rows(owner_engine, REQUESTS) == []
+
+    # In a phase without tools it is refused as any tool is.
+    for phase in (GREETING, CLOSING, HANDOFF, EMERGENCY):
+        state = reach(phase, True)
+        after, outcome = await call_tool(state, REPORT, {}, deps)
+        assert (after, outcome) == (count_refusal(state), REFUSED), phase
+        assert await events_of(owner_engine, state) == [refused_event(state, REPORT)]
+
+
+# Well inside the ~0.2 s budget of a turn: the line goes out without a database round trip.
+RETURN_BOUND_SECONDS = 0.2
+# The event's write, its clean-up included, ends within this, however the database behaves.
+WRITE_BOUND_SECONDS = 3
+
+
+async def test_emergency_line_never_waits_on_the_database(
+    registry: Registry,
+    database: StartupSettings,
+    runtime: AsyncEngine,
+    deps: Deps,
+    clock: Clock,
+    owner_engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    clock.now = OPEN_AT
+    proxy = StallingProxy(database.postgres_host, database.postgres_port)
+    port = await proxy.start()
     engine = create_database_engine(
-        server_settings.model_copy(update={"postgres_port": silent_server})
+        database.model_copy(update={"postgres_host": "127.0.0.1", "postgres_port": port})
     )
     try:
-        silent = Deps(
-            sessions=create_session_factory(engine),
-            audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
-            now=clock,
-            claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
-        )
-        state = intake(office_open=False)
-        with anyio.fail_after(4):
-            after, script = await emergency(state, Reason.GUARD, silent)
-        assert (after.phase, script) == (EMERGENCY, ScriptId.EMERGENCY)
-        assert (
-            f"call_audit_failed action=emergency_detected call_id={state.call_id}"
-            " error=TimeoutError" in caplog.text
-        )
+        stalled = deps_with(engine, clock)
+        # A warm pool: a call started and its event written through the relay.
+        warm, _script = await start_call(new_call_id(), stalled)
+        assert await events_of(owner_engine, warm) == [call_event("call_started", warm)]
+
+        proxy.stall()
+        guarded = intake()
+        (after, script), took = await timed(emergency(guarded, Reason.GUARD, stalled))
+        assert (after, script) == (move(guarded, EMERGENCY), ScriptId.EMERGENCY)
+        assert took < RETURN_BOUND_SECONDS, took
+        reported = sarah()
+        (after, outcome), took = await timed(call_tool(reported, REPORT, {}, stalled))
+        assert (after, outcome) == (move(reported, EMERGENCY), EMERGENCY_LINE)
+        assert took < RETURN_BOUND_SECONDS, took
+        (started, script), took = await timed(start_call(new_call_id(), stalled))
+        assert script is ScriptId.GREETING
+        assert took < RETURN_BOUND_SECONDS, took
+        ended, took = await timed(end_call(move(warm, INTAKE), Reason.CALLER_HUNG_UP, stalled))
+        assert ended.phase is ENDED
+        assert took < RETURN_BOUND_SECONDS, took
+
+        # The writes give up within their bound, clean-up included, and say so.
+        with anyio.fail_after(WRITE_BOUND_SECONDS):
+            _none, drained = await timed(drain_call_events())
+        assert drained < WRITE_BOUND_SECONDS, drained
+        for state, action in (
+            (guarded, "emergency_detected"),
+            (reported, "emergency_detected"),
+            (started, "call_started"),
+            (warm, "call_ended"),
+        ):
+            assert (
+                f"call_audit_failed action={action} call_id={state.call_id} error=TimeoutError"
+                in caplog.text
+            )
     finally:
+        await proxy.close()
         await engine.dispose()
-    assert rows(owner_engine, EVENTS) == []
+
+    # The audit chain's lock held by another transaction: the line does not wait for it, and
+    # the events are written once it is free.
+    async with create_session_factory(runtime)() as holder:
+        await holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
+        guarded = intake()
+        (after, script), took = await timed(emergency(guarded, Reason.GUARD, deps))
+        assert (after.phase, script) == (EMERGENCY, ScriptId.EMERGENCY)
+        assert took < RETURN_BOUND_SECONDS, took
+        reported = intake(office_open=False)
+        (after, outcome), took = await timed(call_tool(reported, REPORT, {}, deps))
+        assert (after.phase, outcome) == (EMERGENCY, EMERGENCY_LINE)
+        assert took < RETURN_BOUND_SECONDS, took
+        await holder.rollback()
+    assert await events_of(owner_engine, guarded) == [
+        call_event("emergency_detected", guarded, "guard")
+    ]
+    assert await events_of(owner_engine, reported) == [
+        call_event("emergency_detected", reported, "model")
+    ]
+
+
+async def test_live_calls_are_bounded(
+    deps: Deps,
+    clock: Clock,
+    owner_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Far above any number of calls at once (MAX_CONCURRENT_CALLS is at most 20).
+    assert MAX_LIVE_CALLS == 1000
+    caplog.set_level(logging.INFO)
+    clock.now = OPEN_AT
+    monkeypatch.setattr(endings, "MAX_LIVE_CALLS", 3)
+    monkeypatch.setattr(endings, "_LIVE_CALLS", {})
+    calls = [(await start_call(new_call_id(), deps))[0] for _ in range(4)]
+    # The oldest was dropped to make room for the fourth: its end writes nothing.
+    assert f"live_call_dropped call_id={calls[0].call_id}" in caplog.text
+    for state in calls:
+        await end_call(state, Reason.CALLER_HUNG_UP, deps)
+    assert await events_of(owner_engine, calls[0]) == [call_event("call_started", calls[0])]
+    for state in calls[1:]:
+        assert await events_of(owner_engine, state) == [
+            call_event("call_started", state),
+            call_event("call_ended", state, "caller_hung_up"),
+        ]
+
+
+async def test_corrected_message_is_kept(
+    registry: Registry, deps: Deps, clock: Clock, seeded: None, owner_engine: Engine
+) -> None:
+    clock.now = OPEN_AT
+    state = sarah()
+    for said in (
+        message(confirmed=True),
+        # The same again: nothing new.
+        message(confirmed=True),
+        # The number corrected, then the name: each a message of its own.
+        message(number="555-014-2390", confirmed=True),
+        message(name="Ana Diaz Ruiz", number="555-014-2390", confirmed=True),
+        message(name="Ana Diaz Ruiz", number="555-014-2390", confirmed=True),
+    ):
+        _after, outcome = await registry.dispatch(state, MESSAGE, said, deps)
+        assert outcome == DONE.model_copy(update={"data": {"status": "recorded"}})
+    assert rows(owner_engine, MESSAGES) == [
+        (state.call_id, "P001", ANA, NUMBER, "callback", NOTE, False),
+        (state.call_id, "P001", ANA, "5550142390", "callback", NOTE, False),
+        (state.call_id, "P001", "Ana Diaz Ruiz", "5550142390", "callback", NOTE, False),
+    ]
+    # The request for a call back is one: its reason did not change.
+    assert rows(owner_engine, REQUESTS) == [(state.call_id, "P001", "callback", NOTE)]
 
 
 async def test_close_call_clears_the_ssn_step(
@@ -942,4 +1235,4 @@ async def test_close_call_clears_the_ssn_step(
     # The digits said after it are no longer collected: the turn passes.
     decision = guard_input("33 44", after)
     assert (decision.action, decision.change, decision.submit) == (GuardAction.PASS, None, False)
-    assert events_of(owner_engine, armed) == [call_event("call_closed", armed)]
+    assert await events_of(owner_engine, armed) == [call_event("call_closed", armed)]
