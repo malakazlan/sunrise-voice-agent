@@ -933,7 +933,8 @@ def test_registration_rules() -> None:
                 list[Any],
             )
         ],
-        # The actions dispatch writes itself, and the admin API's, are not a tool's to declare.
+        # The actions dispatch, the call, the admin API and the output guard write are not a
+        # tool's to declare.
         *[
             ("reserved", Tool(**valid(audit_action=action)))
             for action in (
@@ -941,6 +942,7 @@ def test_registration_rules() -> None:
                 Action.TOOL_FAILED,
                 Action.CALL_STARTED,
                 Action.CALL_ENDED,
+                Action.GUARD_BLOCK,
                 Action.ADMIN_READ_REQUESTS,
                 Action.ADMIN_READ_MESSAGES,
                 Action.ADMIN_READ_AUDIT,

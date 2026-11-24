@@ -228,6 +228,16 @@ _DIGIT_TOKEN = re.compile(
 )
 _JOINS = re.compile(r"[ \t.-]{0,3}|[ \t]{0,3}dash[ \t]{0,3}", re.IGNORECASE)
 _JOINS_SINGLE_DIGITS = re.compile(r"[ \t-]{0,2},[ \t-]{0,2}")
+# What the output guard reads (`says_digits`, `reads_as_nine_digits`): numerals and number
+# words without the homophones, so "ten thirty to eleven thirty" is two times. For the caller's
+# last four, tokens also join across commas, brackets, en and em dashes, "and", and um or uh.
+_SPOKEN_TOKEN = re.compile(
+    rf"\d+|(?<![^\W\d_])(?:{'|'.join(w for w in _NUMBER_WORDS if w not in _HOMOPHONE_DIGITS)})"
+    r"(?![^\W\d_])",
+    re.IGNORECASE,
+)
+_LOOSE_JOINS = re.compile(r"(?:[ \t.,()–—-]|dash|and|um|uh){0,12}", re.IGNORECASE)
+_FILLER_WORD = re.compile(r"and|um|uh", re.IGNORECASE)
 _LAST_FOUR_CUE = re.compile(rf"(?<![^\W\d_]){_LAST_FOUR}(?![^\W\d_])", re.IGNORECASE)
 # Tokens a run may be trimmed of at either end when it is read as a group: a homophone or an
 # "oh" just before or after the digits ("say it to ...").
@@ -326,18 +336,24 @@ def _read(matches: list[re.Match[str]]) -> list[_Token]:
     ]
 
 
-def _runs(text: str) -> list[list[_Token]]:
-    """Each run of tokens in the text, read."""
+def _runs(
+    text: str, *, tokens: re.Pattern[str] = _DIGIT_TOKEN, loose: bool = False
+) -> list[list[_Token]]:
+    """Each run of tokens in the text, read; with `loose`, joined across _LOOSE_JOINS too."""
     text = _LAST_FOUR_CUE.sub(lambda cue: " " * len(cue[0]), text)
     runs: list[list[re.Match[str]]] = []
-    for token in _DIGIT_TOKEN.finditer(text):
+    for token in tokens.finditer(text):
         if runs:
             previous = runs[-1][-1]
             gap = text[previous.end() : token.start()]
-            if _JOINS.fullmatch(gap) or (
-                _JOINS_SINGLE_DIGITS.fullmatch(gap)
-                and _single(previous[0].lower())
-                and _single(token[0].lower())
+            if (
+                _JOINS.fullmatch(gap)
+                or (loose and _LOOSE_JOINS.fullmatch(gap))
+                or (
+                    _JOINS_SINGLE_DIGITS.fullmatch(gap)
+                    and _single(previous[0].lower())
+                    and _single(token[0].lower())
+                )
             ):
                 runs[-1].append(token)
                 continue
@@ -404,6 +420,52 @@ def spoken_digits(text: str) -> str:
 def says_a_number(text: str) -> bool:
     """Whether the text holds any digit or number word, whether or not it reads as digits."""
     return any(token.counted for run in _runs(text) for token in run)
+
+
+def reads_as_nine_digits(text: str) -> bool:
+    """For the output guard: whether any run of numerals and number words (no homophones), or
+    the run without an "oh" at its ends, reads as exactly nine digits, line by line; what
+    `mask` hides as an SSN, here wherever the run starts or ends, inside letters or digits
+    too."""
+    return any(
+        len(_digits(group)) == 9
+        for line in text.split("\n")
+        for run in _runs(line, tokens=_SPOKEN_TOKEN)
+        for group in _groups(run)
+    )
+
+
+def _says_in_run(line: str, run: list[_Token], digits: str) -> bool:
+    """Whether some tokens of the run, one after another, read exactly `digits`. A run that
+    reads as a callback number, joined by separators only (no "and", um or uh), is a phone
+    number and says none of its parts."""
+    readings = [token.reading for token in run]
+    read = "".join(readings)
+    joined_by_fillers = any(
+        _FILLER_WORD.search(line[before.end : after.start])
+        for before, after in zip(run, run[1:], strict=False)
+    )
+    if len(read) in _CALLBACK_LENGTHS and not joined_by_fillers:
+        return False
+    # Where each token's reading starts and ends in the run's.
+    starts = {0}
+    total = 0
+    for reading in readings:
+        total += len(reading)
+        starts.add(total)
+    return any(read[at : at + len(digits)] == digits for at in starts if at + len(digits) in starts)
+
+
+def says_digits(text: str, digits: str) -> bool:
+    """For the output guard: whether the text says `digits`, line by line: some tokens of a run
+    of numerals and number words (no homophones), joined loosely (_LOOSE_JOINS), one after
+    another, read exactly them. A longer number that holds them inside a token ("133445") does
+    not, nor does a phone number that ends in them."""
+    return any(
+        _says_in_run(line, run, digits)
+        for line in text.split("\n")
+        for run in _runs(line, tokens=_SPOKEN_TOKEN, loose=True)
+    )
 
 
 def _allowed_spans(line: str) -> list[tuple[int, int]]:
