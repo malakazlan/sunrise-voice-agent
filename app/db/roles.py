@@ -114,21 +114,35 @@ ATTRIBUTES = {
 
 # What the role can effectively do: has_*_privilege counts its own grants, PUBLIC's and those of
 # any role it belongs to. Schemas Postgres itself provides (catalogs, TOAST, temporary) are
-# left out; every other object in the database is compared, on the server every database.
+# left out; every other object in the database is compared, on the server every database. A
+# table's privilege is its table-level one; what a column holds beyond it is COLUMNS_HELD's.
 RELATIONS_HELD = text(
     "SELECT CASE WHEN c.relkind = 'S' THEN 'sequence' ELSE 'table' END,"
     " CASE WHEN n.nspname = :schema THEN c.relname ELSE n.nspname || '.' || c.relname END,"
     " p.privilege,"
     " CASE WHEN c.relkind = 'S' THEN has_sequence_privilege(:role, c.oid, p.privilege)"
-    " ELSE has_table_privilege(:role, c.oid, p.privilege)"
-    " OR (p.privilege = ANY(CAST(:column_checks AS text[]))"
-    " AND has_any_column_privilege(:role, c.oid, p.privilege)) END"
+    " ELSE has_table_privilege(:role, c.oid, p.privilege) END"
     " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
     " CROSS JOIN LATERAL unnest(CASE WHEN c.relkind = 'S'"
     " THEN CAST(:sequence_checks AS text[]) ELSE CAST(:table_checks AS text[]) END) p(privilege)"
     " WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')"
     " AND n.nspname NOT IN ('pg_catalog', 'information_schema')"
     " AND n.nspname !~ '^pg_(toast|temp_)'"
+)
+# Each column privilege the role can effectively use that its table's privileges do not give,
+# named `table.column`, on the same relations.
+COLUMNS_HELD = text(
+    "SELECT 'column',"
+    " CASE WHEN n.nspname = :schema THEN c.relname ELSE n.nspname || '.' || c.relname END"
+    " || '.' || a.attname, p.privilege, true"
+    " FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid"
+    " JOIN pg_namespace n ON n.oid = c.relnamespace"
+    " CROSS JOIN unnest(CAST(:column_checks AS text[])) p(privilege)"
+    " WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND a.attnum > 0 AND NOT a.attisdropped"
+    " AND n.nspname NOT IN ('pg_catalog', 'information_schema')"
+    " AND n.nspname !~ '^pg_(toast|temp_)'"
+    " AND has_column_privilege(:role, c.oid, a.attnum, p.privilege)"
+    " AND NOT has_table_privilege(:role, c.oid, p.privilege)"
 )
 FUNCTIONS_HELD = text(
     "SELECT 'function', n.nspname || '.' || p.proname"
@@ -264,6 +278,8 @@ def _declared(database: str, databases: set[str]) -> dict[tuple[str, str], froze
     ):
         for name, privileges in declaration.items():
             expected[kind, name] = frozenset(privileges)
+    for (table, column), on_column in grants.COLUMN_PRIVILEGES.items():
+        expected["column", f"{table}.{column}"] = frozenset(on_column)
     expected["schema", grants.SCHEMA] = frozenset(grants.SCHEMA_PRIVILEGES)
     for name in databases:
         expected["database", name] = (
@@ -287,6 +303,10 @@ def _grant_differences(connection: Connection, role: int, database: str) -> list
     named |= {
         ("sequence", f"{grants.SCHEMA}.{name}"): frozenset(privileges)
         for name, privileges in grants.SEQUENCE_PRIVILEGES.items()
+    }
+    named |= {
+        ("table column", f"{grants.SCHEMA}.{table}.{column}"): frozenset(privileges)
+        for (table, column), privileges in grants.COLUMN_PRIVILEGES.items()
     }
     named["schema", grants.SCHEMA] = frozenset(grants.SCHEMA_PRIVILEGES)
     named["database", database] = frozenset(grants.DATABASE_PRIVILEGES)
@@ -347,7 +367,7 @@ def runtime_role_differences(connection: Connection, role_name: str) -> list[str
         ],
     }
     held: dict[tuple[str, str], set[str]] = {}
-    for query in (RELATIONS_HELD, FUNCTIONS_HELD, SCHEMAS_HELD, DATABASES_HELD):
+    for query in (RELATIONS_HELD, COLUMNS_HELD, FUNCTIONS_HELD, SCHEMAS_HELD, DATABASES_HELD):
         for kind, name, privilege, allowed in connection.execute(query, parameters):
             privileges = held.setdefault((kind, name), set())
             if allowed:
@@ -476,6 +496,13 @@ def _set_up(connection: Connection, settings: DatabaseSettings) -> None:
                         f" ON {kind} {schema}.{quote(name)} TO {role}"
                     )
                 )
+    for (table, column), on_column in grants.COLUMN_PRIVILEGES.items():
+        connection.execute(
+            text(
+                f"GRANT {', '.join(sorted(on_column))} ({quote(column)})"
+                f" ON TABLE {schema}.{quote(table)} TO {role}"
+            )
+        )
     for signature, executable in grants.FUNCTION_PRIVILEGES.items():
         if executable:
             connection.execute(
@@ -488,9 +515,10 @@ def _set_up(connection: Connection, settings: DatabaseSettings) -> None:
             f"the runtime role does not match the declaration: {'; '.join(differences)}"
         )
     logger.info(
-        "runtime_role_ready created=%s tables=%d sequences=%d functions=%d",
+        "runtime_role_ready created=%s tables=%d columns=%d sequences=%d functions=%d",
         created,
         len(grants.TABLE_PRIVILEGES),
+        len(grants.COLUMN_PRIVILEGES),
         len(grants.SEQUENCE_PRIVILEGES),
         len(grants.FUNCTION_PRIVILEGES),
     )
