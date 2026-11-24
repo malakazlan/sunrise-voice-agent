@@ -9,8 +9,8 @@ All data used by this project is synthetic. No real customer or personal data is
 - `GET /health` returns `{"status": "ok"}`. It is a liveness check only.
 - Configuration through environment variables or an optional `.env` file, validated at startup.
 - Interactive API docs (`/docs`, `/redoc`, `/openapi.json`) are served only when `APP_ENV=dev`.
-- A Postgres database with four tables (`patients`, `medications`, `appointments`,
-  `available_slots`), created by an Alembic migration.
+- A Postgres database with four clinic tables (`patients`, `medications`, `appointments`,
+  `available_slots`) and the audit log (`audit_events`), created by Alembic migrations.
 - A seed (`python -m app.db.seed`) that loads the synthetic patients and slots from
   `app/db/seed_data.json`, so running it again is safe:
   - A patient that is missing is inserted together with that patient's medications and
@@ -54,6 +54,26 @@ All data used by this project is synthetic. No real customer or personal data is
     listed name is one word and every spoken word has at least three letters and no digit.
     Zero or two matches is no match. Filler words (`my albuterol`) are not removed.
 
+- An audit log, `app/audit/log.py`, the only code that writes or verifies the
+  `audit_events` table (nothing calls it yet; later slices add their events):
+  - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
+    transaction and does not commit, so the event and the action it records commit or roll
+    back together. If the event cannot be written, the caller's whole transaction is rolled
+    back. Appends take a transaction-scoped advisory lock, so callers append last, just
+    before they commit. `now` must carry a time zone.
+  - An event holds only registry codes (action, resource type, outcome, reason) and
+    identifiers: at most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces. The actor is
+    `agent` or `admin:<identifier>`. The database enforces the same character rule.
+  - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
+    previous MAC and the event's canonical form, which is documented in the module.
+    `AuditLog(key).verify(session)` walks the chain in batches and reports the first break:
+    an edited event, a removed or duplicated one, a reordering, a forged event or the wrong
+    key. Removing the newest events is not visible from the chain alone; that needs the head
+    kept outside the database.
+  - The database refuses `UPDATE`, `DELETE` and `TRUNCATE` on `audit_events` for every role,
+    the owner included. A superuser can still switch the table's triggers off; the chain
+    still shows any edit made that way.
+
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
 9:30 AM, 11:00 AM and 3:00 PM and for Dr. Lee at 10:00 AM and 1:30 PM, America/New_York time.
@@ -72,6 +92,7 @@ A generated slot never replaces an existing slot at the same doctor and time.
 | `POSTGRES_DB`       | database name                       | none, required |
 | `POSTGRES_USER`     | user name                           | none, required |
 | `POSTGRES_PASSWORD` | password, never logged (see below)  | none, required |
+| `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup.
 Environment variables take precedence over `.env`. The same `POSTGRES_*` values configure
@@ -79,6 +100,11 @@ the database container in Compose, so there is one set of database credentials.
 
 Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
 placeholder from `.env.example`; startup stops otherwise.
+
+`AUDIT_HMAC_KEY` must be set and not empty in every environment. Unless `APP_ENV=dev` it must
+be at least 32 characters and must not be the placeholder from `.env.example`. Keep it outside
+the database: whoever holds it can write events that verify. Changing it makes the existing
+log fail verification.
 
 `SIMULATED_NOW` fixes the clinic clock for dev and demo, for example to show the office
 closed on a weekday afternoon. Empty means the real clock. Otherwise it must be an ISO 8601
@@ -130,5 +156,6 @@ uv run pytest
 
 The tests need a running database server and read its address from the `POSTGRES_*`
 environment variables (not from `.env`), for example after exporting the values from your
-`.env`. The user must be allowed to create databases: each test gets its own database,
-migrated with Alembic, and drops it afterwards.
+`.env`. The user must be a superuser: each test gets its own database, migrated with Alembic,
+and drops it afterwards, and the audit tamper tests switch the audit table's triggers off for
+one transaction to show that the chain catches edits. The tests use their own audit key.

@@ -1,18 +1,24 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     CHAR,
+    BigInteger,
     CheckConstraint,
+    Connection,
     DateTime,
     ForeignKey,
     MetaData,
     Numeric,
+    Table,
     Text,
     UniqueConstraint,
+    event,
     false,
     func,
     literal_column,
+    text,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -112,3 +118,68 @@ class Appointment(Base):
     reason_short: Mapped[str | None]
     status: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+# Every text column of an audit event except the MACs: identifiers and registry codes only.
+# Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
+AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"
+
+
+def _audit_text(column: str) -> CheckConstraint:
+    return CheckConstraint(f"{column} ~ '^{AUDIT_TEXT_PATTERN}$'", name=column)
+
+
+class AuditEvent(Base):
+    """One event of the audit log. Written and verified only by app/audit/log.py."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = tuple(
+        _audit_text(column)
+        for column in (
+            "call_id",
+            "actor",
+            "action",
+            "resource_type",
+            "resource_id",
+            "outcome",
+            "reason",
+        )
+    )
+
+    # No default and no sequence: the app assigns previous + 1 under the chain's lock.
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    ts: Mapped[datetime]
+    call_id: Mapped[str | None]
+    actor: Mapped[str]
+    action: Mapped[str]
+    resource_type: Mapped[str]
+    resource_id: Mapped[str | None]
+    outcome: Mapped[str]
+    reason: Mapped[str | None]
+    prev_mac: Mapped[str] = mapped_column(CHAR(64))
+    mac: Mapped[str] = mapped_column(CHAR(64))
+
+
+# audit_events is append-only for every role, the owner and superusers included: a statement
+# that would update, delete or truncate is refused before it touches a row, even when it
+# matches none. The migration creates the same function and triggers.
+AUDIT_PROTECTION = (
+    "CREATE FUNCTION audit_events_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+    "BEGIN\n"
+    "  RAISE EXCEPTION 'audit_events is append-only'\n"
+    "    USING ERRCODE = 'insufficient_privilege', TABLE = TG_TABLE_NAME;\n"
+    "END\n"
+    "$$",
+    "CREATE TRIGGER audit_events_refuse_update BEFORE UPDATE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    "CREATE TRIGGER audit_events_refuse_delete BEFORE DELETE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    "CREATE TRIGGER audit_events_refuse_truncate BEFORE TRUNCATE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+)
+
+
+@event.listens_for(AuditEvent.__table__, "after_create")
+def _protect_audit_events(target: Table, connection: Connection, **kw: Any) -> None:
+    for statement in AUDIT_PROTECTION:
+        connection.execute(text(statement))

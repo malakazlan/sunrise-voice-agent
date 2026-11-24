@@ -593,6 +593,7 @@ def test_entry_point_uses_clinic_local_today(
     monkeypatch.setenv("POSTGRES_DB", database.postgres_db)
     monkeypatch.setenv("POSTGRES_USER", database.postgres_user)
     monkeypatch.setenv("POSTGRES_PASSWORD", database.postgres_password.get_secret_value())
+    monkeypatch.setenv("AUDIT_HMAC_KEY", database.audit_hmac_key.get_secret_value())
 
     main(clock=lambda: instant)
 

@@ -126,7 +126,8 @@ jobs:
         run: |
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
             POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
-            POSTGRES_PASSWORD=ci-compose-only-password-0001 > .env
+            POSTGRES_PASSWORD=ci-compose-only-password-0001 \
+            AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 > .env
       - name: Smoke test through Compose
         run: |
           docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
@@ -201,14 +202,14 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
-      - name: Container without database settings must not start
+      - name: Container without database settings or audit key must not start
         run: |
           code=0
           output=$(timeout 60 docker run --rm -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
-          echo "$output" | tail -n 12
+          echo "$output" | tail -n 15
           echo "exit code: $code"
           test "$code" = "1"
-          for name in postgres_host postgres_db postgres_user postgres_password; do
+          for name in postgres_host postgres_db postgres_user postgres_password audit_hmac_key; do
             echo "$output" | grep -q "$name"
           done
       - name: Compose logs

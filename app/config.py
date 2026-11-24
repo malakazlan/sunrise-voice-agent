@@ -15,6 +15,10 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 EXAMPLE_PASSWORD = "change-me-to-a-long-random-value"  # noqa: S105 (a published placeholder)
 MIN_PASSWORD_LENGTH = 16
 
+# The AUDIT_HMAC_KEY value in .env.example. It is only accepted when APP_ENV=dev.
+EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a published placeholder)
+MIN_AUDIT_KEY_LENGTH = 32
+
 # SIMULATED_NOW: a date and a time, never a bare number or a date alone.
 ISO_DATE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}"
@@ -33,6 +37,9 @@ class Settings(BaseSettings):
     postgres_db: str
     postgres_user: str
     postgres_password: SecretStr
+
+    # The key of the audit log's hash chain (app/audit/log.py).
+    audit_hmac_key: SecretStr
 
     # A fixed clock for dev and demo. Set together with app_env=prod, startup stops.
     simulated_now: datetime | None = None
@@ -76,6 +83,23 @@ class Settings(BaseSettings):
         if len(password) < MIN_PASSWORD_LENGTH or password == EXAMPLE_PASSWORD:
             raise ValueError(
                 f"outside dev the password needs at least {MIN_PASSWORD_LENGTH} characters"
+                " and must not be the .env.example placeholder"
+            )
+        return value
+
+    @field_validator("audit_hmac_key")
+    @classmethod
+    def audit_key_is_set_and_strong_outside_dev(
+        cls, value: SecretStr, info: ValidationInfo
+    ) -> SecretStr:
+        key = value.get_secret_value()
+        if not key:
+            raise ValueError("audit_hmac_key must not be empty")
+        if info.data.get("app_env") == "dev":
+            return value
+        if len(key) < MIN_AUDIT_KEY_LENGTH or key == EXAMPLE_AUDIT_KEY:
+            raise ValueError(
+                f"outside dev the audit key needs at least {MIN_AUDIT_KEY_LENGTH} characters"
                 " and must not be the .env.example placeholder"
             )
         return value

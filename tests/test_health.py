@@ -24,6 +24,7 @@ def offline_settings(app_env: AppEnv, log_level: LogLevel = "INFO") -> Settings:
         postgres_db="sunrise_offline",
         postgres_user="sunrise_offline",
         postgres_password="offline-test-password",
+        audit_hmac_key="-".join(["offline", "audit", "key"] * 3),
     )
 
 

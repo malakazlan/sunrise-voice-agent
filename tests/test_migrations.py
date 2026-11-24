@@ -6,7 +6,7 @@ from pathlib import Path
 
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import inspect, text
+from sqlalchemy import TextClause, inspect, text
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
@@ -14,7 +14,7 @@ from app.db.models import Base
 from app.db.session import create_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CLINIC_TABLES = {"patients", "medications", "appointments", "available_slots"}
+TABLES = {"patients", "medications", "appointments", "available_slots", "audit_events"}
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -75,6 +75,26 @@ def constraint_definitions(settings: Settings) -> set[tuple[str, str, str]]:
     return {(table, name, definition) for table, name, definition in rows}
 
 
+# Triggers and functions as Postgres renders them. Alembic compares neither.
+TRIGGER_DEFINITIONS = text(
+    "SELECT tgrelid::regclass::text, tgname, pg_get_triggerdef(oid), tgenabled"
+    " FROM pg_trigger WHERE NOT tgisinternal"
+)
+FUNCTION_DEFINITIONS = text(
+    "SELECT proname, pg_get_functiondef(pro.oid) FROM pg_proc pro"
+    " JOIN pg_namespace nsp ON nsp.oid = pro.pronamespace WHERE nsp.nspname = 'public'"
+)
+
+
+def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]]:
+    engine = create_sync_engine(settings, poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            return {tuple(row) for row in connection.execute(query).all()}
+    finally:
+        engine.dispose()
+
+
 def test_migration_matches_models(
     new_database: Callable[[], Settings], run_alembic: Alembic
 ) -> None:
@@ -91,8 +111,8 @@ def test_migration_matches_models(
         engine.dispose()
 
     assert differences == []
-    assert set(Base.metadata.tables) == CLINIC_TABLES
-    assert table_names(migrated) == CLINIC_TABLES | {"alembic_version"}
+    assert set(Base.metadata.tables) == TABLES
+    assert table_names(migrated) == TABLES | {"alembic_version"}
 
     # Alembic compares CHECK constraints by name only. Build the schema straight from the
     # models as well and compare every constraint's definition.
@@ -105,13 +125,31 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 17
+    assert len(migrated_constraints) == 25
     assert migrated_constraints == constraint_definitions(from_models)
+    assert (
+        "audit_events",
+        "ck_audit_events_actor",
+        "CHECK ((actor ~ '^[A-Za-z0-9_:.-]{1,64}$'::text))",
+    ) in migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 34
+    assert len(migrated_columns) == 45
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
+    # seq has no default: the app assigns it under the lock, never a sequence.
+    assert ("audit_events", "seq", "bigint", None, 64, 0, "NO", None, "NO") in migrated_columns
+
+    migrated_triggers = definitions(migrated, TRIGGER_DEFINITIONS)
+    assert {(table, name, enabled) for table, name, _, enabled in migrated_triggers} == {
+        ("audit_events", "audit_events_refuse_update", "O"),
+        ("audit_events", "audit_events_refuse_delete", "O"),
+        ("audit_events", "audit_events_refuse_truncate", "O"),
+    }
+    assert migrated_triggers == definitions(from_models, TRIGGER_DEFINITIONS)
+    migrated_functions = definitions(migrated, FUNCTION_DEFINITIONS)
+    assert {name for name, _ in migrated_functions} == {"audit_events_refuse_change"}
+    assert migrated_functions == definitions(from_models, FUNCTION_DEFINITIONS)
     assert (
         "available_slots",
         "id",
@@ -148,6 +186,7 @@ def test_downgrade_removes_the_tables(empty_database: Settings, run_alembic: Ale
 
     assert downgrade.returncode == 0, downgrade.stderr
     assert table_names(empty_database) == {"alembic_version"}
+    assert definitions(empty_database, FUNCTION_DEFINITIONS) == set()
 
 
 def test_migration_without_database_settings_names_them(tmp_path: Path) -> None:
