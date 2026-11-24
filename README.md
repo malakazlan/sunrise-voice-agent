@@ -146,9 +146,9 @@ All data used by this project is synthetic. No real customer or personal data is
   - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`
     on `patients` and `appointments` (never `UPDATE`); `SELECT` on `medications`; `SELECT` on
     `available_slots` and `UPDATE` of its one column `is_available`; `SELECT`, `INSERT` on
-    `audit_events`, `verification_attempts`, `requests` and `messages`;
-    nothing on `alembic_version`; `USAGE` on the appointment, request and message id
-    sequences only; no `EXECUTE` on the trigger functions (a
+    `audit_events`, `verification_attempts`, `requests`, `messages` and `call_sessions`;
+    nothing on `alembic_version`; `USAGE` on the appointment, verification attempt, request,
+    message and call session id sequences only; no `EXECUTE` on the trigger functions (a
     trigger runs its function whoever may call it) or on the functions that create large
     objects; `USAGE` on the schema; `CONNECT` on the application's database and nothing on any
     other database of the server. No table allows it `DELETE` or `TRUNCATE`. It cannot create
@@ -725,17 +725,82 @@ Limits, stated plainly:
   writes no `call_started`; the voice-out slice will switch to this one and end calls with
   `end_call` (hang-up and the idle and maximum-duration timers).
 
+### Call record
+
+After a call has ended, `record_call` (`app/agent/call_record.py`) stores one row of
+`call_sessions` for it: call id, started and ended at, whether the office was open, whether the
+caller was verified and the patient id code verified them as (or none), the end reason, the
+number of caller turns, and the transcript. Audio is never stored.
+
+- The transcript is the conversation as the model was given it and as the agent said it, one
+  line per message (`caller: ...`, `agent: ...`): each caller turn as the input guard passed it
+  on, each line said, scripted ones included. A turn the guard swallowed (the SSN step) is the
+  fixed line `caller: (turn withheld)`, and a turn the guard took for an emergency is
+  `caller: (emergency turn withheld)`; their text is never kept anywhere. Both count as caller
+  turns. Tool calls, any text the model wrote beside a tool call (never said, never checked by
+  the output guard) and tool results are not in it.
+- It is masked three times before it is stored:
+  1. `mask`: SSNs and SSN-shaped numbers, dates, phone numbers, email addresses, as in the logs.
+  2. The names the call itself knows, replaced by `<PERSON>` as whole words in any case, and
+     spelled out letter by letter with spaces, dots, commas or hyphens (`S A R A H`,
+     `j-o-h-n-s-o-n`): the verified patient's first and last name from their patients row (if
+     that read fails, `call_record_patient_lookup_failed` is logged and the first name the call
+     state holds is used), and every name given to `verify_identity` (failed attempts too),
+     `collect_new_patient` and `take_message`. Words of one letter are left alone. One
+     compiled pattern, one pass over the text.
+  3. Presidio with spaCy's small English model (`en_core_web_sm`), which replaces the names,
+     locations and dates it finds in free text with `<PERSON>`, `<LOCATION>` and
+     `<DATE_TIME>`. `names_masked` is true only when this pass ran.
+- What the passes do not catch: a name the call never learned (a relative mentioned in passing)
+  said in lower case, which the statistical model often misses; a date of birth said in words
+  by a caller already verified; a street address said in lower case. Presidio can also take an
+  ordinary word for a name or a date (it takes "today" for a date), and a patient whose name is
+  an ordinary word (Will, May) has that word hidden everywhere. Medications, balances, lab
+  status, appointment times and message content are kept by design: staff need them. The admin
+  API masks again on the way out, but that pass hides shapes, not names.
+- Where it runs: in a task of its own after the call has ended, which nothing on a caller's turn
+  waits for. The patients read is one query on the event loop; the rest of the work runs on one
+  worker thread of its own. Presidio is imported and the model loaded on the first record,
+  never at start-up; the model is installed in the image from the lock and is never downloaded
+  at run time. Measured on the development machine: about 3 seconds to load, about 0.1 second
+  for the Presidio pass over a 20-turn transcript.
+- Limit: the worker thread keeps the work off the event loop but not out of Python's
+  interpreter lock. While a record is being masked, the loop that carries the calls can stall
+  for up to about 100 ms at a time (measured). Masking in a separate process would remove that.
+- If the Presidio pass fails, the text of the first two passes is stored and
+  `call_record_presidio_failed` is logged with the error class. If the row cannot be written,
+  `call_record_failed` is logged and the record is dropped. A call is stored once; a second
+  record of it stores nothing and logs `call_record_duplicate`. Logs carry event names, the call
+  id and counts, never transcript text or a name.
+- The transcript is cut at a line boundary to at most 20,000 characters (before the masking
+  passes, so they never read more, and again after, since a replacement can lengthen it), and
+  `transcript_truncated` says so.
+- At shutdown the app waits for the records still being made (`drain_call_records()`); a
+  process killed outright loses them.
+- The runtime role may insert and read `call_sessions`, nothing more. Read them through the
+  admin API below.
+- The live call starts it in `CallAgent.end` (`app/agent/turn.py`), the one place a call ends:
+  once `end_call` has ended the call, `record_call` is called with the ended state, the
+  record's history and the end reason, and not awaited. A failure to start it is logged as
+  `call_record_not_started`, never raised into the call. The history is kept beside the
+  conversation the model is given, as its own list: every message the model is shown and every
+  line said, with the markers in place of withheld turns. A line the caller cut short keeps
+  only the words heard, and one never heard leaves it, as in the conversation, so the record
+  holds what the caller heard.
+
 ### Admin API
 
-A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages
-and audit log can be read and the chain checked without opening the database. It is off
-unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
+A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages,
+call records and audit log can be read and the chain checked without opening the database. It
+is off unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
 answer `404` and the app logs `admin_api_off` once at start.
 
 | Route (all `GET`) | Returns |
 |---|---|
 | `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
 | `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
+| `/admin/api/calls` | `{"calls": [...]}`: id, call_id, started_at, ended_at, office_open, verified, patient_id, end_reason, turn_count; no transcript |
+| `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript, transcript_truncated and names_masked; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
 | `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
 | `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
 
@@ -755,25 +820,28 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
 - Paging: newest first; `limit` 1 to 100 (default 50); `before=<id or seq>` for the next page,
   the last id or seq of the page before. An unknown or repeated parameter, a value out of range
   or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
-  route takes no parameters.
+  and single-call routes take no parameters.
 - One verification runs at a time: another asked for meanwhile gets `429` with `Retry-After: 5`,
   does no work and writes no event. It reads the whole chain, 1000 events a round trip, on the
   one worker that also carries the calls, so on a large chain it costs that worker and the
   database real time; run it when it is needed, not on a timer.
 - Every successful read appends one audit event (actor `admin:<ADMIN_USER>`, action
-  `admin_read_requests`, `admin_read_messages`, `admin_read_audit` or `admin_verify_audit`,
-  resource type `request`, `message` or `audit_event`, no resource id, outcome `success`) in
-  the transaction that read the rows. If the event cannot be written the answer is `503` and
+  `admin_read_requests`, `admin_read_messages`, `admin_read_calls`, `admin_read_call`,
+  `admin_read_audit` or `admin_verify_audit`, resource type `request`, `message`, `call` or
+  `audit_event`, outcome `success`; the resource id is the call id for `admin_read_call` and
+  none otherwise) in the transaction that read the rows. A call that is not found is not
+  audited. If the event cannot be written the answer is `503` and
   no rows. A database that cannot be reached is `503` too, with no detail.
 - Every text value from the database passes the log masking (`mask`): SSNs, dates and email
-  addresses in a summary or body are hidden. Patient ids and call ids come out as stored.
+  addresses in a summary, body or transcript are hidden. Patient ids and call ids come out as stored.
   Timestamps are ISO 8601.
 - A callback number shows as `***-***-` and its last four digits, whatever its shape
   (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
   `***-***-****`.
 - Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
   in the API schema, and `/docs` stays off outside dev.
-- The runtime role needs no new privilege: it already reads these tables and appends events.
+- The runtime role needs no privilege for the API beyond what the calls use: it reads these
+  tables and appends events.
 - Limits:
   - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
     sign-in limit is shared by everyone. Refused requests are not counted, so each failure
@@ -994,7 +1062,10 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
   with the seed); the call's audit actions in order; strings never said nor shown to the
   model (in any case, and as digits when written in digit words); the tools offered, or never
   offered; and for a turn, the input guard's flags, whether the model was shown it, and the
-  output guard's rule if it withheld part of the reply. A turn's `expect_scripted` holds
+  output guard's rule if it withheld part of the reply. At the end of the call, `record`: the
+  call's stored record exists, ends for the call's reason, holds the markers of its withheld
+  turns in order (`swallowed`, `emergency`) and none of the strings it forbids (used in `s01`
+  and `s06`). A turn's `expect_scripted` holds
   expectations only scripted mode checks: what comes of a reply only the scripted model gives,
   such as advice the output guard withholds. A file with an unknown key, a key given twice, or
   an empty expectation block is refused.

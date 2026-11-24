@@ -33,12 +33,14 @@ from evals.runner import (
 )
 from evals.scenario import (
     CallStep,
+    RecordExpect,
     RowExpect,
     SayStep,
     Scenario,
     ScenarioError,
     ToolExpect,
     TurnExpect,
+    Withheld,
     load_scenario,
     scenario_files,
 )
@@ -206,6 +208,15 @@ BROKEN = {
         VALID.replace("    expect:\n      said: []\n", "    expect_scripted: {}\n"),
         "states at least one expectation",
     ),
+    "record-at-a-turn": (
+        VALID.replace("      said: []\n", "      record: {withheld: []}\n"),
+        "Extra inputs are not permitted",
+    ),
+    "unknown-marker": (
+        VALID + "  record: {withheld: [ssn]}\n",
+        "Input should be .swallowed.",
+    ),
+    "record-without-markers": (VALID + "  record: {never: [Sarah]}\n", "withheld"),
     "unreadable-column": (
         VALID
         + "  rows:\n    - table: patients\n      where: {dob: '1985-03-14'}\n      count: 0\n",
@@ -298,6 +309,17 @@ BREAKS: dict[str, tuple[Callable[[Scenario], Scenario], tuple[str, str]]] = {
         lambda s: scripted_at_turn(s, 2, said=[ScriptId.VERIFIED]),
         ("turn 3", "said"),
     ),
+    # s01's record holds one swallowed turn, and the medication, which is kept by design.
+    "record-withheld": (
+        lambda s: at_end(s, record=RecordExpect(withheld=[])),
+        ("call", "record"),
+    ),
+    "record-never": (
+        lambda s: at_end(
+            s, record=RecordExpect(withheld=[Withheld.SWALLOWED], never=["Lisinopril"])
+        ),
+        ("call", "record"),
+    ),
 }
 
 
@@ -310,6 +332,20 @@ async def test_each_expectation_kind_can_fail(server: EvalServer, kind: str) -> 
     failures = await run_scenario(broken(refill()), server)
 
     assert [(failure.scope, failure.kind) for failure in failures] == [expected]
+
+
+@pytest.mark.anyio
+async def test_a_call_with_no_record_fails(
+    server: EvalServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def not_recorded(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.agent.turn, "record_call", not_recorded)
+    failures = await run_scenario(refill(), server)
+    assert [(failure.scope, failure.kind, failure.detail) for failure in failures] == [
+        ("call", "record", "no record was stored")
+    ]
 
 
 def advice() -> Scenario:

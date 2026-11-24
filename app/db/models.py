@@ -176,6 +176,50 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+# The reasons a call ends (END_PHASES in app/agent/endings.py), and the longest transcript kept.
+CALL_END_REASONS = (
+    "completed",
+    "emergency",
+    "transferred",
+    "caller_hung_up",
+    "idle_timeout",
+    "max_duration",
+    "error",
+)
+MAX_TRANSCRIPT = 20_000
+
+
+class CallSession(Base):
+    """The record of one ended call, written once, after it ended (app/agent/call_record.py).
+    `verified` goes with the patient id code verified the caller as. The transcript was masked
+    by `mask`, by the names the call knew and by Presidio before it was stored, and cut at a line
+    to MAX_TRANSCRIPT characters when `transcript_truncated`; `names_masked` says whether the
+    Presidio pass ran. Never audio."""
+
+    __tablename__ = "call_sessions"
+    __table_args__ = (
+        # The declared shape of a call id (CALL_ID in app/audit/log.py).
+        CheckConstraint("call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'", name="call_id"),
+        CheckConstraint(literal_column("end_reason").in_(CALL_END_REASONS), name="end_reason"),
+        CheckConstraint("verified = (patient_id IS NOT NULL)", name="verified_patient"),
+        CheckConstraint(f"char_length(transcript) <= {MAX_TRANSCRIPT}", name="transcript_length"),
+        CheckConstraint("turn_count >= 0", name="turn_count"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    call_id: Mapped[str] = mapped_column(unique=True)
+    started_at: Mapped[datetime]
+    ended_at: Mapped[datetime]
+    office_open: Mapped[bool]
+    verified: Mapped[bool]
+    patient_id: Mapped[str | None] = mapped_column(ForeignKey("patients.id"))
+    end_reason: Mapped[str]
+    turn_count: Mapped[int]
+    transcript: Mapped[str]
+    transcript_truncated: Mapped[bool]
+    names_masked: Mapped[bool]
+
+
 # Every text column of an audit event except the MACs: identifiers and registry codes only.
 # Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
 AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"

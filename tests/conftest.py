@@ -19,6 +19,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.pool import NullPool
 
+from app.agent.call_record import drain_call_records
 from app.config import Settings, StartupSettings
 from app.db.roles import set_up_runtime_role
 from app.db.session import (
@@ -401,11 +402,13 @@ async def owner_session(database: StartupSettings) -> AsyncIterator[AsyncSession
 
 @pytest.fixture
 async def runtime(database: StartupSettings) -> AsyncIterator[AsyncEngine]:
-    """The application's engine: the runtime role."""
+    """The application's engine: the runtime role. As at the app's shutdown, the call records
+    still being made (a call the test ended) are stored before the engine goes."""
     engine = create_database_engine(database)
     try:
         yield engine
     finally:
+        await drain_call_records()
         await engine.dispose()
 
 

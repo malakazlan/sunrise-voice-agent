@@ -154,6 +154,8 @@ RESERVED_ACTIONS = frozenset(
         Action.ADMIN_READ_REQUESTS,
         Action.ADMIN_READ_MESSAGES,
         Action.ADMIN_READ_AUDIT,
+        Action.ADMIN_READ_CALLS,
+        Action.ADMIN_READ_CALL,
         Action.ADMIN_VERIFY_AUDIT,
     }
 )

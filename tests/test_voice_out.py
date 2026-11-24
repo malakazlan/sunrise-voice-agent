@@ -42,6 +42,7 @@ from test_turn import (
     new_call_id,
 )
 
+from app.agent.call_record import drain_call_records
 from app.agent.endings import drain_call_events
 from app.agent.tool_registry import Deps
 from app.agent.turn import Line, drain_guard_audits
@@ -58,14 +59,15 @@ LOUD = b"\x05\x10" * 160
 
 @pytest.fixture
 async def offline_deps() -> AsyncIterator[Deps]:
-    """A call's dependencies on a database that is never reached: the call's events fail to be
-    written, and are logged."""
+    """A call's dependencies on a database that is never reached: the call's events and its
+    record fail to be written, and are logged."""
     engine = create_database_engine(offline_settings())
     try:
         yield deps_on(engine)
     finally:
         await drain_guard_audits(timeout=1)
         await drain_call_events()
+        await drain_call_records()
         await engine.dispose()
 
 

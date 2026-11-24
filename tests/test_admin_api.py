@@ -15,7 +15,7 @@ from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from sqlalchemy import Engine, text
+from sqlalchemy import Connection, Engine, text
 
 from app import main as main_module
 from app.api import admin
@@ -35,23 +35,36 @@ PASSWORD = "-".join(["admin", "pass", "not", "for", "logs"])
 TRIED_USER = "intruder_name"
 TRIED_PASSWORD = "-".join(["tried", "pass", "not", "for", "logs"])
 
+
+def cid(number: int) -> str:
+    """A call id in the format calls are given (uuid4 hex), distinct per number."""
+    return f"{number:012x}4{number:03x}8{number:015x}"
+
+
+# The one call the single-call route reads in these tests.
+CALL_ROUTE = f"/admin/api/calls/{cid(1)}"
 ROUTES = [
     "/admin/api/requests",
     "/admin/api/messages",
     "/admin/api/audit",
     "/admin/api/audit/verify",
+    "/admin/api/calls",
+    CALL_ROUTE,
 ]
-# Each route's audit action and resource type, written out by hand.
+# Each route's audit action, resource type and resource id, written out by hand.
 ROUTE_EVENTS = {
-    "/admin/api/requests": ("admin_read_requests", "request"),
-    "/admin/api/messages": ("admin_read_messages", "message"),
-    "/admin/api/audit": ("admin_read_audit", "audit_event"),
-    "/admin/api/audit/verify": ("admin_verify_audit", "audit_event"),
+    "/admin/api/requests": ("admin_read_requests", "request", None),
+    "/admin/api/messages": ("admin_read_messages", "message", None),
+    "/admin/api/audit": ("admin_read_audit", "audit_event", None),
+    "/admin/api/audit/verify": ("admin_verify_audit", "audit_event", None),
+    "/admin/api/calls": ("admin_read_calls", "call", None),
+    CALL_ROUTE: ("admin_read_call", "call", cid(1)),
 }
 LISTS = {
     "/admin/api/requests": "requests",
     "/admin/api/messages": "messages",
     "/admin/api/audit": "events",
+    "/admin/api/calls": "calls",
 }
 
 REFUSED_BODY = {"detail": "Sign-in required"}
@@ -59,6 +72,7 @@ REFUSED_CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
 LIMITED_BODY = {"detail": "Too many failed sign-ins"}
 UNAVAILABLE_BODY = {"detail": "Service unavailable"}
 INVALID_QUERY_BODY = {"detail": "Invalid query"}
+NOT_FOUND_BODY = {"detail": "Not Found"}
 
 T0 = datetime(2026, 11, 24, 15, 30, tzinfo=UTC)
 AUDIT = AuditLog(SecretStr(TEST_AUDIT_KEY))
@@ -80,11 +94,40 @@ INSERT_MESSAGE = text(
     " VALUES (:id, :call_id, :patient_id, :name, :callback_number, :body, 'doctor_message',"
     " :created_at)"
 )
+INSERT_CALL = text(
+    "INSERT INTO call_sessions (id, call_id, started_at, ended_at, office_open, verified,"
+    " patient_id, end_reason, turn_count, transcript, transcript_truncated, names_masked)"
+    " VALUES (:id, :call_id, :started_at, :ended_at, true, :verified, :patient_id, 'completed',"
+    " :turn_count, :transcript, false, true)"
+)
 
 
-def cid(number: int) -> str:
-    """A call id in the format calls are given (uuid4 hex), distinct per number."""
-    return f"{number:012x}4{number:03x}8{number:015x}"
+def insert_call(
+    connection: Connection,
+    number: int,
+    transcript: str = "agent: Goodbye.",
+    patient_id: str | None = None,
+) -> None:
+    """Call `number`, stored: it started `number` minutes after T0 and lasted two."""
+    connection.execute(
+        INSERT_CALL,
+        {
+            "id": number,
+            "call_id": cid(number),
+            "started_at": T0 + timedelta(minutes=number),
+            "ended_at": T0 + timedelta(minutes=number + 2),
+            "verified": patient_id is not None,
+            "patient_id": patient_id,
+            "turn_count": number,
+            "transcript": transcript,
+        },
+    )
+
+
+def seed_call(engine: Engine) -> None:
+    """Call 1, for the single-call route."""
+    with engine.begin() as connection:
+        insert_call(connection, 1)
 
 
 def basic(user: str | bytes, password: str | bytes) -> dict[str, str]:
@@ -158,8 +201,8 @@ def call_started(number: int) -> Event:
 
 
 def admin_event(route: str) -> tuple[Any, ...]:
-    action, resource_type = ROUTE_EVENTS[route]
-    return (None, f"admin:{ADMIN_USER}", action, resource_type, None, "success", None)
+    action, resource_type, resource_id = ROUTE_EVENTS[route]
+    return (None, f"admin:{ADMIN_USER}", action, resource_type, resource_id, "success", None)
 
 
 @pytest.fixture
@@ -172,7 +215,8 @@ def ssn_sample() -> str:
 
 
 def seed_identifiers(engine: Engine) -> None:
-    """One request and one message holding every kind of identifier the masking hides."""
+    """One request, one message and one call holding every kind of identifier the masking
+    hides."""
     with engine.begin() as connection:
         connection.execute(INSERT_PATIENT)
         connection.execute(
@@ -197,6 +241,13 @@ def seed_identifiers(engine: Engine) -> None:
                 "body": f"Number {ssn_sample()}, mail jane.doe@example.com, born 3/14/1985",
                 "created_at": T0,
             },
+        )
+        insert_call(
+            connection,
+            1,
+            transcript=f"caller: Refill please, dob 1985-03-14, ssn {ssn_sample()}\n"
+            "agent: I'll mail jane.doe@example.com and call 555-201-3344.",
+            patient_id="P001",
         )
 
 
@@ -230,7 +281,7 @@ def test_admin_requires_credentials(database: StartupSettings) -> None:
             assert response.status_code == 401, (route, name)
             assert response.json() == REFUSED_BODY, (route, name)
             assert response.headers["www-authenticate"] == REFUSED_CHALLENGE, (route, name)
-    assert seen == 52
+    assert seen == 78
 
 
 # R2
@@ -303,6 +354,28 @@ def test_admin_output_is_masked(
             }
         ]
     }
+    call = {
+        "id": 1,
+        "call_id": cid(1),
+        "started_at": "2026-11-24T15:31:00+00:00",
+        "ended_at": "2026-11-24T15:33:00+00:00",
+        "office_open": True,
+        "verified": True,
+        "patient_id": "P001",
+        "end_reason": "completed",
+        "turn_count": 1,
+    }
+    assert bodies["/admin/api/calls"].json() == {"calls": [call]}
+    assert bodies[CALL_ROUTE].json() == {
+        "call": {
+            **call,
+            # As in the request's summary: digits after an SSN cue are hidden whole.
+            "transcript": "caller: Refill please, dob ****-**-14, ssn ****\n"
+            "agent: I'll mail j***@***.com and call ***-***-3344.",
+            "transcript_truncated": False,
+            "names_masked": True,
+        }
+    }
     assert bodies["/admin/api/audit"].json() == {
         "events": [
             {
@@ -322,6 +395,7 @@ def test_admin_output_is_masked(
 
 # R5
 def test_admin_reads_are_audited(admin_app: FastAPI, owner_engine: Engine) -> None:
+    seed_call(owner_engine)
     expected: list[tuple[Any, ...]] = []
     with client_from(admin_app) as client:
         for route in ROUTES:
@@ -335,20 +409,32 @@ def test_admin_reads_are_audited(admin_app: FastAPI, owner_engine: Engine) -> No
             assert client.get(ROUTES[0], headers=headers).status_code == 401
         assert events(owner_engine) == before
 
+        # A call that is not there, or an id that is not a call's, is not read: no event.
+        missing_ids = (cid(2), cid(0xABC).upper(), "1", cid(1) + "0", "x'; DROP TABLE requests;--")
+        for missing in missing_ids:
+            response = client.get(f"/admin/api/calls/{missing}", headers=SIGNED_IN)
+            assert response.status_code == 404, missing
+            assert response.json() == NOT_FOUND_BODY, missing
+        assert events(owner_engine) == before
+
         # The chain the reads wrote verifies.
         verified = client.get("/admin/api/audit/verify", headers=SIGNED_IN).json()
-    assert verified == {"ok": True, "checked": 4, "breaks": [], "truncated": False}
-    assert [row[0] for row in events(owner_engine)] == [1, 2, 3, 4, 5]
+    assert verified == {"ok": True, "checked": 6, "breaks": [], "truncated": False}
+    assert [row[0] for row in events(owner_engine)] == [1, 2, 3, 4, 5, 6, 7]
 
 
 # R6
 def test_no_data_without_an_audit_event(admin_app: FastAPI, owner_engine: Engine) -> None:
     seed_identifiers(owner_engine)
     with client_from(admin_app) as client:
-        with owner_engine.connect() as holder:
-            holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
-            responses = {route: client.get(route, headers=SIGNED_IN) for route in ROUTES}
-            holder.rollback()
+        responses = {}
+        # The lock taken afresh for each route: each read waits out its lock timeout, and the
+        # holder's transaction must not sit idle past the server's limit for all of them.
+        for route in ROUTES:
+            with owner_engine.connect() as holder:
+                holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
+                responses[route] = client.get(route, headers=SIGNED_IN)
+                holder.rollback()
         for route, response in responses.items():
             assert response.status_code == 503, route
             assert response.json() == UNAVAILABLE_BODY, route
@@ -404,7 +490,7 @@ def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
     ]
     written = 0
     with client_from(admin_app) as client:
-        for route in ROUTES[:3]:
+        for route in LISTS:
             if route == "/admin/api/audit":
                 refused = refused_everywhere + refused_on_audit
                 allowed = accepted + accepted_on_audit
@@ -425,13 +511,14 @@ def test_admin_query_bounds(admin_app: FastAPI, owner_engine: Engine) -> None:
             written += len(allowed)
             assert len(events(owner_engine)) == written, route
 
-        # The verify route takes no parameters at all.
-        for query in ["limit=1", "before=1", "call_id=" + cid(1), "x=1"]:
-            response = client.get(f"/admin/api/audit/verify?{query}", headers=SIGNED_IN)
-            assert response.status_code == 422, query
-            assert response.json() == INVALID_QUERY_BODY, query
+        # The verify and single-call routes take no parameters at all.
+        for route in ("/admin/api/audit/verify", CALL_ROUTE):
+            for query in ["limit=1", "before=1", "call_id=" + cid(1), "x=1"]:
+                response = client.get(f"{route}?{query}", headers=SIGNED_IN)
+                assert response.status_code == 422, (route, query)
+                assert response.json() == INVALID_QUERY_BODY, (route, query)
     assert len(events(owner_engine)) == written
-    assert written == 4 + 4 + 7
+    assert written == 4 + 4 + 7 + 4
 
 
 def test_audit_reader_refuses_unvalidated_filters() -> None:
@@ -483,12 +570,14 @@ def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: Startu
                     "created_at": at,
                 },
             )
+            insert_call(connection, number)
     append_events(database, [call_started(number) for number in range(1, 121)])
 
     with client_from(admin_app) as client:
         for route, key, extra in (
             ("/admin/api/requests", "id", ""),
             ("/admin/api/messages", "id", ""),
+            ("/admin/api/calls", "id", ""),
             # Only the events appended above; the reads add their own as they go.
             ("/admin/api/audit", "seq", "&action=call_started"),
         ):
@@ -641,6 +730,8 @@ def test_admin_headers_and_schema(
             client.get(f"{ROUTES[0]}?limit=0", headers=SIGNED_IN),
             client.post(ROUTES[0], headers=SIGNED_IN),
             client.get("/admin/api/nothing-here", headers=SIGNED_IN),
+            client.get(f"/admin/api/calls/{cid(2)}", headers=SIGNED_IN),
+            client.get("/admin/api/calls/not-a-call", headers=SIGNED_IN),
         ]
         for _ in range(5):
             client.get(ROUTES[0])
@@ -648,7 +739,17 @@ def test_admin_headers_and_schema(
     down = create_app(admin_settings(database, postgres_port=closed_port()))
     with client_from(down) as client:
         responses.append(client.get(ROUTES[0], headers=SIGNED_IN))
-    assert [response.status_code for response in responses] == [200, 401, 422, 405, 404, 429, 503]
+    assert [response.status_code for response in responses] == [
+        200,
+        401,
+        422,
+        405,
+        404,
+        404,
+        404,
+        429,
+        503,
+    ]
     for response in responses:
         assert response.headers["cache-control"] == "no-store", response.status_code
 
@@ -681,6 +782,7 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
     with client_from(admin_app) as client:
         assert client.get("/admin/api/requests", headers=SIGNED_IN).json() == {"requests": []}
         assert client.get("/admin/api/messages", headers=SIGNED_IN).json() == {"messages": []}
+        assert client.get("/admin/api/calls", headers=SIGNED_IN).json() == {"calls": []}
         # Past the oldest row: nothing.
         seed_identifiers(owner_engine)
         assert client.get("/admin/api/requests?before=1", headers=SIGNED_IN).json() == {
@@ -689,6 +791,7 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
     assert [row[1:] for row in events(owner_engine)] == [
         admin_event("/admin/api/requests"),
         admin_event("/admin/api/messages"),
+        admin_event("/admin/api/calls"),
         admin_event("/admin/api/requests"),
     ]
 
@@ -701,6 +804,11 @@ def test_admin_database_down(database: StartupSettings, caplog: pytest.LogCaptur
             response = client.get(route, headers=SIGNED_IN)
             assert response.status_code == 503, route
             assert response.json() == UNAVAILABLE_BODY, route
+        # An id that is not a call id is refused before the database is asked.
+        for malformed in (cid(0xABC).upper(), "not-a-call", cid(1) + "0"):
+            response = client.get(f"/admin/api/calls/{malformed}", headers=SIGNED_IN)
+            assert response.status_code == 404, malformed
+            assert response.json() == NOT_FOUND_BODY, malformed
     assert [r.getMessage() for r in caplog.records if r.name == "app.api.admin"] == [
         f"admin_read_failed action={ROUTE_EVENTS[route][0]} error=OperationalError"
         for route in ROUTES

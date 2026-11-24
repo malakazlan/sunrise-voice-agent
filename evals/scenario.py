@@ -24,10 +24,17 @@ Expectations, checked after the turn they are under, and over the whole call at 
 - reaches_model: whether the model was shown the turn. A turn that does not reach it appears
   in nothing the model is shown, then or later;
 - withheld: the output guard's rule that withheld part of the model's reply.
+The call's `expect` can also state:
+- record: the call's stored record (app/agent/call_record.py) once it has ended: it exists, ends
+  for the reason the call ended for, holds the markers of the turns the model was given nothing
+  of, in order, under `withheld` (`swallowed`, `emergency`), and none of the strings under
+  its `never`, whatever their case (one written in digit words alone is looked for as its
+  digits too).
 A turn's `expect_scripted` holds expectations for scripted mode only: what comes of a reply
 only the scripted model is given, such as one the output guard withholds. Real mode skips them.
 """
 
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Self
 
@@ -152,6 +159,22 @@ class Expect(_Strict):
         return self
 
 
+class Withheld(StrEnum):
+    """A turn the model was given nothing of, by the marker the call record keeps for it."""
+
+    SWALLOWED = "swallowed"
+    EMERGENCY = "emergency"
+
+
+class RecordExpect(_Strict):
+    withheld: list[Withheld]
+    never: list[Text] = []
+
+
+class CallExpect(Expect):
+    record: RecordExpect | None = None
+
+
 class TurnExpect(Expect):
     flags: list[Flag] | None = None
     reaches_model: StrictBool | None = None
@@ -168,7 +191,7 @@ class Turn(_Strict):
 class Scenario(_Strict):
     now: AwareDatetime
     turns: list[Turn] = Field(min_length=1)
-    expect: Expect
+    expect: CallExpect
 
 
 def _refuse_repeated_keys(node: Any) -> None:

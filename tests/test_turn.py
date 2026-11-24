@@ -18,6 +18,7 @@ from pydantic import SecretStr
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.agent.call_record import drain_call_records
 from app.agent.claims import ClaimKeys
 from app.agent.endings import drain_call_events
 from app.agent.model import (
@@ -224,8 +225,10 @@ async def offline_deps() -> AsyncIterator[Deps]:
     try:
         yield deps_on(engine)
     finally:
-        # A call event a turn started writing (an emergency) has ended before the engine goes.
+        # A call event a turn started writing (an emergency), and the record of a call the test
+        # ended, have ended before the engine goes.
         await drain_call_events()
+        await drain_call_records()
         await engine.dispose()
 
 

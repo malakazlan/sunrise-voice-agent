@@ -30,6 +30,7 @@ from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
 import app.voice.transport
+from app.agent.call_record import drain_call_records
 from app.agent.scripts import ScriptId
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call
 from app.agent.tool_registry import Deps
@@ -61,6 +62,8 @@ async def offline_deps() -> AsyncIterator[Deps]:
     try:
         yield deps_on(engine)
     finally:
+        # The record of a call the test ended is made, or given up, before the engine goes.
+        await drain_call_records()
         await engine.dispose()
 
 

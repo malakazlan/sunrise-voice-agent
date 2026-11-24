@@ -23,6 +23,7 @@ TABLES = {
     "verification_attempts",
     "requests",
     "messages",
+    "call_sessions",
 }
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
@@ -134,7 +135,7 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 38
+    assert len(migrated_constraints) == 46
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
@@ -174,8 +175,37 @@ def test_migration_matches_models(
         ),
     } <= migrated_constraints
 
+    # A call is stored once, with a call id of the declared shape, one of the fixed reasons a
+    # call ends, a patient only when verified and a transcript of at most 20,000 characters.
+    assert {
+        ("call_sessions", "uq_call_sessions_call_id", "UNIQUE (call_id)"),
+        (
+            "call_sessions",
+            "ck_call_sessions_call_id",
+            "CHECK ((call_id ~ '^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$'::text))",
+        ),
+        (
+            "call_sessions",
+            "ck_call_sessions_end_reason",
+            "CHECK ((end_reason = ANY (ARRAY['completed'::text, 'emergency'::text,"
+            " 'transferred'::text, 'caller_hung_up'::text, 'idle_timeout'::text,"
+            " 'max_duration'::text, 'error'::text])))",
+        ),
+        (
+            "call_sessions",
+            "ck_call_sessions_verified_patient",
+            "CHECK ((verified = (patient_id IS NOT NULL)))",
+        ),
+        (
+            "call_sessions",
+            "ck_call_sessions_transcript_length",
+            "CHECK ((char_length(transcript) <= 20000))",
+        ),
+        ("call_sessions", "ck_call_sessions_turn_count", "CHECK ((turn_count >= 0))"),
+    } <= migrated_constraints
+
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 65
+    assert len(migrated_columns) == 77
     assert (
         "messages",
         "after_hours",

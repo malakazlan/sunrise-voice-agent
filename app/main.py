@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.agent.call_record import drain_call_records
 from app.agent.claims import ClaimKeys
 from app.agent.endings import drain_call_events
 from app.agent.model import anthropic_model
@@ -68,6 +69,8 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         # engine goes.
         await drain_call_events()
         await drain_guard_audits()
+        # And the call records still being masked and stored.
+        await drain_call_records()
         if model is not None:
             await model.close()
         await engine.dispose()

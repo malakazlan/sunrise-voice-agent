@@ -57,6 +57,14 @@ heard, or leaves the conversation. Turns are handled one at a time (a lock), eac
 applied to the state before the next turn is read. The conversation is kept in memory only, for
 the call's life. `end` is the one way the call ends.
 
+Beside the conversation, the agent keeps the history the call record stores (`history`): every
+message the model is shown and every line said, trimmed by `heard` as the conversation is, with
+a fixed marker in place of each turn the model was given nothing of (SWALLOWED_TURN,
+EMERGENCY_TURN), and without the opening message code gives the model. It is never sent to the
+model. Once `end` has ended the call it hands that history to `record_call`
+(app/agent/call_record.py), which masks and stores it in a task of its own: the end does not
+wait for it, and a failure to start it is logged, never raised.
+
 Logs carry event names, the call id, rule names, counts and exception class names; never text.
 """
 
@@ -72,6 +80,7 @@ from types import MappingProxyType
 from typing import Any
 
 from app.agent import endings
+from app.agent.call_record import record_call
 from app.agent.endings import emergency, end_call
 from app.agent.model import Model, ModelReply, ModelRequest, ToolCall
 from app.agent.prompts import SYSTEM_PROMPT, TOOL_DESCRIPTIONS
@@ -127,6 +136,9 @@ BLOCK_REASONS = {
 # The Messages API takes a conversation that starts with the caller; this, fixed and written by
 # code, is the caller's first message, before the opening line.
 CALL_CONNECTED = "(The call has connected.)"
+# What the call record's history holds in place of a turn the model was given nothing of.
+SWALLOWED_TURN = "(turn withheld)"
+EMERGENCY_TURN = "(emergency turn withheld)"
 
 # What the model is told about a tool call that ended its turn with a scripted line, and about
 # one asked for after it in the same reply, which does not run.
@@ -240,10 +252,18 @@ class CallAgent:
         # The texts of the lines released in the turn running, in order.
         self._turn_lines: list[str] = []
         self._filler_said = False
+        # The history the call record stores: what the model is shown and what is said, and
+        # the marker of each turn the model never saw. Never sent to the model.
+        self._record: list[dict[str, Any]] = []
 
     @property
     def state(self) -> CallState:
         return self._state
+
+    @property
+    def history(self) -> tuple[dict[str, Any], ...]:
+        """The history the call record stores; never sent to the model."""
+        return tuple(self._record)
 
     @property
     def ending(self) -> Reason | None:
@@ -267,7 +287,7 @@ class CallAgent:
         """The line joins the conversation and goes to `speak`."""
         line = Line(id=next(self._line_ids), text=text, script=script)
         message = {"role": "assistant", "content": text}
-        self._messages.append(message)
+        self._append(message)
         self._unheard[line.id] = message
         self._turn_lines.append(text)
         if self._speak is not None:
@@ -280,12 +300,22 @@ class CallAgent:
         message = self._unheard.pop(line_id, None)
         if message is None or words is None:
             return
-        at = next(index for index, kept in enumerate(self._messages) if kept is message)
         said = " ".join(message["content"].split()[:words])
-        if said:
-            self._messages[at] = {"role": "assistant", "content": said}
-        else:
-            del self._messages[at]
+        for messages in (self._messages, self._record):
+            at = next(index for index, kept in enumerate(messages) if kept is message)
+            if said:
+                messages[at] = {"role": "assistant", "content": said}
+            else:
+                del messages[at]
+
+    def _append(self, message: dict[str, Any]) -> None:
+        """A message joins the conversation and the call record's history."""
+        self._messages.append(message)
+        self._record.append(message)
+
+    def _withheld(self, marker: str) -> None:
+        """A turn the model is given nothing of leaves its marker in the record's history."""
+        self._record.append({"role": "user", "content": marker})
 
     def _line_for(self, outcome: ToolOutcome) -> str:
         if outcome.script is not None:
@@ -323,6 +353,7 @@ class CallAgent:
         no lock: the voice adapter calls it with the running turn cancelled, and nothing here
         waits, so a turn cannot run in between."""
         self._state, script = await emergency(self._state, Reason.GUARD, self._deps)
+        self._withheld(EMERGENCY_TURN)
         self._speak = speak
         try:
             return self._say(script)
@@ -331,8 +362,20 @@ class CallAgent:
 
     async def end(self, reason: Reason) -> None:
         """The one place a call ends: `end_call` (app/agent/endings.py) writes its call_ended
-        event, once, with the reason."""
+        event, once, with the reason; then the call's record is started, once, and not
+        waited for."""
+        ended_before = self._state.phase is Phase.ENDED
         self._state = await end_call(self._state, reason, self._deps)
+        if ended_before:
+            return
+        try:
+            record_call(self._state, self.history, reason, self._deps)
+        except Exception as error:
+            logger.error(
+                "call_record_not_started call_id=%s error=%s",
+                self._state.call_id,
+                type(error).__name__,
+            )
 
     async def _handle(self, transcript: str) -> TurnResult:
         started = self._clock()
@@ -343,10 +386,13 @@ class CallAgent:
 
         if decision.action is GuardAction.EMERGENCY:
             # The emergency's one way: the move and the line first, its event in the background.
+            self._withheld(EMERGENCY_TURN)
             self._state, script = await emergency(self._state, Reason.GUARD, self._deps)
             self.say(script)
             return self._turn(decision.action, None, timings)
 
+        if decision.action is GuardAction.SWALLOW:
+            self._withheld(SWALLOWED_TURN)
         if decision.change is not None:
             self._state = apply(self._state, decision.change)
 
@@ -382,7 +428,7 @@ class CallAgent:
     async def _model_turn(self, text: str, started: float) -> tuple[OutputRule | None, TurnTimings]:
         """One caller turn the model answers, its lines released as they are decided; the
         output guard's rule if it blocked part of the answer."""
-        self._messages.append({"role": "user", "content": text})
+        self._append({"role": "user", "content": text})
         marks: list[float] = []
         rounds = 0
         withheld: OutputRule | None = None
@@ -398,7 +444,7 @@ class CallAgent:
                         raise _ModelFailedError("tool_rounds")
                     rounds += 1
                     asked_at = self._clock()
-                    self._messages.append({"role": "assistant", "content": reply.content})
+                    self._append({"role": "assistant", "content": reply.content})
                     scripted = await self._run_tools(reply.tool_calls, read_back)
                     if scripted is not None:
                         self._line_for(scripted)
@@ -574,7 +620,7 @@ class CallAgent:
                 "data": outcome.data,
             }
             results.append(_result(call, content, error=outcome.status is not Status.DONE))
-        self._messages.append({"role": "user", "content": results})
+        self._append({"role": "user", "content": results})
         return scripted
 
     async def _fall_back(self, reason: str) -> None:

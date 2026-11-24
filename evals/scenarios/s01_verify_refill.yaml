@@ -63,3 +63,8 @@ expect:
     - refill_requested
     - call_ended
   never: ["three three four four"]
+  # The stored record: the swallowed turn as its marker, not its digits; her name and birth
+  # date hidden.
+  record:
+    withheld: [swallowed]
+    never: ["three three four four", "Sarah", "Johnson", "J O H N S O N", "March 14", "1985"]

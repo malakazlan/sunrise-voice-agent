@@ -25,3 +25,8 @@ expect:
   said: [greeting, ssn_ask, verified, emergency]
   phase: emergency
   audit: [call_started, identity_claimed, identity_verified, emergency_detected, call_ended]
+  # The stored record: the swallowed digits and the emergency turn as their markers, and her
+  # name hidden.
+  record:
+    withheld: [swallowed, emergency]
+    never: ["Sarah", "Johnson", "three three four four", "chest pain"]

@@ -19,7 +19,8 @@ After each turn, and at the end of the call, the scenario's expectations are che
 Failure, named by where it is and its kind. Audit actions are read once the call's events and
 the output guard's guard_block events still being written are. A turn's
 flags are read from the input guard itself, given the turn and the state the turn starts in:
-the guard is pure, so that is the decision the turn gets. In scripted mode a turn must ask the
+the guard is pure, so that is the decision the turn gets. The call's stored record is read once
+the records still being made are. In scripted mode a turn must ask the
 model exactly as many times as it has replies.
 
 The report gives, for each scenario, the runs that passed and the first unmet expectation of
@@ -43,6 +44,7 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent.call_record import drain_call_records
 from app.agent.claims import ClaimKeys
 from app.agent.endings import drain_call_events
 from app.agent.model import AnthropicModel, Model, ModelReply, ModelRequest, anthropic_model
@@ -50,10 +52,16 @@ from app.agent.scripts import PLACEHOLDER, SCRIPTS, ScriptId
 from app.agent.state import Phase
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
-from app.agent.turn import TurnResult, drain_guard_audits, start_call
+from app.agent.turn import (
+    EMERGENCY_TURN,
+    SWALLOWED_TURN,
+    TurnResult,
+    drain_guard_audits,
+    start_call,
+)
 from app.audit.log import AuditLog, Reason
 from app.config import Settings
-from app.db.models import AuditEvent
+from app.db.models import AuditEvent, CallSession
 from app.db.session import create_session_factory
 from app.domain.clinic import clinic_date
 from app.guard.input import Flag, guard_input
@@ -66,12 +74,14 @@ from evals.scenario import (
     TABLES,
     CallStep,
     Expect,
+    RecordExpect,
     RowExpect,
     Scenario,
     ScenarioError,
     ToolExpect,
     Turn,
     TurnExpect,
+    Withheld,
     load_scenario,
     scenario_files,
 )
@@ -86,6 +96,12 @@ _LINES = {
         )
     )
     for script, line in SCRIPTS.items()
+}
+
+# The line of the stored transcript each withheld turn leaves.
+_WITHHELD_LINES = {
+    f"caller: {SWALLOWED_TURN}": Withheld.SWALLOWED,
+    f"caller: {EMERGENCY_TURN}": Withheld.EMERGENCY,
 }
 
 # The call registry only gives a run its call id: it never runs the call, so it never applies
@@ -284,6 +300,39 @@ def _never_failure(text: str, lines: list[str], shown: list[str]) -> str | None:
     return None
 
 
+async def _record_failures(
+    sessions: async_sessionmaker[AsyncSession],
+    call_id: str,
+    reason: Reason,
+    expect: RecordExpect,
+) -> list[Failure]:
+    """The call's stored record against `expect`, once the records still being made are:
+    it exists, ends for `reason`, holds the withheld turns' markers in order and none of its
+    `never` strings."""
+    await drain_call_records()
+    async with sessions() as session:
+        statement = select(CallSession.end_reason, CallSession.transcript).where(
+            CallSession.call_id == call_id
+        )
+        row = (await session.execute(statement)).first()
+    if row is None:
+        return [Failure("call", "record", "no record was stored")]
+    end_reason, transcript = row
+    found = []
+    if end_reason != reason.value:
+        found.append(f"the record ends for {end_reason}")
+    withheld = [_WITHHELD_LINES[line] for line in transcript.split("\n") if line in _WITHHELD_LINES]
+    if withheld != expect.withheld:
+        found.append(f"{[kind.value for kind in withheld]} withheld")
+    stored = transcript.casefold()
+    found += [
+        f"{text!r} was stored"
+        for text in expect.never
+        if any(form in stored for form in _forms(text))
+    ]
+    return [Failure("call", "record", detail) for detail in found]
+
+
 def _offered(request: ModelRequest) -> set[str]:
     return {tool["name"] for tool in request.tools}
 
@@ -465,7 +514,8 @@ async def run_scenario(
             # that phase gives, or, when the scenario's turns run out first, because the caller
             # hangs up.
             phase = agent.state.phase
-            await agent.end(agent.ending or Reason.CALLER_HUNG_UP)
+            reason = agent.ending or Reason.CALLER_HUNG_UP
+            await agent.end(reason)
             seen = _Seen(
                 lines=lines,
                 requests=recorded.requests,
@@ -475,6 +525,10 @@ async def run_scenario(
                 verified=agent.state.verified,
             )
             failures += _check("call", scenario.expect, seen, await _written(sessions, before))
+            if scenario.expect.record is not None:
+                failures += await _record_failures(
+                    sessions, call_id, reason, scenario.expect.record
+                )
             shown = _shown(recorded.requests)
             failures += [
                 Failure(scope, "reaches_model", "the turn's words reached the model later")
@@ -484,6 +538,7 @@ async def run_scenario(
         finally:
             await drain_call_events()
             await drain_guard_audits()
+            await drain_call_records()
     return failures
 
 
