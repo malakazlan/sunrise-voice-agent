@@ -33,10 +33,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.scripts import ScriptId
 from app.agent.serving import (
-    CONTROL_CHARACTER,
     DAYS,
     NEEDS_CONFIRMATION,
     Weekday,
+    plain_text,
     spoken_date,
     spoken_time,
     stored_text,
@@ -70,7 +70,6 @@ NEW_PATIENT_LABS = "None on file"
 # Separators a phone number may be said with; ten digits must remain.
 PHONE_SEPARATORS = re.compile(r"[\s().-]")
 TEN_DIGITS = re.compile(r"[0-9]{10}")
-DIGIT = re.compile(r"[0-9]")
 MEMBER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9 -]*")
 # One @, a local part, and a domain of at least two labels joined by dots.
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
@@ -114,9 +113,7 @@ class NewPatientArguments(BaseModel):
     @field_validator("full_name")
     @classmethod
     def _is_a_full_name(cls, value: str) -> str:
-        if CONTROL_CHARACTER.search(value) or DIGIT.search(value):
-            raise ValueError("full_name holds no control characters and no digits")
-        if name_key(value) is None or len(value.split()) < 2:
+        if name_key(plain_text(value, digits=False)) is None or len(value.split()) < 2:
             raise ValueError("full_name is not a first and last name")
         return value
 
@@ -138,8 +135,8 @@ class NewPatientArguments(BaseModel):
     @field_validator("insurance_provider", "member_id")
     @classmethod
     def _no_identifier(cls, value: str | None) -> str | None:
-        if value is not None and (CONTROL_CHARACTER.search(value) or mask_ssns(value) != value):
-            raise ValueError("insurance details hold no control characters and no SSN")
+        if value is not None and mask_ssns(plain_text(value, digits=True)) != value:
+            raise ValueError("insurance details hold no SSN")
         return value
 
     @field_validator("member_id")
@@ -391,7 +388,10 @@ async def book_appointment(
         )
     )
     if repeat is not None:
-        return ToolResult(data=_answer(BOOKED, slot.doctor, slot.starts_at))
+        return ToolResult(
+            data=_answer(BOOKED, slot.doctor, slot.starts_at),
+            audit_action=Action.BOOKING_REPEATED,
+        )
     if not arguments.confirmed:
         if await _open_slot(session, arguments.slot_id, context.now) is None:
             return _TAKEN
@@ -539,7 +539,7 @@ BOOKING_TOOLS = (
         takes_date_of_birth=None,
         callers=frozenset({Caller.PATIENT}),
         audit_action=Action.APPOINTMENT_BOOKED,
-        outcome_actions=_PREVIEW_OR_TAKEN,
+        outcome_actions={**_PREVIEW_OR_TAKEN, Action.BOOKING_REPEATED: Outcome.SUCCESS},
         resource_type=ResourceType.PATIENT,
     ),
     Tool(

@@ -127,6 +127,7 @@ class Action(StrEnum):
     NEW_PATIENT_BOOKED = "new_patient_booked"
     BOOKING_PREVIEWED = "booking_previewed"
     SLOT_TAKEN = "slot_taken"
+    BOOKING_REPEATED = "booking_repeated"
 
 
 class ResourceType(StrEnum):

@@ -14,7 +14,7 @@ written or already there.
 handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
-import re
+import unicodedata
 from datetime import datetime
 from typing import Literal, get_args
 
@@ -49,8 +49,10 @@ REQUESTED = "requested"
 SENT_TO_DOCTOR = "sent_to_doctor"
 SENT = "sent"
 
-# C0 control characters, NUL included, and DEL: never in a stored message.
-CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+# Unicode categories never in text a caller gives to be stored: controls (C0 with NUL, DEL,
+# C1), format characters (bidi overrides, zero-width characters, soft hyphens), surrogates,
+# private use, unassigned code points, and line and paragraph separators.
+HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 Weekday = Literal["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 # The day names, Monday first, as datetime.weekday() counts them.
@@ -100,12 +102,21 @@ def trimmed(value: object) -> object:
     return value.strip() if isinstance(value, str) else value
 
 
+def plain_text(value: str, *, digits: bool) -> str:
+    """The text, unless it holds a character of HIDDEN_CATEGORIES or, where `digits` is false,
+    a digit of any script."""
+    for char in value:
+        if unicodedata.category(char) in HIDDEN_CATEGORIES:
+            raise ValueError("the text must not contain control or format characters")
+        if not digits and char.isdigit():
+            raise ValueError("the text must not contain digits")
+    return value
+
+
 def stored_text(value: str, longest: int) -> str:
-    """A caller's short text as it is read back and stored: no control characters, SSNs
+    """A caller's short text as it is read back and stored: plain text (digits allowed), SSNs
     masked, and 1 to `longest` characters once masked."""
-    if CONTROL_CHARACTER.search(value):
-        raise ValueError("the text must not contain control characters")
-    stored = mask_ssns(value)
+    stored = mask_ssns(plain_text(value, digits=True))
     if not 1 <= len(stored) <= longest:
         raise ValueError(f"the text must be 1 to {longest} characters")
     return stored

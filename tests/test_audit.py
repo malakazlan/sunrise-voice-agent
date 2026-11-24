@@ -1386,6 +1386,7 @@ def test_only_registry_members_are_accepted() -> None:
         "new_patient_booked",
         "booking_previewed",
         "slot_taken",
+        "booking_repeated",
     }
     assert {member.value for member in ResourceType} == {
         "call",

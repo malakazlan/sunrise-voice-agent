@@ -763,6 +763,16 @@ async def test_new_patient_details_are_bounded(
             {**DETAILS, "full_name": "  O'Brien-Smith  Ann  "},
             {"first_name": "O'Brien-Smith", "last_name": "Ann"},
         ),
+        # Letters with accents, and digits where text may hold them.
+        ({**DETAILS, "full_name": "Zoë Ångström"}, {"first_name": "Zoë", "last_name": "Ångström"}),
+        (
+            {**DETAILS, "reason_short": "Knee pain for 2 weeks"},
+            {"reason_short": "Knee pain for 2 weeks"},
+        ),
+        (
+            {**DETAILS, **insured, "insurance_provider": "Acme Health 2"},
+            {**insured, "insurance_provider": "Acme Health 2"},
+        ),
     ]
     stored_default = {
         "first_name": "Ann",
@@ -790,6 +800,9 @@ async def test_new_patient_details_are_bounded(
                 "1990-13-01",
                 "2026-11-25",
                 "",
+                # Not before 1900.
+                "1899-12-31",
+                "0001-01-01",
             )
         ],
         # Phone: exactly ten digits once separators are removed.
@@ -844,6 +857,25 @@ async def test_new_patient_details_are_bounded(
             {**DETAILS, "full_name": name}
             for name in ("", "   ", "Ann", "Dr.", "Ann 9 Example", "李 小龙", "x" * 201)
         ],
+        # Unicode digits in a name; control and format characters (a bidi override, a
+        # zero-width space, a soft hyphen, a line separator) in any text.
+        *[
+            {**DETAILS, "full_name": name}
+            for name in (
+                "Ann ٣ Example",
+                "Ann Example²",
+                "Ann Ex‮elpma",
+                "Ann Exa​mple",
+                "Ann Ex­ample",
+                "Ann Example",
+            )
+        ],
+        *[
+            {**DETAILS, "reason_short": reason}
+            for reason in ("Knee ‮pain", "Knee​ pain", "Knee \u0085pain")
+        ],
+        {**DETAILS, **insured, "insurance_provider": "Acme​ Health"},
+        {**DETAILS, **insured, "insurance_provider": "Acme ‮Health"},
         # Nothing else can be collected.
         {**DETAILS, "allergies": "none"},
         {**DETAILS, "address": "1 Main St"},
@@ -1215,6 +1247,14 @@ async def test_repeat_booking_writes_once(
     # set as offered by hand, since no call is offered a taken slot.)
     later = sarah().model_copy(update={"offered_slots": (first,)})
     assert (await run(registry, deps, later, BOOK, book(first, True)))[1] == SLOT_TAKEN
+    # The audit trail shows one booking per slot, and each repeat as a repeat.
+    assert [row[0] for row in rows(owner_engine, EVENTS) if row[4] == state.call_id] == [
+        "slots_offered",
+        "appointment_booked",
+        "booking_repeated",
+        "booking_repeated",
+        "appointment_booked",
+    ]
 
     assert rows(owner_engine, APPOINTMENTS) == [
         ("P001", first, "Dr. Patel", at(11, 25, 9, 30), "Knee pain", "scheduled"),
@@ -1312,6 +1352,83 @@ async def test_concurrent_booking_gives_one_winner(
     # The earliest slot went first, and no dispatch failed.
     assert rows(owner_engine, APPOINTMENTS)[0][3] == at(11, 25, 9, 30)
     assert first.tool_errors == second.tool_errors == 0
+
+
+# --- Rework: smaller items ----------------------------------------------------------------------
+
+
+async def test_details_again_forget_the_offers(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    offered_state, data = await done(registry, deps, await new_patient(registry, deps), FIND)
+    first = data["slots"][0]["slot_id"]
+    assert len(offered_state.offered_slots) == 3
+    # The email was spelled back wrongly: the details are given again.
+    again, _ = await done(
+        registry, deps, offered_state, COLLECT, {**DETAILS, "phone": "5554102299"}
+    )
+    assert again.offered_slots == ()
+    draft = again.new_patient_details
+    assert draft is not None
+    assert draft.phone == "555-410-2299"
+    # A slot offered before the new details is not offered now.
+    assert (await run(registry, deps, again, BOOK_NEW, booking_args(first, True)))[1] == SLOT_TAKEN
+    assert is_open(owner_engine, first)
+
+
+async def test_find_slots_boundaries(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    # Slots of this test's own, after every seeded one: noon on a Wednesday, 11:30 PM on a
+    # Monday (already Tuesday in UTC), and two after the March clock change (EDT, UTC-4).
+    inserted = [
+        ("Dr. Lee", at(12, 16, 12)),
+        ("Dr. Lee", at(12, 21, 23, 30)),
+        ("Dr. Patel", datetime(2027, 3, 15, 11, 30, tzinfo=EASTERN)),
+        ("Dr. Patel", datetime(2027, 3, 15, 12, 0, tzinfo=EASTERN)),
+    ]
+    assert inserted[1][1].astimezone(UTC) == datetime(2026, 12, 22, 4, 30, tzinfo=UTC)
+    assert inserted[2][1].astimezone(UTC) == datetime(2027, 3, 15, 15, 30, tzinfo=UTC)
+    for doctor, starts_at in inserted:
+        execute(
+            owner_engine,
+            text(
+                "INSERT INTO available_slots (doctor, starts_at, source)"
+                " VALUES (:doctor, :starts_at, 'task')"
+            ),
+            doctor=doctor,
+            starts_at=starts_at,
+        )
+    noon, late, march_morning, march_noon = (
+        {
+            "slot_id": slot_id(owner_engine, doctor, starts_at),
+            "doctor": doctor,
+            "date": day,
+            "time": clock,
+        }
+        for (doctor, starts_at), day, clock in zip(
+            inserted,
+            (
+                "Wednesday, December 16",
+                "Monday, December 21",
+                "Monday, March 15",
+                "Monday, March 15",
+            ),
+            ("12:00 PM", "11:30 PM", "11:30 AM", "12:00 PM"),
+            strict=True,
+        )
+    )
+    after_the_seed = clocked(deps, at(12, 15, 18))
+    cases: list[tuple[dict[str, Any], list[dict[str, Any]]]] = [
+        ({"preferred_time_of_day": "morning"}, [march_morning]),
+        ({"preferred_time_of_day": "afternoon"}, [noon, late, march_noon]),
+        ({"preferred_days": ["Monday"]}, [late, march_morning, march_noon]),
+        ({"preferred_days": ["Tuesday"]}, []),
+        ({"preferred_days": ["Wednesday"], "preferred_time_of_day": "morning"}, []),
+    ]
+    for arguments, expected in cases:
+        _, data = await done(registry, after_the_seed, sarah(), FIND, arguments)
+        assert data == {"slots": expected}, arguments
 
 
 # --- Rework M1: the SSN step cannot be left for a booking ------------------------------------

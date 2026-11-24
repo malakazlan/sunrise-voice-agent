@@ -63,18 +63,23 @@ def _iso_text(value: object) -> date:
     return date.fromisoformat(value)
 
 
-def _not_in_the_future(value: date, info: ValidationInfo) -> date:
+def _in_range(value: date, info: ValidationInfo) -> date:
     today = (info.context or {}).get("today")
     if not isinstance(today, date):
         raise ValueError("dob is checked against the clinic's date, which is missing")
     if value > today:
         raise ValueError("dob is in the future")
+    if value < EARLIEST_DOB:
+        raise ValueError("dob is before 1900")
     return value
 
 
-# A date of birth as the caller gives it: strictly an ISO date (YYYY-MM-DD), not after the
-# clinic's date, which dispatch passes in the validation context.
-DateOfBirth = Annotated[date, BeforeValidator(_iso_text), AfterValidator(_not_in_the_future)]
+# The earliest date of birth taken.
+EARLIEST_DOB = date(1900, 1, 1)
+
+# A date of birth as the caller gives it: strictly an ISO date (YYYY-MM-DD), from 1900-01-01 to
+# the clinic's date, which dispatch passes in the validation context.
+DateOfBirth = Annotated[date, BeforeValidator(_iso_text), AfterValidator(_in_range)]
 
 
 class VerifyIdentityArguments(BaseModel):

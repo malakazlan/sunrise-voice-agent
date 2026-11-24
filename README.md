@@ -401,7 +401,8 @@ model. Code decides; the model only relays the name and the date.
   (`spoken_digits`, `says_a_number`). A repo scan refuses SSN patterns or lists of digit words
   anywhere else under `app/`; it is a lint, like the others.
 - `verify_identity(full_name, dob)`: the model calls it in `intake` with the office open.
-  The date must be an ISO date (`YYYY-MM-DD`) not after the clinic's date, and the name must
+  The date must be an ISO date (`YYYY-MM-DD`) from 1900-01-01 to the clinic's date, and the
+  name must
   be a name; otherwise the arguments are refused and nothing is counted. It stores the claim,
   arms the SSN step and returns `ssn_ask`. If the call is locked, or the claimed identity has
   five failures within the last hour across calls, it returns `verify_locked`, arms nothing
@@ -507,11 +508,14 @@ for a verified patient and for a first-time caller. All need the office open.
   locked): the call moves to `booking` as a new patient's call, which can never be verified
   and never reaches a patient-data tool. A locked call is offered staff, not a booking.
 - `collect_new_patient` (booking, a new patient's call): `full_name` (a first and a last name,
-  no digits), `dob` (ISO, not in the future), `phone` (ten digits once spaces, dots, dashes and
-  brackets are removed; stored as `555-410-2233`), `email` (one `@`, a dot in the domain, at
-  most 254 characters, letters, digits and `. _ % + -`), either `insurance_provider` and
-  `member_id` or `self_pay: true`, and `reason_short` (1 to 120 characters, SSNs masked).
-  Nothing else is accepted. The details are kept in the call's state only, hidden from its text
+  no digit of any script), `dob` (ISO, from 1900-01-01, not in the future; the same bounds as
+  `verify_identity`), `phone` (ten digits once spaces, dots, dashes and brackets are removed;
+  stored as `555-410-2233`), `email` (one `@`, a dot in the domain, at most 254 characters,
+  letters, digits and `. _ % + -`), either `insurance_provider` and `member_id` or
+  `self_pay: true`, and `reason_short` (1 to 120 characters, SSNs masked). No text may hold a
+  Unicode control or format character (bidi overrides, zero-width characters), a line or
+  paragraph separator, or a private-use or unassigned one; the doctor-message text follows the
+  same rule. Nothing else is accepted. The details are kept in the call's state only, hidden from its text
   form, its dumps, logs and errors; a second call replaces them and forgets the slots offered.
   The answer is the email spelled letter by letter for reading back.
 - `find_slots(doctor?, preferred_days?, preferred_time_of_day?)` (serving or booking, a
@@ -535,7 +539,8 @@ for a verified patient and for a first-time caller. All need the office open.
   record, flagged `possible_duplicate` for staff. The caller is told exactly the same.
 - Audit actions: `new_patient_started`, `new_patient_details_collected`, `slots_offered`,
   `appointment_booked` (resource: the patient), `new_patient_booked` (resource: the
-  appointment), `booking_previewed`, and `slot_taken` (outcome `refused`).
+  appointment), `booking_previewed`, `booking_repeated` (a verified caller asking again for a
+  slot this call booked: nothing written), and `slot_taken` (outcome `refused`).
 - The runtime role may insert patients and appointments but not change or delete them, and may
   change only `is_available` on a slot.
 - Limits:
@@ -550,7 +555,12 @@ for a verified patient and for a first-time caller. All need the office open.
     is refused; the caller needs staff for it.
   - A verified caller moved to `booking` may look for slots there but books from `serving`;
     moving between them forgets the slots offered.
-  - A new patient books once per call: after booking, a repeat is refused, not answered.
+  - A new patient books once per call: after booking, a repeat is refused, not answered. This
+    relies on a call's turns being handled one at a time, which they are (the turn loop is
+    serial per call); two bookings dispatched at once for one new-patient call are not
+    supported.
+  - The `slot_taken` answers do not differ in content, but their paths differ in time by a few
+    milliseconds (a slot never offered is refused before any database read).
   - Slot times are rendered without the year to the caller; the staff summary carries it.
 
 ## Configuration
