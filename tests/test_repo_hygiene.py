@@ -187,3 +187,173 @@ def test_raw_driver_connections_only_in_allowed_modules() -> None:
     }
 
     assert users <= RAW_CONNECTION_ALLOWED, users - RAW_CONNECTION_ALLOWED
+
+
+# app/domain/ decides office hours and identity from its arguments alone: no database, no
+# network, no settings or other files. Everything it may import is listed; anything else fails.
+DOMAIN_PACKAGE = "app.domain"
+DOMAIN_DIR = REPO_ROOT / "app" / "domain"
+DOMAIN_ALLOWED_IMPORTS = {
+    "__future__",
+    "collections.abc",
+    "dataclasses",
+    "datetime",
+    "re",
+    "typing",
+    "unicodedata",
+    "zoneinfo",
+    "jellyfish",
+    DOMAIN_PACKAGE,
+}
+# Builtins that read files, run code, or reach modules and attributes by name.
+DOMAIN_FORBIDDEN_CALLS = {
+    "open",
+    "__import__",
+    "exec",
+    "eval",
+    "compile",
+    "getattr",
+    "globals",
+    "vars",
+}
+# Names that reach other modules, the environment or the builtins through an allowed module:
+# as an attribute (dataclasses.sys), as a name, or as a from-import (from typing import sys).
+DOMAIN_FORBIDDEN_NAMES = {
+    "sys",
+    "os",
+    "modules",
+    "environ",
+    "__builtins__",
+    "__import__",
+    "importlib",
+    "__loader__",
+    "__spec__",
+    "__dict__",
+    "__getattribute__",
+    "__subclasses__",
+    "__class__",
+    "__base__",
+    "inspect",
+    "linecache",
+    "breakpoint",
+}
+
+
+def imported_modules(source: str, package: str) -> list[str]:
+    modules = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level:
+            parts = package.split(".")
+            base = parts[: len(parts) - node.level + 1]
+            modules.append(".".join([*base, *([node.module] if node.module else [])]))
+        elif isinstance(node, ast.ImportFrom):
+            modules.append(node.module or "")
+    return modules
+
+
+def forbidden_uses(source: str) -> list[str]:
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) in DOMAIN_FORBIDDEN_CALLS:
+            uses.append(f"{getattr(node.func, 'id', '')}()")
+        elif isinstance(node, ast.Name) and node.id in DOMAIN_FORBIDDEN_NAMES:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in DOMAIN_FORBIDDEN_NAMES:
+            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.ImportFrom):
+            uses += [alias.name for alias in node.names if alias.name in DOMAIN_FORBIDDEN_NAMES]
+    return uses
+
+
+def impure_imports(source: str, package: str = DOMAIN_PACKAGE) -> list[str]:
+    disallowed = [
+        module
+        for module in imported_modules(source, package)
+        if not any(
+            module == allowed or module.startswith(f"{allowed}.")
+            for allowed in DOMAIN_ALLOWED_IMPORTS
+        )
+    ]
+    return disallowed + forbidden_uses(source)
+
+
+def test_domain_is_pure() -> None:
+    for sample in (
+        "import sqlalchemy\n",
+        "from sqlalchemy.ext.asyncio import AsyncSession\n",
+        "import psycopg\n",
+        "from app.db.models import Patient\n",
+        "from app.db import session\n",
+        "from app.config import Settings\n",
+        "from app import config\n",
+        "from .. import config\n",
+        "from ..db.session import create_database_engine\n",
+        "import pydantic_settings\n",
+        "from dotenv import load_dotenv\n",
+        "import os\n",
+        "from pathlib import Path\n",
+        "import socket\n",
+        "import urllib.request\n",
+        "import httpx2\n",
+        "import asyncio\n",
+        "import importlib\n",
+        "open('settings.toml')\n",
+        "__import__('socket')\n",
+        "import collections\n",
+        # Reaching other modules, the environment or the builtins through allowed modules.
+        "import dataclasses\ndataclasses.sys.modules['app.config'].Settings()\n",
+        "import typing\ntyping.__builtins__['open']('.env')\n",
+        "from dataclasses import sys\n",
+        "import zoneinfo\nzoneinfo._tzpath.os.environ['APP_ENV']\n",
+        "import typing\ngetattr(typing, 'sys')\n",
+        "globals()['__builtins__']\n",
+        "import typing\nvars(typing)['sys']\n",
+        "exec(compile('import socket', 'x', 'exec'))\n",
+        "import re\nre.importlib\n",
+        "typing.sys.modules['os'].environ\n",
+        "dataclasses.inspect.os.environ\n",
+        "getattr(__builtins__, 'open', None)\n",
+        "import typing\ntyping.__loader__.load_module('os')\n",
+        "import re\nre.__spec__.loader.exec_module(re)\n",
+        "import datetime\ndatetime.__dict__['__builtins__']\n",
+        "import typing\nobject.__getattribute__(typing, 'sys')\n",
+        "().__class__.__base__.__subclasses__()\n",
+        "import dataclasses\ndataclasses.inspect.getmodule(dataclasses)\n",
+        "import typing\ntyping.linecache.getlines('.env')\n",
+        # The re-review's six bypasses, verbatim.
+        "breakpoint()\n",
+        "__loader__.get_data('.env')\n",
+        "[c for c in ().__class__.__base__.__subclasses__()"
+        " if c.__name__ == 'FileIO'][0]('.env')\n",
+        "dataclasses.inspect.linecache.getlines('.env')\n",
+        "typing.__dict__['s'+'ys']\n",
+        "typing.__getattribute__('s'+'ys')\n",
+        # Caught only by the bare-name ban: the attribute (open) is not banned.
+        "__builtins__.open('.env')\n",
+    ):
+        assert impure_imports(sample), sample
+    assert not impure_imports(
+        "from __future__ import annotations\n"
+        "from collections.abc import Iterable\n"
+        "from datetime import datetime\n"
+        "from zoneinfo import ZoneInfo\n"
+        "import jellyfish\n"
+        "import re\n"
+        "WORD = re.compile('[a-z]+')\n"
+        "from app.domain.clinic import CLINIC_TZ\n"
+        "from .clinic import CLINIC_TZ\n"
+        "from . import clinic\n"
+    )
+
+    sources = sorted(DOMAIN_DIR.rglob("*.py"))
+    assert {path.name for path in sources} >= {"clinic.py", "office_hours.py", "matching.py"}
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix(): found
+        for path in sources
+        if (found := impure_imports(path.read_text(encoding="utf-8")))
+    }
+
+    assert offenders == {}
