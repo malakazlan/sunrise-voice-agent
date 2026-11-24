@@ -1,13 +1,19 @@
 """The only place log output is configured. Every handler formats with MaskingFormatter, so
 every line that leaves the process has its identifiers masked (app/guard/mask.py), whoever
-logged it: the app, uvicorn, Alembic, or Pipecat through loguru."""
+logged it: the app, uvicorn, Alembic, or Pipecat through loguru. Warnings and uncaught
+exceptions, in the main thread or another, are logged too, and so masked."""
 
 import logging
+import sys
+import threading
+from types import TracebackType
 
 from loguru import logger as loguru_logger
 
 from app.config import DatabaseSettings
 from app.guard.mask import mask
+
+logger = logging.getLogger(__name__)
 
 # The handler configure_logging puts on the root logger; a later call replaces it.
 HANDLER_NAME = "app.guard.logging"
@@ -36,6 +42,16 @@ class MaskingFormatter(logging.Formatter):
         parts = [mask(message), *(mask(part) for part in (exception, stack) if part.strip())]
         text = "\n".join(parts)
         return f"{self.formatTime(record)} {record.levelname} {record.name} {text}"
+
+
+def _log_uncaught(
+    exc_type: type[BaseException], exc_value: BaseException, exc_traceback: TracebackType | None
+) -> None:
+    logger.critical("uncaught_exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    logger.error("uncaught_thread_exception", exc_info=args.exc_value)
 
 
 def configure_logging(settings: DatabaseSettings) -> None:
@@ -71,6 +87,13 @@ def configure_logging(settings: DatabaseSettings) -> None:
         logging.getLogger(name).setLevel(third_party_level)
     # A handler that fails to write would otherwise print the raw message and its arguments.
     logging.raiseExceptions = False
+    # A record that finds no handler (its logger does not pass records up) goes here.
+    logging.lastResort = handler
+
+    # Output that Python would otherwise print itself, unmasked.
+    logging.captureWarnings(True)
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_exception
 
     # loguru's own sink writes unmasked text to stderr. diagnose=False keeps the values of
     # local variables out of its tracebacks.

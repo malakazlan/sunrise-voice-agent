@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,7 @@ def logged(tmp_path: Path) -> Callable[..., str]:
     logging configuration, from a directory without a .env; what it wrote to stderr. The
     script reads identifiers from its arguments, so its own source lines hold none."""
 
-    def run(script: str, *args: str) -> str:
+    def run(script: str, *args: str, returncode: int = 0) -> str:
         path = tmp_path / "script.py"
         path.write_text(CONFIGURE + script, encoding="utf-8")
         result = subprocess.run(
@@ -66,7 +67,7 @@ def logged(tmp_path: Path) -> Callable[..., str]:
             encoding="utf-8",
             check=False,
         )
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == returncode, result.stderr
         assert result.stdout == ""
         return result.stderr
 
@@ -189,6 +190,87 @@ def test_timestamp_survives(logged: Callable[..., str]) -> None:
     assert re.fullmatch(rf"{TIMESTAMP} INFO app\.example caller dob \*\*\*\*-\*\*-14\n", output)
 
 
+def test_warnings_are_masked(logged: Callable[..., str]) -> None:
+    output = logged(
+        "import warnings\nwarnings.warn('caller phone ' + sys.argv[1], stacklevel=1)\n",
+        PHONE,
+    )
+
+    assert "UserWarning: caller phone ***-***-3344" in output
+    assert without_timestamps(output)[0].startswith("WARNING py.warnings ")
+    assert PHONE not in output
+
+
+def test_uncaught_exceptions_are_masked(logged: Callable[..., str]) -> None:
+    output = logged("raise LookupError('no match for ' + sys.argv[1])\n", PHONE, returncode=1)
+    lines = without_timestamps(output)
+
+    assert lines[0] == "CRITICAL app.guard.logging uncaught_exception"
+    assert lines[-1] == "LookupError: no match for ***-***-3344"
+    assert PHONE not in output
+
+
+def test_thread_exceptions_are_masked(logged: Callable[..., str]) -> None:
+    output = logged(
+        "import threading\n"
+        "def lookup(phone):\n"
+        "    raise LookupError('no match for ' + phone)\n"
+        "worker = threading.Thread(target=lookup, args=(sys.argv[1],))\n"
+        "worker.start()\n"
+        "worker.join()\n",
+        PHONE,
+    )
+    lines = without_timestamps(output)
+
+    assert lines[0] == "ERROR app.guard.logging uncaught_thread_exception"
+    assert lines[-1] == "LookupError: no match for ***-***-3344"
+    assert PHONE not in output
+
+
+def test_asyncio_task_exceptions_are_masked(logged: Callable[..., str]) -> None:
+    # asyncio reports a task exception nobody retrieved through its own logger.
+    output = logged(
+        "import asyncio, gc\n"
+        "async def lookup(phone):\n"
+        "    raise LookupError('no match for ' + phone)\n"
+        "async def main():\n"
+        "    task = asyncio.ensure_future(lookup(sys.argv[1]))\n"
+        "    await asyncio.sleep(0.01)\n"
+        "    del task\n"
+        "    gc.collect()\n"
+        "asyncio.run(main())\n",
+        PHONE,
+    )
+    lines = without_timestamps(output)
+
+    assert lines[0] == "ERROR asyncio Task exception was never retrieved"
+    assert lines[-1] == "LookupError: no match for ***-***-3344"
+    assert PHONE not in output
+
+
+def test_last_resort_is_masked(logged: Callable[..., str]) -> None:
+    # A record whose logger and its parents have no handler goes to logging.lastResort.
+    output = logged(
+        "import logging\n"
+        "quiet = logging.getLogger('quiet.example')\n"
+        "quiet.propagate = False\n"
+        "quiet.warning('caller phone %s', sys.argv[1])\n",
+        PHONE,
+    )
+
+    assert without_timestamps(output) == ["WARNING quiet.example caller phone ***-***-3344"]
+
+
+@pytest.mark.usefixtures("restore_logging")
+def test_warnings_still_fail_tests() -> None:
+    # pytest's filter turns a warning into an exception before it could be shown, so capturing
+    # warnings into logging hides none from it.
+    create_app(offline_settings())
+
+    with pytest.raises(UserWarning, match="still an error"):
+        warnings.warn("still an error", stacklevel=1)
+
+
 def test_second_configuration_replaces_the_first(logged: Callable[..., str]) -> None:
     output = logged(
         "import logging\n"
@@ -260,6 +342,9 @@ def test_every_handler_masks() -> None:
         if isinstance(logger, logging.Logger)
         for handler in logger.handlers
     ]
+    # The handler for records that find no other.
+    assert logging.lastResort is not None
+    handlers.append(logging.lastResort)
     sinks = loguru_sink_handlers()
 
     # uvicorn's default handler is among them.
