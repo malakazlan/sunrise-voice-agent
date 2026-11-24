@@ -226,6 +226,16 @@ DOMAIN_FORBIDDEN_NAMES = {
     "__builtins__",
     "__import__",
     "importlib",
+    "__loader__",
+    "__spec__",
+    "__dict__",
+    "__getattribute__",
+    "__subclasses__",
+    "__class__",
+    "__base__",
+    "inspect",
+    "linecache",
+    "breakpoint",
 }
 
 
@@ -305,6 +315,16 @@ def test_domain_is_pure() -> None:
         "typing.sys.modules['os'].environ\n",
         "dataclasses.inspect.os.environ\n",
         "getattr(__builtins__, 'open', None)\n",
+        "import typing\ntyping.__loader__.load_module('os')\n",
+        "import re\nre.__spec__.loader.exec_module(re)\n",
+        "import datetime\ndatetime.__dict__['__builtins__']\n",
+        "import typing\nobject.__getattribute__(typing, 'sys')\n",
+        "().__class__.__base__.__subclasses__()\n",
+        "import dataclasses\ndataclasses.inspect.getmodule(dataclasses)\n",
+        "import typing\ntyping.linecache.getlines('.env')\n",
+        "breakpoint()\n",
+        # Caught only by the bare-name ban: the attribute (open) is not banned.
+        "__builtins__.open('.env')\n",
     ):
         assert impure_imports(sample), sample
     assert not impure_imports(
