@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import TEST_AUDIT_KEY
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -104,6 +104,7 @@ def admin_settings(database: StartupSettings, **overrides: Any) -> Settings:
         "app_db_user": database.app_db_user,
         "app_db_password": database.app_db_password,
         "audit_hmac_key": TEST_AUDIT_KEY,
+        "identity_hash_key": TEST_IDENTITY_KEY,
         "admin_user": ADMIN_USER,
         "admin_password": PASSWORD,
     }

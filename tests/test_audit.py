@@ -1367,6 +1367,10 @@ def test_only_registry_members_are_accepted() -> None:
         "tool_called",
         "tool_refused",
         "tool_failed",
+        "identity_claimed",
+        "identity_verified",
+        "identity_refused",
+        "identity_locked",
         "appointment_read",
         "refill_requested",
         "lab_status_read",
@@ -1376,6 +1380,9 @@ def test_only_registry_members_are_accepted() -> None:
         "admin_read_messages",
         "admin_read_audit",
         "admin_verify_audit",
+        "refill_previewed",
+        "refill_not_found",
+        "doctor_message_previewed",
     }
     assert {member.value for member in ResourceType} == {
         "call",

@@ -108,6 +108,10 @@ class Action(StrEnum):
     TOOL_CALLED = "tool_called"
     TOOL_REFUSED = "tool_refused"
     TOOL_FAILED = "tool_failed"
+    IDENTITY_CLAIMED = "identity_claimed"
+    IDENTITY_VERIFIED = "identity_verified"
+    IDENTITY_REFUSED = "identity_refused"
+    IDENTITY_LOCKED = "identity_locked"
     APPOINTMENT_READ = "appointment_read"
     REFILL_REQUESTED = "refill_requested"
     LAB_STATUS_READ = "lab_status_read"
@@ -117,6 +121,9 @@ class Action(StrEnum):
     ADMIN_READ_MESSAGES = "admin_read_messages"
     ADMIN_READ_AUDIT = "admin_read_audit"
     ADMIN_VERIFY_AUDIT = "admin_verify_audit"
+    REFILL_PREVIEWED = "refill_previewed"
+    REFILL_NOT_FOUND = "refill_not_found"
+    DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
 
 
 class ResourceType(StrEnum):
