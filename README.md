@@ -366,12 +366,13 @@ name, message text, balance or status reaches the audit log or the logs.
   against the caller's own medications only. No match, or more than one: `not_found` and
   nothing else, no list. A match without `confirmed: true`: `needs_confirmation` with the
   medication and pharmacy to read back. Confirmed: a `requests` row (type `refill`, summary
-  `<medication> at <pharmacy>`, built by code) and `requested`, or `sent_to_doctor` when no
+  `<medication> at <pharmacy>`, built by code and cut to its first 200 characters) and `requested`, or `sent_to_doctor` when no
   refills are left, with the medication and pharmacy. The refill count is never returned.
 - `get_lab_status`: the stored status text only; the clinic stores no results.
 - `get_balance`: the balance as an exact two-decimal string (`45.00`).
-- `send_message_to_doctor(summary_short, confirmed)`: 1 to 120 characters after trimming;
-  anything else is refused without echoing it. Without `confirmed: true`:
+- `send_message_to_doctor(summary_short, confirmed)`: 1 to 120 characters after trimming, with
+  no control character (C0, NUL included, or DEL) inside; anything else is refused without
+  echoing it. Without `confirmed: true`:
   `needs_confirmation` with the text as it will be stored. Confirmed: a `messages` row (kind
   `doctor_message`), a `requests` row (type `doctor_message`, the same text) and the message's
   id.
@@ -387,7 +388,8 @@ name, message text, balance or status reaches the audit log or the logs.
     that SSNs are masked as the logs mask them: a grouped or nine-digit number, and the digits
     after a cue such as `ssn`, `last four` or `ending in`. Phone numbers, dates, names and
     anything else in it are stored unmasked. The cue rule also masks an innocent number after
-    such words (`ends in 2 days`).
+    such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
+    four five six seven eight nine`) is not masked.
   - "Now", for the next appointment, is when the call started (the clock reading office hours
     are decided from), not the moment of the question: an appointment that starts during the
     call is still told as next.

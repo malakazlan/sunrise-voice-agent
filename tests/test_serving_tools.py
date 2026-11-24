@@ -402,6 +402,43 @@ async def test_refill_does_not_match_another_drug(
     }
 
 
+async def test_long_refill_summary_is_cut_to_fit(
+    registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
+) -> None:
+    pharmacy = "Corner Pharmacy " + "p" * 230
+    execute(owner_engine, INSERT_PATIENT, id="P901")
+    execute(
+        owner_engine,
+        INSERT_MEDICATION,
+        patient_id="P901",
+        name="Hydrochlorothiazide 25mg",
+        refills=1,
+        pharmacy=pharmacy,
+    )
+    state = serving("P901", "Test")
+    expected = {
+        "status": "requested",
+        "medication": "Hydrochlorothiazide 25mg",
+        "pharmacy": pharmacy,
+    }
+    assert await data_of(registry, deps, state, REFILL, refill("hydrochlorothiazide", True)) == (
+        expected
+    )
+    # The same request again, in the same call, is still the one request.
+    assert await data_of(registry, deps, state, REFILL, refill("hydrochlorothiazide", True)) == (
+        expected
+    )
+    # The summary's first 200 characters: 44 of name and pharmacy, then 156 of the p's.
+    assert rows(owner_engine, REQUESTS) == [
+        (
+            state.call_id,
+            "P901",
+            "refill",
+            "Hydrochlorothiazide 25mg at Corner Pharmacy " + "p" * 156,
+        )
+    ]
+
+
 # --- R7, R8: confirmation and the request rows -----------------------------------------------
 
 
@@ -510,11 +547,13 @@ async def test_next_appointment_is_in_the_future(
     registry: Registry, deps: Deps, seeded: None, owner_engine: Engine
 ) -> None:
     # Sarah's seeded appointment is 2026-12-03 10:30 AM clinic time, 15:30 UTC. Add a past
-    # one, a later one and a cancelled one before it.
+    # one, a later one, a cancelled one before it, and one before it that is stored after it,
+    # so storage order is not time order.
     for starts_at, status in (
         (datetime(2026, 11, 20, 15, 0, tzinfo=UTC), "scheduled"),
         (datetime(2026, 12, 10, 14, 0, tzinfo=UTC), "scheduled"),
         (datetime(2026, 12, 1, 14, 0, tzinfo=UTC), "cancelled"),
+        (datetime(2026, 11, 30, 14, 0, tzinfo=UTC), "scheduled"),
     ):
         execute(
             owner_engine,
@@ -526,7 +565,8 @@ async def test_next_appointment_is_in_the_future(
         )
     at_appointment = datetime(2026, 12, 3, 15, 30, tzinfo=UTC)
     expected = [
-        (T0, SARAH_APPOINTMENT),
+        (T0, "Monday, November 30 at 9:00 AM with Dr. Lee"),
+        (datetime(2026, 11, 30, 14, 0, 1, tzinfo=UTC), SARAH_APPOINTMENT),
         # Exactly at "now" counts as next.
         (at_appointment, SARAH_APPOINTMENT),
         (
@@ -650,20 +690,20 @@ async def test_tool_and_audit_commit_together(
     assert rows(owner_engine, MESSAGES) == []
     assert [row[0] for row in rows(owner_engine, EVENTS)] == ["tool_failed", "tool_failed"]
 
-    # A database error in the middle of the write: a pharmacy so long that the request's
-    # summary breaks its bound. Generic failure, nothing written, counted toward hand-off.
+    # A database error in the middle of the write: in this test's database only, a constraint
+    # that refuses a message's request row, after its message row went in. Generic failure,
+    # neither row written, counted toward hand-off.
     execute(
         owner_engine,
-        INSERT_MEDICATION,
-        patient_id="P002",
-        name="Atorvastatin 40mg",
-        refills=1,
-        pharmacy="Pharmacy " + "x" * 200,
+        text(
+            "ALTER TABLE requests ADD CONSTRAINT ck_requests_test_refuses"
+            " CHECK (type <> 'doctor_message')"
+        ),
     )
-    execute(owner_engine, text("DELETE FROM medications WHERE name = 'Atorvastatin 20mg'"))
     other = michael()
-    after, outcome = await registry.dispatch(other, REFILL, refill("atorvastatin", True), deps)
+    after, outcome = await registry.dispatch(other, MESSAGE, message("call me", True), deps)
     assert (after.tool_errors, outcome) == (1, FAILED)
+    assert rows(owner_engine, MESSAGES) == []
     assert rows(owner_engine, REQUESTS) == []
 
     # And a success commits both.
@@ -703,7 +743,17 @@ async def test_message_bounds(
     # 120 characters said, 122 once the nine digits are masked as ***-**-****.
     grows = "x" * 110 + " " + "9" * 3 + "8" * 2 + "7" * 4
     assert len(grows) == 120
-    for body in (too_long, grows, "", "   ", "\n\t"):
+    # Control characters inside the text (C0, NUL included, and DEL) are refused.
+    control = [
+        "hi\x00there",
+        f"{MARKER}\x00",
+        "hi\x07there",
+        "line one\nline two",
+        "tab\there",
+        "hi\x1fthere",
+        "hi\x7fthere",
+    ]
+    for body in (too_long, grows, "", "   ", "\n\t", *control):
         for confirmed in (None, True):
             outcome = await call(registry, deps, state, MESSAGE, message(body, confirmed))
             assert outcome == REFUSED, repr(body)
@@ -711,6 +761,17 @@ async def test_message_bounds(
     assert MARKER not in caplog.text
     assert rows(owner_engine, MESSAGES) == []
     assert rows(owner_engine, REQUESTS) == []
+
+    # The bound is on the text once trimmed: 125 characters said, 115 kept.
+    for said, kept in (
+        (" " * 10 + "a" * 115, "a" * 115),
+        ("\n  hello there  \n", "hello there"),
+        ("\t" + "b" * 120 + "\r\n", "b" * 120),
+    ):
+        assert await data_of(registry, deps, state, MESSAGE, message(said)) == {
+            "status": "needs_confirmation",
+            "message": kept,
+        }, repr(said)
 
     longest = "y" * 120
     assert await data_of(registry, deps, state, MESSAGE, message(longest)) == {

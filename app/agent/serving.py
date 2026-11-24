@@ -12,6 +12,7 @@ nothing and answers as the first did.
 started, as office hours are): the clock is injected there, and a handler has no other.
 """
 
+import re
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -24,6 +25,7 @@ from app.agent.tool_registry import Handler, Tool, ToolResult
 from app.audit.log import Action, ResourceType
 from app.db.models import (
     MAX_MESSAGE_BODY,
+    MAX_REQUEST_SUMMARY,
     SCHEDULED,
     Appointment,
     Medication,
@@ -43,6 +45,9 @@ NOT_FOUND = "not_found"
 REQUESTED = "requested"
 SENT_TO_DOCTOR = "sent_to_doctor"
 SENT = "sent"
+
+# C0 control characters, NUL included, and DEL: never in a stored message.
+CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 
 DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 MONTHS = (
@@ -78,11 +83,19 @@ class MessageArguments(BaseModel):
     summary_short: str = Field(min_length=1, max_length=MAX_MESSAGE_BODY)
     confirmed: bool = Field(default=False, strict=True)
 
+    @field_validator("summary_short", mode="before")
+    @classmethod
+    def _trimmed(cls, value: object) -> object:
+        """Trimmed before the length bounds apply; anything but text is left to be refused."""
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator("summary_short")
     @classmethod
     def _as_stored(cls, value: str) -> str:
         """The text as it is read back and stored: trimmed, SSNs masked, still in bounds."""
-        stored = mask_ssns(value.strip())
+        if CONTROL_CHARACTER.search(value):
+            raise ValueError("summary_short must not contain control characters")
+        stored = mask_ssns(value)
         if not 1 <= len(stored) <= MAX_MESSAGE_BODY:
             raise ValueError(f"summary_short must be 1 to {MAX_MESSAGE_BODY} characters")
         return stored
@@ -180,7 +193,9 @@ async def request_refill(
     if not arguments.confirmed:
         return ToolResult(data={"status": NEEDS_CONFIRMATION, **named})
 
-    await _record_request(session, state, REFILL, f"{medication.name} at {medication.pharmacy}")
+    # Cut to the column's bound, always at the same place, so a repeat has the same summary.
+    summary = f"{medication.name} at {medication.pharmacy}"[:MAX_REQUEST_SUMMARY]
+    await _record_request(session, state, REFILL, summary)
     status = REQUESTED if medication.refills_remaining > 0 else SENT_TO_DOCTOR
     return ToolResult(data={"status": status, **named})
 
