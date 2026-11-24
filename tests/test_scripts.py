@@ -41,6 +41,11 @@ LINES = [
         " nearest emergency room right away.",
         False,
     ),
+    (
+        "fallback",
+        "I'm sorry, I can't help with that. I can take a message for our staff instead.",
+        True,
+    ),
 ]
 
 
