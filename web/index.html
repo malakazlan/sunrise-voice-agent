@@ -34,6 +34,7 @@
   <dl>
     <dt>Connection state</dt><dd id="state">idle</dd>
     <dt>Candidate type in use</dt><dd id="candidate">none</dd>
+    <dt>Why the call ended</dt><dd id="ended">-</dd>
   </dl>
 
   <audio id="voice" autoplay></audio>
@@ -163,6 +164,7 @@
       el("call").disabled = true;
       el("hangup").disabled = false;
       show("candidate", "none");
+      show("ended", "-");
       el("turns").replaceChildren();
       try {
         show("state", "fetching ICE servers");
@@ -191,7 +193,14 @@
           if (["opening", "turn", "said"].includes(message.type)) addTurn(message);
           if (message.type === "first_audio") showFirstAudio(message);
           if (message.type === "interrupted") addNote("(you interrupted the agent)");
-          if (message.type === "ended") addNote(`(the call ended: ${message.reason})`);
+          if (message.type === "ended") {
+            // The server's last message, kept on the page when the connection then drops.
+            const ended = typeof message.hint === "string"
+              ? `${message.reason}: ${message.hint}`
+              : String(message.reason);
+            show("ended", ended);
+            addNote(`(the call ended: ${ended})`);
+          }
         };
         pc.onconnectionstatechange = () => {
           if (!pc) return;

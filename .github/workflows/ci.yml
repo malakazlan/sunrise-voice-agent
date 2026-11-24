@@ -68,6 +68,11 @@ jobs:
         with:
           version: "0.10.4"
       - run: uv sync --locked
+      # No test reaches a vendor: their hosts, the speech check's included, point at the
+      # runner's own loopback, as in the relay test's stack.
+      - run: |
+          printf '127.0.0.1 %s\n' api.deepgram.com api.anthropic.com api.elevenlabs.io \
+            | sudo tee -a /etc/hosts
       - run: uv run pytest
 
   gitleaks:

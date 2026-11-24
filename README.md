@@ -268,6 +268,15 @@ over the data channel.
   S O N`); the input guard reads digits and number words either way. The caller is taken to
   have stopped after `VAD_STOP_SECONDS` of silence (0.5 by default); Deepgram is then asked to
   finalize, and only a finalized transcript makes a turn.
+- Vocabulary hints (`app/voice/vocabulary.py`): Nova-3's keyterm prompting, one `keyterm`
+  query parameter per term, so that "Lisinopril" is heard as the drug. The list is built once
+  at start-up: the distinct medication names of the `medications` table cut to their drug word
+  (`Lisinopril 10mg` is `Lisinopril`), the doctors' surnames and `Sunrise Family Clinic`;
+  letters only, 2 to 40 characters a term, sorted, each once, at most 100 (Deepgram's limit).
+  It is a vocabulary list with no link to any patient, and it is sent to Deepgram with every
+  call. When the database cannot be read at start-up the list is the doctors and the clinic,
+  and `stt_hints_fallback` is logged. Deepgram's page on keyterms says nothing of their cost
+  in latency; it is not measured here.
 - The turn (`app/agent/turn.py`, no Pipecat in it): the input guard decides first. Emergency:
   `emergency()` (below) moves the call to `emergency` and gives the emergency line at once, its
   event written in the background; no model request. Swallowed (the SSN
@@ -987,6 +996,20 @@ through the functions of "Messages, transfer, emergency and the end of the call"
   rejects the key, the voice or the model, and the call then ends with `error`. In CI's relay
   test ElevenLabs' host points at the app's own loopback: the call starts, its lines fail this
   way, and the probe still passes.
+- Why speech out refused (`app/voice/speech_check.py`): Pipecat's ElevenLabs service does not
+  read ElevenLabs' error messages, so a voice the plan does not allow shows only as silent
+  lines. When a call ends with `error` because speech out was written off, one request goes to
+  ElevenLabs' plain text-to-speech endpoint (`POST /v1/text-to-speech/{voice_id}`, the
+  configured voice and model, two words) in the background, given up after 5 seconds, at most
+  one a minute for the whole process, never waited for by the call. One line is logged:
+  `speech_refused status=<HTTP status> code=<ElevenLabs' error code>` (a fixed set of codes,
+  anything else `other`; for example `status=402 code=paid_plan_required`, or `status=404
+  code=voice_not_found` for a voice that does not exist), `speech_check_ok`, or
+  `speech_check_failed error=<class>`; never the key, the voice id or ElevenLabs' message.
+  The page is told the reason before the call closes, and for `error` a fixed hint: "The
+  speech service refused to speak. Check the voice id and the plan." when speech out was
+  written off, otherwise "The call ended because of an error."; it keeps them ("Why the call
+  ended") when the connection then drops.
 - Logs: event names, the call id, line ids, counts and milliseconds. Pipecat's own records from
   the modules that quote the text being spoken (its text-to-speech service and its word
   sequencer, at warning level) are not written; each one at warning or above leaves a line of

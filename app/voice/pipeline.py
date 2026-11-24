@@ -32,7 +32,10 @@ caller speaking (once, the agent asks whether they are still there) or of MAX_CA
 that fails or a pipeline that ends without the call deciding to. The idle timer runs only while
 nothing is said and no turn runs. Before it ends, a closing call hears out a caller who is
 speaking (HEAR_OUT_SECONDS at most). Ending is `end` of the agent, then an EndWorkerFrame: the
-transport sends what is left, then closes.
+transport sends what is left, then closes. Before it closes the page is told the reason once,
+and for `error` a fixed hint: speech out written off (text-to-speech, the processor after the
+agent, reported it can no longer work; the check of why, app/voice/speech_check.py, is then
+started and not waited for), or any other error.
 
 Logs carry event names, the call id, line ids, counts and milliseconds; never text.
 """
@@ -40,7 +43,7 @@ Logs carry event names, the call id, line ids, counts and milliseconds; never te
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Protocol
@@ -51,6 +54,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     EndWorkerFrame,
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     InterruptionFrame,
@@ -81,7 +85,9 @@ from app.agent.turn import Line, Speak, TurnResult, start_call
 from app.audit.log import Reason
 from app.config import Settings
 from app.voice.speech import CallerGate, LineMark, Playback, PlayoutTracker, elevenlabs_tts
+from app.voice.speech_check import SpeechCheck
 from app.voice.transport import audio_transport, open_connection, server_ice_servers
+from app.voice.vocabulary import Vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,10 @@ END_GRACE_SECONDS = 30
 # How long a call that is closing waits, after its last line, for a caller who is speaking or
 # whose words are still being transcribed: they may be an emergency.
 HEAR_OUT_SECONDS = 5.0
+# What the page is told, with the reason, of a call that ended with `error`: speech out written
+# off, or anything else. Fixed text; nothing of a vendor's.
+SPEECH_REFUSED_HINT = "The speech service refused to speak. Check the voice id and the plan."
+ERROR_HINT = "The call ended because of an error."
 
 
 class Agent(Protocol):
@@ -119,12 +129,14 @@ class Agent(Protocol):
 StartCall = Callable[[], Awaitable[tuple[Agent, Line]]]
 
 
-def deepgram_stt(api_key: SecretStr) -> DeepgramSTTService:
+def deepgram_stt(api_key: SecretStr, keyterms: Sequence[str]) -> DeepgramSTTService:
     """Deepgram's streaming speech-to-text, its options chosen for digits and names:
     smart formatting writes numbers as numerals ("three three four four" becomes 3344) and
     dates as dates ("March 14, 1985"), which the input guard reads either way; numerals is
     left off, smart formatting covers it; a spelled name stays letters ("J O H N S O N").
-    The call opts out of Deepgram's model improvement programme. Audio stops here."""
+    `keyterms`, the clinic's own words (app/voice/vocabulary.py), go as Nova-3's keyterm
+    prompting, one `keyterm` query parameter each. The call opts out of Deepgram's model
+    improvement programme. Audio stops here."""
     return DeepgramSTTService(
         api_key=api_key.get_secret_value(),
         mip_opt_out=True,
@@ -135,6 +147,7 @@ def deepgram_stt(api_key: SecretStr) -> DeepgramSTTService:
             smart_format=True,
             numerals=False,
             punctuate=True,
+            keyterm=list(keyterms),
         ),
     )
 
@@ -170,6 +183,7 @@ class AgentProcessor(FrameProcessor):
         idle_seconds: float,
         max_seconds: float,
         vad_stop_seconds: float,
+        speech_refused: Callable[[], None],
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -180,6 +194,12 @@ class AgentProcessor(FrameProcessor):
         self._idle_seconds = idle_seconds
         self._max_seconds = max_seconds
         self._vad_stop_seconds = vad_stop_seconds
+        # Called, without waiting, when the call ends with `error` because speech out, the
+        # processor after this one, can no longer work: app/voice/speech_check.py.
+        self._speech_refused = speech_refused
+        self._speech_unusable = False
+        # Whether the page has been told how the call ended, or there is nobody left to tell.
+        self._told = False
         self._clock = clock
         self._sleep = sleep
         self._queue: asyncio.Queue[_Utterance | _Connected] = asyncio.Queue()
@@ -214,7 +234,8 @@ class AgentProcessor(FrameProcessor):
 
     async def hang_up(self) -> None:
         """The caller has gone: the call ends now, for the reason already decided if it was
-        ending, otherwise because the caller hung up."""
+        ending, otherwise because the caller hung up. The page has gone with them."""
+        self._told = True
         await self._end_now(Reason.CALLER_HUNG_UP)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -227,8 +248,20 @@ class AgentProcessor(FrameProcessor):
         if isinstance(frame, (EndFrame, CancelFrame)):
             # A pipeline that ends without the call having decided to is an error.
             await self._end_now(Reason.ERROR)
+            await self._tell_ended()
+            if self._closing is Reason.ERROR and self._speech_unusable:
+                self._speech_refused()
             await self.push_frame(frame, direction)
             return
+        if (
+            isinstance(frame, ErrorFrame)
+            and frame.processor is not None
+            and frame.processor is self.next
+            and not frame.processor.is_usable
+        ):
+            # Speech out reports that it can no longer work, on its way to the pipeline
+            # worker, which then ends the pipeline.
+            self._speech_unusable = True
         if isinstance(frame, VADUserStartedSpeakingFrame | VADUserStoppedSpeakingFrame) or (
             isinstance(frame, TranscriptionFrame | TranscriptionFinalizedFrame)
         ):
@@ -534,7 +567,7 @@ class AgentProcessor(FrameProcessor):
         await self._playback.all_over()
         await self._heard_out()
         await self._finish(reason)
-        await self._send({"type": "ended", "reason": reason.value})
+        await self._tell_ended()
         await self.push_frame(EndWorkerFrame(), FrameDirection.UPSTREAM)
 
     def _caller_pending(self) -> bool:
@@ -576,6 +609,17 @@ class AgentProcessor(FrameProcessor):
             logger.error("call_end_failed call_id=%s error=%s", self._call_id, type(error).__name__)
             return
         logger.info("call_life_ended call_id=%s reason=%s", self._call_id, reason.value)
+
+    async def _tell_ended(self) -> None:
+        """The page's last message, once, before the transport closes: why the call ended,
+        and for `error` a fixed hint of its cause."""
+        if self._told or self._closing is None:
+            return
+        self._told = True
+        message = {"type": "ended", "reason": self._closing.value}
+        if self._closing is Reason.ERROR:
+            message["hint"] = SPEECH_REFUSED_HINT if self._speech_unusable else ERROR_HINT
+        await self._send(message)
 
     async def _send(self, message: dict[str, Any]) -> None:
         await self.push_frame(OutputTransportMessageUrgentFrame(message=message))
@@ -680,11 +724,13 @@ async def open_agent_call(
     settings: Settings,
     deps: Deps,
     model: Model | None,
+    vocabulary: Vocabulary,
+    speech_check: SpeechCheck,
     call_id: str,
     sdp: str,
     sdp_type: str,
     connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
-    speech_to_text: Callable[[SecretStr], FrameProcessor] = deepgram_stt,
+    speech_to_text: Callable[[SecretStr, Sequence[str]], FrameProcessor] = deepgram_stt,
     text_to_speech: Callable[[Settings], FrameProcessor] = elevenlabs_tts,
 ) -> AgentCall:
     if (
@@ -694,7 +740,7 @@ async def open_agent_call(
         or settings.elevenlabs_voice_id is None
     ):
         raise VendorsNotConfiguredError("a call needs every vendor's settings")
-    stt = speech_to_text(settings.deepgram_api_key)
+    stt = speech_to_text(settings.deepgram_api_key, vocabulary.terms)
     tts = text_to_speech(settings)
     # Loading the VAD's model reads a file; off the event loop, so other calls' audio flows.
     vad = await asyncio.to_thread(
@@ -716,6 +762,7 @@ async def open_agent_call(
         idle_seconds=settings.idle_seconds,
         max_seconds=settings.max_call_seconds,
         vad_stop_seconds=settings.vad_stop_seconds,
+        speech_refused=speech_check.start,
     )
     try:
         return AgentCall(call_id, connection, connect_timeout, agent, playback, vad, stt, tts)
