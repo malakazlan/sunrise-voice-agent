@@ -426,8 +426,14 @@ def test_the_ssn_step_lives_in_intake() -> None:
         True,
     )
 
-    # Every phase change ends the step: emergency, a new patient's booking, hand-off, the rest.
-    for target in (BOOKING, HANDOFF, EMERGENCY, CLOSING, ENDED):
+    # Never left for a new patient's booking, armed or awaiting the submit: the digits would
+    # then reach the model.
+    awaiting = apply(state, SsnStep(expecting_ssn4=False, ssn_turns=0, pending_ssn4=DIGITS))
+    for pending in (state, stepped, awaiting):
+        with pytest.raises(IllegalTransitionError, match="intake -> booking"):
+            move(pending, BOOKING)
+    # Every other phase change ends the step: emergency, hand-off, the rest.
+    for target in (HANDOFF, EMERGENCY, CLOSING, ENDED):
         after = move(stepped, target)
         assert (
             after.pending_claim,

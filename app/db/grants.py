@@ -4,26 +4,35 @@ app/db/roles.py applies exactly this at start-up, takes away anything else the r
 then compares what Postgres says the role can effectively do with it, refusing to start on any
 difference; tests/test_roles.py uses the same comparison. Every table, sequence and function in
 the schema has an entry, an empty set where the role may do nothing, so a new one stops the
-start until it is declared here.
+start until it is declared here. A column has an entry only where the role holds a privilege on
+it that its table does not give; any other column privilege stops the start.
 """
 
 from typing import Literal
 
-TablePrivilege = Literal["SELECT", "INSERT", "UPDATE"]
+TablePrivilege = Literal["SELECT", "INSERT"]
+ColumnPrivilege = Literal["UPDATE"]
 SequencePrivilege = Literal["USAGE"]
 
 SCHEMA = "public"
 
+# New patients and appointments are added, never changed: no table is updated as a whole.
 TABLE_PRIVILEGES: dict[str, frozenset[TablePrivilege]] = {
-    "patients": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    "patients": frozenset({"SELECT", "INSERT"}),
     "medications": frozenset({"SELECT"}),
-    "appointments": frozenset({"SELECT", "INSERT", "UPDATE"}),
-    "available_slots": frozenset({"SELECT", "UPDATE"}),
+    "appointments": frozenset({"SELECT", "INSERT"}),
+    "available_slots": frozenset({"SELECT"}),
     "audit_events": frozenset({"SELECT", "INSERT"}),
     "verification_attempts": frozenset({"SELECT", "INSERT"}),
     "requests": frozenset({"SELECT", "INSERT"}),
     "messages": frozenset({"SELECT", "INSERT"}),
     "alembic_version": frozenset(),
+}
+
+# Privileges on single columns, by table and column, beyond their table's: a booking takes a
+# slot by changing whether it is available, and nothing else about it.
+COLUMN_PRIVILEGES: dict[tuple[str, str], frozenset[ColumnPrivilege]] = {
+    ("available_slots", "is_available"): frozenset({"UPDATE"}),
 }
 
 # Only the sequences the inserts above draw numbers from: appointment, verification attempt,

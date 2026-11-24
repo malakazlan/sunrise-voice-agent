@@ -1,8 +1,14 @@
 from datetime import UTC, date, datetime, timedelta, tzinfo
+from typing import get_args
 
 import pytest
 
-from app.domain.clinic import clinic_date
+from app.domain.clinic import DOCTORS, Doctor, clinic_date
+
+
+def test_the_doctor_list_is_one_list() -> None:
+    # What a tool argument may name is what the database allows.
+    assert get_args(Doctor) == DOCTORS == ("Dr. Patel", "Dr. Lee")
 
 
 def test_clinic_date_is_the_new_york_calendar_date() -> None:

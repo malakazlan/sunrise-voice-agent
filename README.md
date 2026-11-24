@@ -76,8 +76,8 @@ All data used by this project is synthetic. No real customer or personal data is
     for the app and the start-up steps alike.
   - An event holds only registry codes (action, resource type, outcome, reason) and
     identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
-    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
-    slot id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
+    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication,
+    slot, request, message or audit event id is its row number (up to 8 digits), a tool id is its registered name (2 to 40
     lower-case letters and underscores), and the actor is `agent` or `admin:` and a
     user name of letters and underscores. The database's own CHECKs are the outer bound: at
     most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
@@ -143,9 +143,10 @@ All data used by this project is synthetic. No real customer or personal data is
     and only that goes into the `ALTER ROLE` statement, which is sent straight through the
     driver, so no log line, SQLAlchemy event or error message contains it, at any log level.
     A verifier in any other form is refused before it is sent.
-  - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`,
-    `UPDATE` on `patients` and `appointments`; `SELECT` on `medications`; `SELECT`, `UPDATE`
-    on `available_slots`; `SELECT`, `INSERT` on `audit_events`, `requests` and `messages`;
+  - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`
+    on `patients` and `appointments` (never `UPDATE`); `SELECT` on `medications`; `SELECT` on
+    `available_slots` and `UPDATE` of its one column `is_available`; `SELECT`, `INSERT` on
+    `audit_events`, `verification_attempts`, `requests` and `messages`;
     nothing on `alembic_version`; `USAGE` on the appointment, request and message id
     sequences only; no `EXECUTE` on the trigger functions (a
     trigger runs its function whoever may call it) or on the functions that create large
@@ -199,7 +200,8 @@ All data used by this project is synthetic. No real customer or personal data is
     - The role can end its own sessions (`pg_terminate_backend` on a backend of the same role).
     - A rotated password does not end sessions opened with the old one.
     - A hostile session of the runtime role can make start-up fail, by holding the role
-      set-up's advisory lock or a lock on a table it may write, until that session ends.
+      set-up's advisory lock, a lock on a table it may write, or an uncommitted row the seed
+      also inserts (a patient with a seed id), until that session ends.
       Restarting the database ends it.
     - Use a dedicated database server. Do not point `POSTGRES_*` at a server that hosts other
       applications: set-up takes `PUBLIC`'s privileges away on every other database on that
@@ -437,9 +439,13 @@ model. Code decides; the model only relays the name and the date.
   again (`ssn_too_long`); the third armed turn without four submits what there is.
   **Redaction**, always: digits after an SSN cue, SSN-shaped numbers, and any run of digits
   or number words that reads as exactly nine digits, whatever its grouping (spaces, hyphens,
-  dots, the word "dash"). In `greeting` and `intake`, before verification, every other digit
-  and number word is hidden too, except inside a date the mask module recognises, a year from
-  1900 to 2099 (numerals or words) or a run of ten or eleven digits (a callback number). Once
+  dots, the word "dash"). Before verification, in every phase but a new patient's `booking`,
+  every other digit and number word is hidden too, except inside a date the mask module
+  recognises, a year from 1900 to 2099 (numerals or words) or a run of ten or eleven digits (a
+  callback number); in `booking` a new patient gives times and member numbers, and only SSNs
+  are hidden. While a claim is pending (the step armed, or its digits awaiting the submit) and
+  once verification is locked, the call cannot move to `booking`, and `start_new_patient` is
+  not offered: the step cannot be left for the phase where numbers pass. Once
   verified, any group that reads as the caller's own last four is hidden; a phone number that
   ends in those digits is not. **Flags**: an attempt to override the instructions, and a
   request about someone else; the text still passes. The decision carries the state change as
@@ -451,7 +457,8 @@ model. Code decides; the model only relays the name and the date.
   (`spoken_digits`, `says_a_number`). A repo scan refuses SSN patterns or lists of digit words
   anywhere else under `app/`; it is a lint, like the others.
 - `verify_identity(full_name, dob)`: the model calls it in `intake` with the office open.
-  The date must be an ISO date (`YYYY-MM-DD`) not after the clinic's date, and the name must
+  The date must be an ISO date (`YYYY-MM-DD`) from 1900-01-01 to the clinic's date, and the
+  name must
   be a name; otherwise the arguments are refused and nothing is counted. It stores the claim,
   arms the SSN step and returns `ssn_ask`. If the call is locked, or the claimed identity has
   five failures within the last hour across calls, it returns `verify_locked`, arms nothing
@@ -546,6 +553,134 @@ name, message text, balance or status reaches the audit log or the logs.
     four five six seven eight nine`) is not masked.
   - A message id is a row number, so it tells roughly how many messages the clinic has.
 
+### Booking
+
+Five tools in `app/agent/booking.py`, registered by `register_tools()`, book an appointment
+for a verified patient and for a first-time caller. All need the office open.
+
+- `start_new_patient` (intake, nobody verified, no identity claim pending, verification not
+  locked): the call moves to `booking` as a new patient's call, which can never be verified
+  and never reaches a patient-data tool. A locked call is offered staff, not a booking.
+- `collect_new_patient` (booking, a new patient's call): `full_name` (a first and a last name,
+  no digit of any script), `dob` (ISO, from 1900-01-01, not in the future; the same bounds as
+  `verify_identity`), `phone` (ten digits once spaces, dots, dashes and brackets are removed;
+  stored as `555-410-2233`), `email` (one `@`, a dot in the domain, at most 254 characters,
+  letters, digits and `. _ % + -`), either `insurance_provider` and `member_id` or
+  `self_pay: true`, and `reason_short` (1 to 120 characters, SSNs masked). No text may hold a
+  Unicode control or format character (bidi overrides, zero-width characters), a line or
+  paragraph separator, or a private-use or unassigned one; the doctor-message text follows the
+  same rule. Nothing else is accepted. The details are kept in the call's state only, hidden
+  from its text form, its dumps, logs and errors; a second call replaces them and forgets the
+  slots offered. The answer is the email spelled letter by letter for reading back.
+- `find_slots(doctor?, preferred_days?, preferred_time_of_day?)` (serving or booking, a
+  verified patient or a new patient with details): at most three open slots after the moment of
+  the question, earliest first, as `{slot_id, doctor, date, time}` in clinic time. The doctor is
+  one of the clinic's; days are day names; morning is before noon. The state remembers every
+  slot it offered in the call.
+- `book_appointment(slot_id, reason_short, confirmed)` (serving, the verified patient) and
+  `book_new_patient(slot_id, confirmed)` (booking, a new patient with details): only a slot
+  offered in this call. A slot not offered, taken, or begun: `slot_taken`, the same answer
+  whatever the reason. Without `confirmed: true`: `needs_confirmation` with the doctor, date
+  and time. Confirmed, in one transaction: the slot is taken by a single `UPDATE` that changes
+  it only while it is still open and in the future, so of two callers only one gets it; then
+  the new patient's record (`NP-` and a random UUID, `is_new`, no SSN, labs `None on file`,
+  balance 0), the appointment and a `requests` row of type `booking`, and the audit event. A
+  failure at any point leaves the slot open and nothing written. The slot row is kept, marked
+  unavailable. `book_new_patient` then moves the call to `closing` and answers with the
+  `booking_instructions` line; a verified patient may book more than one slot, and asking
+  again for one this call booked gives the same `booked` answer and writes nothing.
+- A new patient whose name key and date of birth match an existing record still gets a new
+  record, flagged `possible_duplicate` for staff. The caller is told exactly the same.
+- Audit actions: `new_patient_started`, `new_patient_details_collected`, `slots_offered`,
+  `appointment_booked` (resource: the patient), `new_patient_booked` (resource: the
+  appointment), `booking_previewed`, `booking_repeated` (a verified caller asking again for a
+  slot this call booked: nothing written), and `slot_taken` (outcome `refused`).
+- The runtime role may insert patients and appointments but not change or delete them, and may
+  change only `is_available` on a slot.
+- Limits:
+  - No email is sent. The request's summary tells staff to `confirm by email` when an email is
+    on file or was given, `confirm by phone` otherwise. The `booking_instructions` line still
+    says a confirmation will come by email, as the task's text has it.
+  - The last word of the name is stored as the last name, the rest as the first name; a
+    suffix (`Jr`) becomes the last name.
+  - A name that is a single word cannot be collected.
+  - A member id is letters, digits, spaces and dashes. In booking the input guard masks only
+    SSN-shaped numbers, so a member id that reads as nine digits reaches the model masked and
+    is refused; the caller needs staff for it.
+  - A verified caller moved to `booking` may look for slots there but books from `serving`;
+    moving between them forgets the slots offered.
+  - A new patient books once per call: after booking, a repeat is refused, not answered. This
+    relies on a call's turns being handled one at a time, which they are (the turn loop is
+    serial per call); two bookings dispatched at once for one new-patient call are not
+    supported.
+  - The `slot_taken` answers do not differ in content, but their paths differ in time by a few
+    milliseconds (a slot never offered is refused before any database read).
+  - Slot times are rendered without the year to the caller; the staff summary carries it.
+
+### Admin API
+
+A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages
+and audit log can be read and the chain checked without opening the database. It is off
+unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
+answer `404` and the app logs `admin_api_off` once at start.
+
+| Route (all `GET`) | Returns |
+|---|---|
+| `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
+| `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
+| `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
+| `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
+
+```sh
+curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?limit=20'
+```
+
+- Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`. The user name and the password
+  are each compared as a SHA-256 digest in constant time, both always. Anything else (no
+  header, a wrong part, a malformed or non-UTF-8 header, an `Authorization` header over 1024
+  characters) gets the same `401` and `WWW-Authenticate` challenge, and is logged as
+  `admin_sign_in_failed failures=<n>`, never the name or password tried.
+- Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): after five
+  inside a sliding minute the address gets `429`, before its credentials are looked at, until
+  the oldest of them is a minute old. A correct sign-in is not counted. Failed sign-ins are
+  not audited, so a stranger cannot make the audit chain grow.
+- Paging: newest first; `limit` 1 to 100 (default 50); `before=<id or seq>` for the next page,
+  the last id or seq of the page before. An unknown or repeated parameter, a value out of range
+  or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
+  route takes no parameters.
+- One verification runs at a time: another asked for meanwhile gets `429` with `Retry-After: 5`,
+  does no work and writes no event. It reads the whole chain, 1000 events a round trip, on the
+  one worker that also carries the calls, so on a large chain it costs that worker and the
+  database real time; run it when it is needed, not on a timer.
+- Every successful read appends one audit event (actor `admin:<ADMIN_USER>`, action
+  `admin_read_requests`, `admin_read_messages`, `admin_read_audit` or `admin_verify_audit`,
+  resource type `request`, `message` or `audit_event`, no resource id, outcome `success`) in
+  the transaction that read the rows. If the event cannot be written the answer is `503` and
+  no rows. A database that cannot be reached is `503` too, with no detail.
+- Every text value from the database passes the log masking (`mask`): SSNs, dates and email
+  addresses in a summary or body are hidden. Patient ids and call ids come out as stored.
+  Timestamps are ISO 8601.
+- A callback number shows as `***-***-` and its last four digits, whatever its shape
+  (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
+  `***-***-****`.
+- Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
+  in the API schema, and `/docs` stays off outside dev.
+- The runtime role needs no new privilege: it already reads these tables and appends events.
+- Limits:
+  - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
+    sign-in limit is shared by everyone. Refused requests are not counted, so each failure
+    ages out after a minute and is replaced by the next: one wrong password every 12 seconds,
+    from anyone, keeps the admin locked out for as long as it goes on. A sustained lockout
+    costs an attacker five requests a minute. It delays the admin; it is not a way in, and the
+    password's strength is the real control. Trusting the proxy's forwarded address is left to
+    the deploy set-up. The limit is held in memory, so a restart clears it, and it keeps at
+    most 10,000 addresses, dropping the one that failed longest ago.
+  - A real console would reveal a callback number only on an explicit, audited action; this
+    API never reveals one, it shows the masked form with the last four digits.
+  - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
+    number written another way (spelled out without a cue, for example) is shown as written.
+  - A read event records which list was read, not which rows.
+
 ### Output guard
 
 Every sentence of the model's own answer is checked in code before it is returned
@@ -620,6 +755,8 @@ Limits of the output guard:
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
+| `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
+| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off) |
 | `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
 | `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
 | `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
@@ -638,7 +775,7 @@ when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
-`DEEPGRAM_API_KEY`) must also not start or end with whitespace and must
+`DEEPGRAM_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
 of environment, so it applies the rule in dev as well.
@@ -651,6 +788,12 @@ log fail verification.
 `IDENTITY_HASH_KEY` follows the same rules as `AUDIT_HMAC_KEY` (its own placeholder). It keys
 the hashes under which failed identity checks are counted across calls; choose one different
 from the audit key. Changing it starts every count again.
+
+`ADMIN_PASSWORD`, when set, needs `ADMIN_USER`, in every environment, and unless `APP_ENV=dev`
+at least 16 characters. In every environment it must differ from every other secret of the
+application's settings: every secret field of `Settings`, found from the class, so a secret
+added later is covered too. A clash is reported by field name only. The owner's
+`POSTGRES_PASSWORD` never reaches the app, so it cannot be compared there: choose another.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -696,7 +839,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL` |
+| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the

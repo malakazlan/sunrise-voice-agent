@@ -14,15 +14,16 @@ written or already there.
 handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
-import re
+import unicodedata
 from datetime import datetime
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.state import CallState, Phase
+from app.agent.state import Caller, CallState, Phase
 from app.agent.tool_registry import Handler, HandlerContext, NoArguments, Tool, ToolResult
 from app.audit.log import Action, Outcome, ResourceType
 from app.db.models import (
@@ -48,10 +49,14 @@ REQUESTED = "requested"
 SENT_TO_DOCTOR = "sent_to_doctor"
 SENT = "sent"
 
-# C0 control characters, NUL included, and DEL: never in a stored message.
-CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+# Unicode categories never in text a caller gives to be stored: controls (C0 with NUL, DEL,
+# C1), format characters (bidi overrides, zero-width characters, soft hyphens), surrogates,
+# private use, unassigned code points, and line and paragraph separators.
+HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
-DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+Weekday = Literal["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+# The day names, Monday first, as datetime.weekday() counts them.
+DAYS: tuple[Weekday, ...] = get_args(Weekday)
 MONTHS = (
     "January",
     "February",
@@ -84,38 +89,63 @@ class MessageArguments(BaseModel):
     @field_validator("summary_short", mode="before")
     @classmethod
     def _trimmed(cls, value: object) -> object:
-        """Trimmed before the length bounds apply; anything but text is left to be refused."""
-        return value.strip() if isinstance(value, str) else value
+        return trimmed(value)
 
     @field_validator("summary_short")
     @classmethod
     def _as_stored(cls, value: str) -> str:
-        """The text as it is read back and stored: trimmed, SSNs masked, still in bounds."""
-        if CONTROL_CHARACTER.search(value):
-            raise ValueError("summary_short must not contain control characters")
-        stored = mask_ssns(value)
-        if not 1 <= len(stored) <= MAX_MESSAGE_BODY:
-            raise ValueError(f"summary_short must be 1 to {MAX_MESSAGE_BODY} characters")
-        return stored
+        return stored_text(value, MAX_MESSAGE_BODY)
 
 
-def _patient_id(state: CallState) -> str:
-    """The verified caller's patient id. The gate allows these tools only with one; a state
-    without one stops the call."""
+def trimmed(value: object) -> object:
+    """Text trimmed before its length bounds apply; anything but text is left to be refused."""
+    return value.strip() if isinstance(value, str) else value
+
+
+def plain_text(value: str, *, digits: bool) -> str:
+    """The text, unless it holds a character of HIDDEN_CATEGORIES or, where `digits` is false,
+    a digit of any script."""
+    for char in value:
+        if unicodedata.category(char) in HIDDEN_CATEGORIES:
+            raise ValueError("the text must not contain control or format characters")
+        if not digits and char.isdigit():
+            raise ValueError("the text must not contain digits")
+    return value
+
+
+def stored_text(value: str, longest: int) -> str:
+    """A caller's short text as it is read back and stored: plain text (digits allowed), SSNs
+    masked, and 1 to `longest` characters once masked."""
+    stored = mask_ssns(plain_text(value, digits=True))
+    if not 1 <= len(stored) <= longest:
+        raise ValueError(f"the text must be 1 to {longest} characters")
+    return stored
+
+
+def verified_patient_id(state: CallState) -> str:
+    """The verified caller's patient id. The gate allows a patient's tools only with one; a
+    state without one stops the call."""
     if state.patient_id is None:
         raise PermissionError("no verified patient")
     return state.patient_id
 
 
+def spoken_date(starts_at: datetime) -> str:
+    """For example `Thursday, December 3`, in clinic time."""
+    local = starts_at.astimezone(CLINIC_TZ)
+    return f"{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}"
+
+
+def spoken_time(starts_at: datetime) -> str:
+    """For example `10:30 AM`, in clinic time."""
+    local = starts_at.astimezone(CLINIC_TZ)
+    noon = "AM" if local.hour < 12 else "PM"
+    return f"{local.hour % 12 or 12}:{local.minute:02d} {noon}"
+
+
 def _spoken(starts_at: datetime, doctor: str) -> str:
     """For example `Thursday, December 3 at 10:30 AM with Dr. Patel`, in clinic time."""
-    local = starts_at.astimezone(CLINIC_TZ)
-    hour = local.hour % 12 or 12
-    noon = "AM" if local.hour < 12 else "PM"
-    return (
-        f"{DAYS[local.weekday()]}, {MONTHS[local.month - 1]} {local.day}"
-        f" at {hour}:{local.minute:02d} {noon} with {doctor}"
-    )
+    return f"{spoken_date(starts_at)} at {spoken_time(starts_at)} with {doctor}"
 
 
 async def get_next_appointment(
@@ -125,7 +155,7 @@ async def get_next_appointment(
         await session.execute(
             select(Appointment.starts_at, Appointment.doctor)
             .where(
-                Appointment.patient_id == _patient_id(state),
+                Appointment.patient_id == verified_patient_id(state),
                 Appointment.status == SCHEDULED,
                 Appointment.starts_at >= context.now,
             )
@@ -142,7 +172,7 @@ async def get_lab_status(
 ) -> ToolResult:
     status = (
         await session.execute(
-            select(Patient.lab_results_status).where(Patient.id == _patient_id(state))
+            select(Patient.lab_results_status).where(Patient.id == verified_patient_id(state))
         )
     ).scalar_one()
     return ToolResult(data={"lab_status": status})
@@ -152,7 +182,9 @@ async def get_balance(
     session: AsyncSession, state: CallState, arguments: NoArguments, context: HandlerContext
 ) -> ToolResult:
     balance = (
-        await session.execute(select(Patient.balance_due).where(Patient.id == _patient_id(state)))
+        await session.execute(
+            select(Patient.balance_due).where(Patient.id == verified_patient_id(state))
+        )
     ).scalar_one()
     return ToolResult(data={"balance": f"{balance:.2f}"})
 
@@ -165,7 +197,7 @@ async def _record_request(
         insert(Request)
         .values(
             call_id=state.call_id,
-            patient_id=_patient_id(state),
+            patient_id=verified_patient_id(state),
             type=request_type,
             summary=summary,
         )
@@ -179,7 +211,7 @@ async def request_refill(
     medications = (
         await session.execute(
             select(Medication.name, Medication.refills_remaining, Medication.pharmacy).where(
-                Medication.patient_id == _patient_id(state)
+                Medication.patient_id == verified_patient_id(state)
             )
         )
     ).all()
@@ -210,7 +242,7 @@ async def send_message_to_doctor(
             audit_action=Action.DOCTOR_MESSAGE_PREVIEWED,
         )
 
-    patient_id = _patient_id(state)
+    patient_id = verified_patient_id(state)
     message_id = await session.scalar(
         insert(Message)
         .values(call_id=state.call_id, patient_id=patient_id, kind=DOCTOR_MESSAGE, body=body)
@@ -252,7 +284,8 @@ def _serving_tool(
         office_open_only=True,
         writes=writes,
         may_verify=False,
-        takes_identity_claim=False,
+        takes_date_of_birth=None,
+        callers=frozenset({Caller.PATIENT}),
         audit_action=action,
         outcome_actions={} if outcome_actions is None else outcome_actions,
         resource_type=ResourceType.PATIENT,

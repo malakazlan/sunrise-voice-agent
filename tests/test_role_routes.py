@@ -265,7 +265,7 @@ SURPLUS = [
     (
         "GRANT UPDATE (outcome) ON audit_events TO {helper} WITH GRANT OPTION",
         "GRANT UPDATE (outcome) ON audit_events TO {role}",
-        "table audit_events: UPDATE not declared;"
+        "column audit_events.outcome: not declared;"
         " table column public.audit_events.outcome: UPDATE granted to the runtime role",
     ),
     (

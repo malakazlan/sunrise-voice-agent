@@ -47,6 +47,12 @@ LINES = [
         True,
     ),
     (
+        "booking_instructions",
+        "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
+        " receive a confirmation by email.",
+        True,
+    ),
+    (
         "advice_refusal",
         "I'm not able to give medical advice. I can send a message to your doctor instead.",
         True,

@@ -225,6 +225,38 @@ def test_downgrade_removes_the_tables(
     assert definitions(empty_database, FUNCTION_DEFINITIONS) == set()
 
 
+REQUEST_TYPE = text(
+    "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_requests_type'"
+)
+
+
+def request_type_rule(settings: StartupSettings) -> str:
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
+    try:
+        with engine.connect() as connection:
+            return str(connection.execute(REQUEST_TYPE).scalar_one())
+    finally:
+        engine.dispose()
+
+
+def test_booking_requests_step_down_and_up(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
+    with_booking = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text])))"
+    )
+    without = "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text])))"
+    assert run_alembic(empty_database, "upgrade", "9a4f2c71d0e8").returncode == 0
+    assert request_type_rule(empty_database) == with_booking
+
+    step_down = run_alembic(empty_database, "downgrade", "-1")
+
+    assert step_down.returncode == 0, step_down.stderr
+    assert request_type_rule(empty_database) == without
+    assert run_alembic(empty_database, "upgrade", "9a4f2c71d0e8").returncode == 0
+    assert request_type_rule(empty_database) == with_booking
+
+
 def test_migration_without_database_settings_names_them(tmp_path: Path) -> None:
     env = {key: value for key, value in os.environ.items() if not key.startswith("POSTGRES_")}
     env["APP_ENV"] = "dev"

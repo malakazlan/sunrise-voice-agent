@@ -50,16 +50,18 @@ Module = Callable[..., subprocess.CompletedProcess[str]]
 # The spec's privilege table, written out here by hand. The declaration must say exactly this,
 # so widening it is caught here as well as by the catalog comparison.
 EXPECTED_TABLES = {
-    "patients": {"SELECT", "INSERT", "UPDATE"},
+    "patients": {"SELECT", "INSERT"},
     "medications": {"SELECT"},
-    "appointments": {"SELECT", "INSERT", "UPDATE"},
-    "available_slots": {"SELECT", "UPDATE"},
+    "appointments": {"SELECT", "INSERT"},
+    "available_slots": {"SELECT"},
     "audit_events": {"SELECT", "INSERT"},
     "verification_attempts": {"SELECT", "INSERT"},
     "requests": {"SELECT", "INSERT"},
     "messages": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
+# Beyond its table's privileges, a column's own: booking takes a slot by changing this one.
+EXPECTED_COLUMNS = {("available_slots", "is_available"): {"UPDATE"}}
 # Only the appointments, verification attempts, requests and messages inserts take a number
 # from a sequence; patients have text ids and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
@@ -120,7 +122,7 @@ DATABASES = text(
     " LEFT JOIN LATERAL aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) x ON true"
 )
 COLUMN_GRANTS = text(
-    "SELECT c.relname, a.attname, x.privilege_type FROM pg_attribute a"
+    "SELECT c.relname, a.attname, x.grantee, x.privilege_type FROM pg_attribute a"
     " JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace"
     " CROSS JOIN LATERAL aclexplode(a.attacl) x"
     " WHERE x.grantee IN (0, :role)"
@@ -161,13 +163,15 @@ CALL = "0123456789ab4def8123456789abcdef"
 
 @dataclass(frozen=True, kw_only=True)
 class Privileges:
-    """What a role may do, per kind of object, keyed by name; `database` is this database."""
+    """What a role may do, per kind of object, keyed by name; `database` is this database, and
+    `columns` holds only the columns with privileges of their own, keyed by table and column."""
 
     tables: dict[str, set[str]]
     sequences: dict[str, set[str]]
     functions: dict[str, set[str]]
     schemas: dict[str, set[str]]
     database: set[str]
+    columns: dict[tuple[str, str], set[str]]
 
 
 def declared() -> Privileges:
@@ -177,6 +181,7 @@ def declared() -> Privileges:
         functions={name: set(held) for name, held in grants.FUNCTION_PRIVILEGES.items()},
         schemas={grants.SCHEMA: set(grants.SCHEMA_PRIVILEGES)},
         database=set(grants.DATABASE_PRIVILEGES),
+        columns={name: set(held) for name, held in grants.COLUMN_PRIVILEGES.items()},
     )
 
 
@@ -189,12 +194,15 @@ class Catalog:
     granted: Privileges
     public: Privileges
     public_elsewhere: dict[str, set[str]]
-    column_grants: list[tuple[str, str, str]]
 
 
 def catalog(engine: Engine, role: str) -> Catalog:
-    granted = Privileges(tables={}, sequences={}, functions={}, schemas={}, database=set())
-    public = Privileges(tables={}, sequences={}, functions={}, schemas={}, database=set())
+    granted = Privileges(
+        tables={}, sequences={}, functions={}, schemas={}, database=set(), columns={}
+    )
+    public = Privileges(
+        tables={}, sequences={}, functions={}, schemas={}, database=set(), columns={}
+    )
     public_elsewhere: dict[str, set[str]] = {}
     with engine.connect() as connection:
         role_oid = connection.execute(ROLE_OID, {"name": role}).scalar_one()
@@ -232,18 +240,12 @@ def catalog(engine: Engine, role: str) -> Catalog:
                 public_elsewhere.setdefault(name, set())
                 if grantee == 0:
                     public_elsewhere[name].add(held)
-        column_grants = [
-            (table, column, privilege)
-            for table, column, privilege in connection.execute(
-                COLUMN_GRANTS, {"role": role_oid}
-            ).all()
-        ]
-    return Catalog(
-        granted=granted,
-        public=public,
-        public_elsewhere=public_elsewhere,
-        column_grants=column_grants,
-    )
+        for table, column, grantee, held in connection.execute(
+            COLUMN_GRANTS, {"role": role_oid}
+        ).all():
+            holder = granted if grantee == role_oid else public
+            holder.columns.setdefault((table, column), set()).add(held)
+    return Catalog(granted=granted, public=public, public_elsewhere=public_elsewhere)
 
 
 def assert_privileges_match_the_declaration(engine: Engine, role: str) -> None:
@@ -260,10 +262,10 @@ def assert_privileges_match_the_declaration(engine: Engine, role: str) -> None:
         functions={name: set() for name in expected.functions},
         schemas={grants.SCHEMA: {"USAGE"}},
         database={"CONNECT"},
+        columns={},
     )
     assert found.public_elsewhere, "the server has other databases"
     assert found.public_elsewhere == {name: set() for name in found.public_elsewhere}
-    assert found.column_grants == []
     # And what the role can effectively do, by the comparison role set-up itself uses.
     with engine.connect() as connection:
         assert runtime_role_differences(connection, role) == []
@@ -458,6 +460,11 @@ async def test_runtime_role_is_refused_what_is_not_declared(runtime: AsyncEngine
                 if not refused_by_privileges(error):
                     allowed[table].add(privilege)
     assert allowed == EXPECTED_TABLES
+    # A column with an UPDATE of its own: allowed for that column, while the table refuses the
+    # others (the loop above).
+    for table, column in EXPECTED_COLUMNS:
+        statement = f"UPDATE {table} SET {column} = {column} WHERE false"  # noqa: S608
+        assert await attempt(runtime, statement) is None
 
     sequences: dict[str, set[str]] = {}
     for sequence in EXPECTED_SEQUENCES:
@@ -480,6 +487,7 @@ def test_privileges_match_the_declaration(database: StartupSettings, owner_engin
         functions=EXPECTED_FUNCTIONS,
         schemas=EXPECTED_SCHEMAS,
         database=EXPECTED_DATABASE,
+        columns=EXPECTED_COLUMNS,
     )
     assert set(grants.TABLE_PRIVILEGES) == {*Base.metadata.tables, "alembic_version"}
 
@@ -725,6 +733,8 @@ async def test_undeclared_privilege_is_revoked(
             f"GRANT UPDATE ON medications TO {role}",
             f"GRANT SELECT ON patients TO {role} WITH GRANT OPTION",
             f"GRANT INSERT (pharmacy) ON medications TO {role}",
+            f"GRANT UPDATE (starts_at) ON available_slots TO {role}",
+            f"GRANT UPDATE ON appointments TO {role}",
             f"GRANT SELECT, UPDATE ON alembic_version TO {role}",
             f"GRANT ALL ON SEQUENCE medications_id_seq TO {role}",
             f"GRANT SELECT, UPDATE ON SEQUENCE appointments_id_seq TO {role}",

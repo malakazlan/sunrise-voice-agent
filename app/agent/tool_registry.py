@@ -13,6 +13,13 @@ A tool is callable by the model, or by code only. A dispatch without a grant is 
 Code calls a code-only tool with the `Grant` registered with that tool: an object the code
 holds, which nothing the model sends can be. Every gate rule applies to both.
 
+The gate offers a tool in its declared phases, to its declared callers (a verified patient, a
+new patient's call with or without the details, or nobody known yet), with the office open if
+it says so, and a patient-data tool only to the verified caller. No argument may name whose
+record a tool acts on, and none may be a date of birth, but for the one tool of each kind in
+DOB_RULES: the identity claim, and a new patient's details. Each kind has its fixed phase and
+callers, and is the only tool that may ask for its kind's transition.
+
 The handler's transaction is checked before its event is appended: its id is read before the
 handler runs and again after (`pg_current_xact_id`, unique for the life of the database
 cluster), so a handler that ended it, through SQLAlchemy or with SQL text, fails the call. A
@@ -32,10 +39,11 @@ import collections.abc
 import copy
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, get_args, get_origin
 
 from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, ValidationError
@@ -46,14 +54,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent.claims import ClaimKeys
 from app.agent.scripts import ScriptId
 from app.agent.state import (
+    Caller,
     CallState,
     EndClaim,
     FailedAttempt,
     IdentityClaim,
     Move,
+    NewPatientDetails,
     Phase,
+    SlotsOffered,
     Verify,
     apply,
+    caller_of,
     count_refusal,
     count_tool_error,
 )
@@ -86,12 +98,51 @@ OWNER_FIELDS = frozenset(
         "record_owner",
     }
 )
-# The one of them the tool that takes an identity claim may have, as its own top-level field:
-# the date of birth the caller claims. Code matches the claim; no record is looked up by it.
-CLAIM_FIELDS = frozenset({"dob"})
+# The one of them a tool declared to take a date of birth may have, as its own top-level field.
+DOB_FIELDS = frozenset({"dob"})
 
-# The actions dispatch, the call itself and the output guard's turn loop write; no tool may
-# declare one as its own.
+
+class DobKind(StrEnum):
+    """Why a tool may take a date of birth. Each kind is declared by one tool at most."""
+
+    # The date of birth the caller claims, with their name: code matches the claim, and no
+    # record is looked up by it.
+    IDENTITY_CLAIM = "identity_claim"
+    # A first-time caller's own, for the record their booking creates.
+    NEW_PATIENT_DETAILS = "new_patient_details"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DobRule:
+    """Where a tool of a kind runs, for whom, and the one transition that kind of tool alone
+    may ask for (the details it took, for the state). Besides, such a tool is no patient-data
+    tool, runs only with the office open, is callable by the model and may not verify."""
+
+    description: str
+    phases: frozenset[Phase]
+    callers: frozenset[Caller]
+    transition: type[IdentityClaim] | type[NewPatientDetails]
+
+
+DOB_RULES: Mapping[DobKind, DobRule] = MappingProxyType(
+    {
+        DobKind.IDENTITY_CLAIM: DobRule(
+            description="an identity claim",
+            phases=frozenset({Phase.INTAKE}),
+            callers=frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED}),
+            transition=IdentityClaim,
+        ),
+        DobKind.NEW_PATIENT_DETAILS: DobRule(
+            description="a new patient's details",
+            phases=frozenset({Phase.BOOKING}),
+            callers=frozenset({Caller.NEW_PATIENT, Caller.NEW_PATIENT_WITH_DETAILS}),
+            transition=NewPatientDetails,
+        ),
+    }
+)
+
+# The actions dispatch, the call itself, the admin API and the output guard's turn loop write;
+# no tool may declare one as its own.
 RESERVED_ACTIONS = frozenset(
     {
         Action.TOOL_REFUSED,
@@ -99,6 +150,10 @@ RESERVED_ACTIONS = frozenset(
         Action.CALL_STARTED,
         Action.CALL_ENDED,
         Action.GUARD_BLOCK,
+        Action.ADMIN_READ_REQUESTS,
+        Action.ADMIN_READ_MESSAGES,
+        Action.ADMIN_READ_AUDIT,
+        Action.ADMIN_VERIFY_AUDIT,
     }
 )
 
@@ -125,7 +180,16 @@ class ToolResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     data: dict[str, Any] = {}
-    transition: Move | Verify | IdentityClaim | FailedAttempt | EndClaim | None = None
+    transition: (
+        Move
+        | Verify
+        | IdentityClaim
+        | FailedAttempt
+        | EndClaim
+        | NewPatientDetails
+        | SlotsOffered
+        | None
+    ) = None
     script: ScriptId | None = None
     audit_action: Action | None = None
     resource_id: str | None = None
@@ -170,8 +234,10 @@ class Tool(BaseModel):
     writes: bool
     # The one tool that may ask to verify the caller (a Verify transition).
     may_verify: bool
-    # The one tool that takes an identity claim (an IdentityClaim transition).
-    takes_identity_claim: bool
+    # For the one tool of each kind (DOB_RULES), the kind of date of birth it takes.
+    takes_date_of_birth: DobKind | None
+    # Who it is for (state.caller_of), whatever the phase.
+    callers: frozenset[Caller] = Field(min_length=1)
     # The action of the tool's events, with the outcome success, unless the handler names one
     # of outcome_actions, each with its fixed outcome.
     audit_action: Action
@@ -285,15 +351,15 @@ def _takes_anything(annotation: object) -> bool:
     return False
 
 
-def _check_arguments(arguments: type[BaseModel], *, claim: bool) -> None:
-    """The argument rules. For the tool that takes an identity claim, its own top-level fields
-    may be named as in CLAIM_FIELDS."""
+def _check_arguments(arguments: type[BaseModel], *, takes_dob: bool) -> None:
+    """The argument rules. For a tool declared to take a date of birth, its own top-level
+    fields may be named as in DOB_FIELDS."""
     for model in _models_in(arguments):
         if model.model_config.get("extra") != "forbid":
             raise DeclarationError(
                 "every argument model, nested ones too, must forbid extra fields"
             )
-        allowed = CLAIM_FIELDS if claim and model is arguments else frozenset()
+        allowed = DOB_FIELDS if takes_dob and model is arguments else frozenset()
         for name, field in model.model_fields.items():
             owners = sorted(
                 key
@@ -320,19 +386,25 @@ def check_declaration(tool: Tool) -> Tool:
     if declared.audit_action in declared.outcome_actions:
         raise DeclarationError("the default action is not listed again in outcome_actions")
 
-    if declared.takes_identity_claim and (
-        declared.phi
-        or declared.phases != {Phase.INTAKE}
-        or not declared.office_open_only
-        or not declared.model_callable
-        or declared.may_verify
-    ):
-        raise DeclarationError(
-            "a tool that takes an identity claim is not a phi tool, is in intake only with the"
-            " office open, is callable by the model and may not verify"
-        )
+    kind = declared.takes_date_of_birth
+    if kind is not None:
+        rule = DOB_RULES[kind]
+        if (
+            declared.phi
+            or declared.phases != rule.phases
+            or declared.callers != rule.callers
+            or not declared.office_open_only
+            or not declared.model_callable
+            or declared.may_verify
+        ):
+            raise DeclarationError(
+                f"a tool that takes {rule.description} is not a phi tool, is in"
+                f" {', '.join(sorted(rule.phases))} only, for"
+                f" {', '.join(sorted(rule.callers))} callers, with the office open, is callable"
+                " by the model and may not verify"
+            )
 
-    _check_arguments(declared.arguments, claim=declared.takes_identity_claim)
+    _check_arguments(declared.arguments, takes_dob=kind is not None)
 
     if declared.phi and not declared.phases <= PHI_PHASES:
         raise DeclarationError("a phi tool may list only the serving and booking phases")
@@ -366,6 +438,8 @@ def check_declaration(tool: Tool) -> Tool:
 def is_available(tool: Tool, state: CallState) -> bool:
     """The gate, for the model's calls and code's alike."""
     if state.phase in NO_TOOL_PHASES or state.phase not in tool.phases:
+        return False
+    if caller_of(state) not in tool.callers:
         return False
     if tool.office_open_only and not state.office_open:
         return False
@@ -467,10 +541,11 @@ class Registry:
             raise DeclarationError("a tool of that name is already registered")
         if declared.may_verify and any(item.may_verify for item in self._tools.values()):
             raise DeclarationError("only one tool may verify the caller")
-        if declared.takes_identity_claim and any(
-            item.takes_identity_claim for item in self._tools.values()
+        kind = declared.takes_date_of_birth
+        if kind is not None and any(
+            item.takes_date_of_birth is kind for item in self._tools.values()
         ):
-            raise DeclarationError("only one tool may take an identity claim")
+            raise DeclarationError(f"only one tool may take {DOB_RULES[kind].description}")
         self._schemas[declared.name] = declared.arguments.model_json_schema()
         self._tools[declared.name] = declared
         if grant is not None:
@@ -535,11 +610,12 @@ class Registry:
                         raise TypeError("a handler returns a ToolResult")
                     if isinstance(result.transition, Verify) and not tool.may_verify:
                         raise PermissionError("only the tool declared to verify may verify")
-                    if (
-                        isinstance(result.transition, IdentityClaim)
-                        and not tool.takes_identity_claim
-                    ):
-                        raise PermissionError("only the tool declared to take a claim may")
+                    for kind, rule in DOB_RULES.items():
+                        if (
+                            isinstance(result.transition, rule.transition)
+                            and tool.takes_date_of_birth is not kind
+                        ):
+                            raise PermissionError("only the tool declared to take it may")
                     action, outcome = _event(tool, result)
                     after = state if result.transition is None else apply(state, result.transition)
                     resource_id = _resource_id(tool, after, result)

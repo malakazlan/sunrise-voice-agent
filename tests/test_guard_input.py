@@ -187,10 +187,32 @@ def test_ssn_digits_never_pass() -> None:
     # A full SSN said in the greeting, before anything else.
     assert passed(start(), FULL_SSN) == "***-**-****"
 
-    # In greeting and intake, unverified: only dates, years and callback numbers.
-    for state in (start(), intake(), intake(office_open=False), start(office_open=False)):
+    # Unverified, in every phase but booking: only dates, years and callback numbers.
+    new_patient = move(intake(), Phase.BOOKING)
+    unverified = [
+        start(),
+        intake(),
+        intake(office_open=False),
+        start(office_open=False),
+        *[
+            move(intake(office_open), phase)
+            for office_open in (True, False)
+            for phase in (Phase.CLOSING, Phase.EMERGENCY, Phase.ENDED)
+        ],
+        move(intake(), Phase.HANDOFF),
+        move(start(), Phase.EMERGENCY),
+        *[move(new_patient, phase) for phase in (Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY)],
+    ]
+    assert {state.phase for state in unverified} == set(Phase) - {Phase.SERVING, Phase.BOOKING}
+    for state in unverified:
+        assert not state.verified
         for text, expected in REDACTED_UNVERIFIED:
             assert passed(state, text) == expected, (state.phase, text)
+    # A new patient booking gives times and member numbers: only SSNs are hidden there.
+    for state in (new_patient, move(intake(office_open=False), Phase.BOOKING)):
+        assert passed(state, "I have 2 questions") == "I have 2 questions"
+        assert passed(state, "member number AH 5521") == "member number AH 5521"
+        assert passed(state, f"my ssn is {LAST_FOUR}") == "my ssn is ****"
     # Verified: the caller's own last four, wherever it stands alone.
     for text, expected in REDACTED_VERIFIED:
         assert passed(verified_with_digits(), text) == expected, text

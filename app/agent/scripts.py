@@ -19,6 +19,7 @@ class ScriptId(StrEnum):
     VERIFY_LOCKED = "verify_locked"
     EMERGENCY = "emergency"
     FALLBACK = "fallback"
+    BOOKING_INSTRUCTIONS = "booking_instructions"
     ADVICE_REFUSAL = "advice_refusal"
     REFILL_SENT = "refill_sent"
 
@@ -73,6 +74,11 @@ SCRIPTS = MappingProxyType(
         # sentence the output guard blocks for SSN digits or patient data (app/guard/output.py).
         ScriptId.FALLBACK: Script(
             "I'm sorry, I can't help with that. I can take a message for our staff instead.",
+            interruptible=True,
+        ),
+        ScriptId.BOOKING_INSTRUCTIONS: Script(
+            "Please arrive 15 minutes early and bring a photo ID and your insurance card. You'll"
+            " receive a confirmation by email.",
             interruptible=True,
         ),
         # In place of a sentence the output guard blocks as medical advice.

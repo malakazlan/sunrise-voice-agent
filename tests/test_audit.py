@@ -1376,9 +1376,21 @@ def test_only_registry_members_are_accepted() -> None:
         "lab_status_read",
         "balance_read",
         "doctor_message_sent",
+        "admin_read_requests",
+        "admin_read_messages",
+        "admin_read_audit",
+        "admin_verify_audit",
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
+        "new_patient_started",
+        "new_patient_details_collected",
+        "slots_offered",
+        "appointment_booked",
+        "new_patient_booked",
+        "booking_previewed",
+        "slot_taken",
+        "booking_repeated",
         "guard_block",
     }
     assert {member.value for member in ResourceType} == {
@@ -1388,6 +1400,9 @@ def test_only_registry_members_are_accepted() -> None:
         "medication",
         "slot",
         "tool",
+        "request",
+        "message",
+        "audit_event",
     }
     assert {member.value for member in Outcome} == {"success", "failure", "refused"}
     assert {member.value for member in Reason} == {

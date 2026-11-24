@@ -158,6 +158,10 @@ jobs:
           docs=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
+          # No ADMIN_PASSWORD in the env file: the admin API is not mounted.
+          admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/admin/api/requests)
+          echo "GET /admin/api/requests -> $admin"
+          test "$admin" = "404"
           uid=$(bounded 30 "id -u in the app container" $compose exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"

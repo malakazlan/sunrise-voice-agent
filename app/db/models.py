@@ -38,7 +38,7 @@ NAMING_CONVENTION = {
 
 SLOT_SOURCES = ("task", "generated")
 SCHEDULED = "scheduled"
-REQUEST_TYPES = ("refill", "doctor_message")
+REQUEST_TYPES = ("refill", "doctor_message", "booking")
 MESSAGE_KINDS = ("doctor_message",)
 MAX_REQUEST_SUMMARY = 200
 MAX_MESSAGE_BODY = 120
