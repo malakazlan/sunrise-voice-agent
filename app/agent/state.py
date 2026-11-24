@@ -17,9 +17,10 @@ declaration; validation errors never show input.
 A new patient's call is the intake -> booking move: `is_new_patient` is set and the call can
 never be verified. The move is refused while an identity claim is pending and for a locked
 call, so the SSN step can never be left for a booking. Its details (`new_patient_details`, the
-draft) are stored by `collect`, in booking only, and are hidden like the SSN digits. `offer` remembers the slots a caller was
-offered (`offered_slots`): a verified caller in serving or booking, or a new patient with the
-details. Every phase change ends the draft and the offered slots.
+draft) are stored by `collect`, in booking only, and are hidden like the SSN digits. `offer`
+remembers the slots a caller was offered (`offered_slots`): a verified caller in serving or
+booking, or a new patient with the details. Every phase change ends the draft and the offered
+slots.
 
 These rules protect against the model and the caller. Code that deliberately bypasses
 validation (`model_construct`, `object.__setattr__`) can still forge a state.
