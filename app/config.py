@@ -168,8 +168,8 @@ class DatabaseSettings(_SettingsBase):
 
 
 class Settings(DatabaseSettings):
-    """The application's settings. They hold no part of the owner's identity: the application
-    process is started without the owner's variables (the Dockerfile's start command)."""
+    """The application's settings. They hold no part of the owner's identity, and the app
+    container is never given the owner's variables (deploy/docker-compose.yml)."""
 
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
@@ -322,17 +322,14 @@ _EVERY_SETTING = frozenset(Settings.model_fields) | frozenset(StartupSettings.mo
 
 
 def main() -> None:
-    """`python -m app.config`: check the start-up steps' and the application's settings from
-    the environment, before the container touches the database. Every error of both is
-    reported, by field name and a fixed message, never a value."""
-    failed = False
-    for settings_class in (StartupSettings, Settings):
-        try:
-            settings_class()
-        except ValidationError as error:
-            sys.stderr.write(f"{error}\n")
-            failed = True
-    if failed:
+    """`python -m app.config`: the start-up service's first step, which checks the start-up
+    steps' settings from the environment before anything touches the database. Every error is
+    reported, by field name and a fixed message, never a value. The application checks its own
+    settings when it starts."""
+    try:
+        StartupSettings()
+    except ValidationError as error:
+        sys.stderr.write(f"{error}\n")
         sys.exit(1)
 
 

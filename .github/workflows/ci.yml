@@ -170,6 +170,15 @@ jobs:
             psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
           echo "patients: $patients"
           test "$patients" = "5"
+          # The start-up service ran to completion, with 0, before the app was started.
+          startup=$($compose ps -a -q startup)
+          state=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")
+          echo "start-up service: $state"
+          test "$state" = "exited 0"
+          finished=$(docker inspect --format '{{.State.FinishedAt}}' "$startup")
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          echo "start-up finished $finished, app started $started"
+          test "$(date -d "$started" +%s%N)" -gt "$(date -d "$finished" +%s%N)"
       - name: The app connects as the runtime role the start-up set up
         run: |
           set -o pipefail
@@ -205,63 +214,67 @@ jobs:
           echo "DELETE as the runtime role -> exit $code: $refused"
           test "$code" = "1"
           echo "$refused" | grep -q 'permission denied for table audit_events'
-      - name: The application process holds the runtime identity and not the owner's
+      - name: Each service's configured environment is its settings class, exactly
         run: |
           set -o pipefail
           . .github/ci-wait.sh
           compose="docker compose --env-file .env -f deploy/docker-compose.yml"
-          # Inside the app container, as its non-root user, which uvicorn (PID 1) runs as too:
-          # the names in PID 1's environment, never the values. Then every value in it is tried
-          # as the owner's password and must be refused, while the owner's real password, from
-          # the container's configuration that this exec sees, must work: the attempt is real.
-          bounded 120 "the application process check" $compose exec -T app python -c '
-          import os
-          import subprocess
-          import psycopg
+          # What Docker gives every process it starts in each container, HEALTHCHECK included:
+          # the container's configured environment, less what the image sets itself. Names only.
+          configured() {
+            id=$($compose ps -a -q "$1")
+            image=$(docker inspect --format '{{.Config.Image}}' "$id")
+            docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
+              | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/image-env"
+            docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" \
+              | cut -d= -f1 | sed '/^$/d' | sort -u | comm -23 - "$RUNNER_TEMP/image-env" \
+              | tr '\n' ' '
+          }
+          {
+            echo "app $(configured app)"
+            echo "startup $(configured startup)"
+          } | tee "$RUNNER_TEMP/configured-env"
+          bounded_run 60 "the configured-environment comparison" ci-configured-env -i --rm \
+            --entrypoint python sunrise-voice-agent:ci -c '
+          import sys
           from app.config import Settings, StartupSettings
-          def variables(settings_class):
-              return {name.upper() for name in settings_class.model_fields}
-          with open("/proc/1/cmdline", "rb") as file:
-              command = [part.decode() for part in file.read().split(b"\0") if part]
-          assert any(part.endswith("/uvicorn") for part in command), "PID 1 is not uvicorn"
-          print("PID 1 runs uvicorn")
-          with open("/proc/1/environ", "rb") as file:
-              entries = [entry.decode() for entry in file.read().split(b"\0") if entry]
-          process = dict(entry.split("=", 1) for entry in entries)
-          names = set(process)
-          known = variables(Settings) | variables(StartupSettings)
-          print("application process variables:", " ".join(sorted(names & known)))
-          # The read is real: what the process must have is there.
-          assert {"PATH", "APP_DB_USER", "APP_DB_PASSWORD", "POSTGRES_HOST"} <= names
-          assert names & known == variables(Settings), sorted((names & known) ^ variables(Settings))
-          assert not names & {"POSTGRES_USER", "POSTGRES_PASSWORD"}
-          owner = os.environ["POSTGRES_USER"]
-          def owner_login(password):
-              try:
-                  psycopg.connect(
-                      host=process["POSTGRES_HOST"], port=process["POSTGRES_PORT"],
-                      dbname=process["POSTGRES_DB"], user=owner, password=password,
-                      connect_timeout=10,
-                  ).close()
-              except psycopg.OperationalError as error:
-                  refused = ("password authentication failed", "no password supplied")
-                  assert any(reason in str(error) for reason in refused), "not a login refusal"
-                  return False
-              return True
-          assert owner_login(os.environ["POSTGRES_PASSWORD"]), "the owner login itself fails"
-          accepted = sum(owner_login(value) for value in process.values())
-          print(f"owner logins with each of the {len(process)} values the process holds: {accepted}")
-          assert accepted == 0
-          # Nor can a start-up step run from what the application process holds.
-          setup = subprocess.run(
-              ["python", "-m", "app.db.roles"], env=process, capture_output=True, text=True,
-              timeout=60,
-          )
-          assert setup.returncode != 0
-          assert "postgres_user" in setup.stderr and "postgres_password" in setup.stderr
-          print("role set-up with the application process environment: refused, no owner")
-          '
-      - name: A restart runs the set-up again and changes no role or privilege
+          expected = {
+              "app": {name.upper() for name in Settings.model_fields},
+              "startup": {name.upper() for name in StartupSettings.model_fields},
+          }
+          found = {}
+          for line in sys.stdin:
+              service, *names = line.split()
+              found[service] = set(names)
+          print("services checked:", " ".join(sorted(found)))
+          if found != expected:
+              for service in sorted(expected):
+                  print(service, "missing:", sorted(expected[service] - found.get(service, set())),
+                        "unexpected:", sorted(found.get(service, set()) - expected[service]))
+              sys.exit(1)
+          ' < "$RUNNER_TEMP/configured-env"
+      - name: No process in the app container holds the owner's identity, healthcheck included
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # Inside the app container, as its own user: every readable /proc/*/environ, sampled
+          # until a HEALTHCHECK process has been seen (bounded), then every value seen is tried
+          # as the owner's password. The real owner password goes in on stdin only, so it is in
+          # no process the check reads (scripts/check_app_processes.py says how).
+          owner_password=$(sed -n 's/^POSTGRES_PASSWORD=//p' .env)
+          test -n "$owner_password"
+          printf '%s' "$owner_password" | bounded 120 "the app container's process check" \
+            $compose exec -T app python -c "$(cat scripts/check_app_processes.py)" sunrise 75
+          # Nor can a start-up step run from what the app container holds.
+          code=0
+          output=$(bounded 60 "role set-up in the app container" $compose exec -T app \
+            python -m app.db.roles 2>&1) || code=$?
+          echo "role set-up in the app container -> exit $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "postgres_user"
+          echo "$output" | grep -q "postgres_password"
+      - name: Restarts keep the role and its privileges; a stack restart runs the start-up again
         run: |
           . .github/ci-wait.sh
           compose="docker compose --env-file .env -f deploy/docker-compose.yml"
@@ -273,27 +286,48 @@ jobs:
               -c "SELECT relname, relacl FROM pg_class
                 WHERE relnamespace = 'public'::regnamespace ORDER BY relname" \
               -c "SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public'" \
-              -c "SELECT datacl FROM pg_database WHERE datname = 'sunrise'"
+              -c "SELECT datname, datacl FROM pg_database ORDER BY datname"
+          }
+          setups() {
+            bounded 60 "the start-up service's logs" $compose logs --no-color startup \
+              > "$RUNNER_TEMP/startup-logs"
+            grep -c "runtime_role_ready created=$1" "$RUNNER_TEMP/startup-logs" || true
           }
           app=$($compose ps -q app)
-          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          startup=$($compose ps -a -q startup)
           snapshot > "$RUNNER_TEMP/privileges-before"
           cat "$RUNNER_TEMP/privileges-before"
-          # The snapshot holds the role and its grants, so the comparison below means something.
+          # The snapshot holds the role and its grants, so the comparisons below mean something.
           grep -qx 'sunrise_app|f|f|f|t|f|f' "$RUNNER_TEMP/privileges-before"
           grep -q '^audit_events|.*sunrise_app=ar/sunrise' "$RUNNER_TEMP/privileges-before"
+          test "$(setups True)" = 1
+          test "$(setups False)" = 0
+
+          echo "--- the app container alone: no start-up run is needed"
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          startup_started=$(docker inspect --format '{{.State.StartedAt}}' "$startup")
           bounded 120 "the app to restart" $compose restart app
           wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
-          restarted=$(docker inspect --format '{{.State.StartedAt}}' "$app")
-          echo "started $started, restarted $restarted"
-          test "$restarted" != "$started"
-          snapshot > "$RUNNER_TEMP/privileges-after"
-          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after"
-          # The set-up ran on both starts: it created the role once and found it the second time.
-          bounded 60 "the app's logs" $compose logs --no-color app > "$RUNNER_TEMP/app-logs"
-          grep runtime_role_ready "$RUNNER_TEMP/app-logs"
-          test "$(grep -c 'runtime_role_ready created=True' "$RUNNER_TEMP/app-logs")" = 1
-          test "$(grep -c 'runtime_role_ready created=False' "$RUNNER_TEMP/app-logs")" = 1
+          test "$(docker inspect --format '{{.State.StartedAt}}' "$app")" != "$started"
+          test "$(docker inspect --format '{{.State.StartedAt}}' "$startup")" = "$startup_started"
+          test "$(setups False)" = 0
+          snapshot > "$RUNNER_TEMP/privileges-after-app"
+          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-app"
+
+          echo "--- the whole stack: the start-up runs again, then the app starts"
+          bounded 120 "the stack to stop" $compose stop
+          bounded 300 "the stack to start again" $compose up -d
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
+          state=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")
+          echo "start-up service: $state"
+          test "$state" = "exited 0"
+          test "$(setups True)" = 1
+          test "$(setups False)" = 1
+          finished=$(docker inspect --format '{{.State.FinishedAt}}' "$startup")
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          test "$(date -d "$started" +%s%N)" -gt "$(date -d "$finished" +%s%N)"
+          snapshot > "$RUNNER_TEMP/privileges-after-stack"
+          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after-stack"
       - name: The db container holds only the database variables
         run: |
           db=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q db)
@@ -316,28 +350,28 @@ jobs:
             grep -qx "$name" "$RUNNER_TEMP/db-env"
           done
           echo "db environment holds only the database variables"
-      - name: The app container receives exactly the settings variables
+      - name: Compose gives app and startup exactly their settings variables
         run: |
           set -o pipefail
           . .github/ci-wait.sh
           # Compose's resolved configuration, read by the app's own settings classes inside the
-          # image. Names only; values are never printed. The container receives the variables
-          # of both classes: the start-up steps need the owner. The application process gets
-          # only its own class's (the step above checks the running process).
+          # image. Names only; values are never printed. The running containers are checked
+          # against the same classes above.
           timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
             | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
               --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
           from app.config import Settings, StartupSettings
-          received = set(json.load(sys.stdin)["services"]["app"]["environment"])
-          application = {name.upper() for name in Settings.model_fields}
-          startup = {name.upper() for name in StartupSettings.model_fields}
-          fields = application | startup
-          print("app environment names:", " ".join(sorted(received)))
-          print("of which only the start-up steps get:", " ".join(sorted(startup - application)))
-          if received != fields or startup - application != {"POSTGRES_USER", "POSTGRES_PASSWORD"}:
-              print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
-              sys.exit(1)
+          services = json.load(sys.stdin)["services"]
+          failed = False
+          for service, settings_class in (("app", Settings), ("startup", StartupSettings)):
+              received = set(services[service]["environment"])
+              fields = {name.upper() for name in settings_class.model_fields}
+              print(service, "environment names:", " ".join(sorted(received)))
+              if received != fields:
+                  print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
+                  failed = True
+          sys.exit(1 if failed else 0)
           '
       - name: The coturn container holds only its own variables
         run: |
@@ -475,18 +509,31 @@ jobs:
           echo "$output" | tail -n 15
           echo "exit code: $code"
           test "$code" = "1"
-          for name in postgres_host postgres_db postgres_user postgres_password \
-            app_db_user app_db_password audit_hmac_key turn_shared_secret turn_host \
-            demo_access_token; do
+          for name in postgres_host postgres_db app_db_user app_db_password audit_hmac_key \
+            turn_shared_secret turn_host demo_access_token; do
             echo "$output" | grep -q "$name"
           done
-      - name: Container whose runtime user is the owner must not start
+      - name: Start-up steps without their settings must not run
+        run: |
+          . .github/ci-wait.sh
+          code=0
+          output=$(bounded_run 60 "the start-up check to refuse" ci-no-startup-settings --rm \
+            -e APP_ENV=prod sunrise-voice-agent:ci python -m app.config 2>&1) || code=$?
+          echo "$output" | tail -n 15
+          echo "exit code: $code"
+          test "$code" = "1"
+          for name in postgres_host postgres_db postgres_user postgres_password app_db_user \
+            app_db_password; do
+            echo "$output" | grep -q "$name"
+          done
+      - name: Start-up whose runtime user is the owner must not run
         run: |
           . .github/ci-wait.sh
           # Every other setting is valid (the Compose env file), so only this rule can stop it.
           code=0
-          output=$(bounded_run 60 "the app container to refuse to start" ci-same-user --rm \
-            --env-file .env -e APP_DB_USER=sunrise sunrise-voice-agent:ci 2>&1) || code=$?
+          output=$(bounded_run 60 "the start-up check to refuse" ci-same-user --rm \
+            --env-file .env -e APP_DB_USER=sunrise sunrise-voice-agent:ci \
+            python -m app.config 2>&1) || code=$?
           echo "$output" | tail -n 5
           echo "exit code: $code"
           test "$code" = "1"
@@ -496,6 +543,32 @@ jobs:
             echo "the application settings were refused too; only the start-up rule should be"
             exit 1
           fi
+      - name: A failed start-up keeps the app from starting
+        run: |
+          . .github/ci-wait.sh
+          # The same stack, with a start-up setting the start-up service refuses.
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          bounded 120 "the stack to go down" $compose \
+            -f deploy/docker-compose.relay-test.yml down
+          code=0
+          export APP_DB_USER=sunrise
+          bounded 300 "the stack to try to start" $compose up -d \
+            > "$RUNNER_TEMP/failed-up" 2>&1 || code=$?
+          tail -n 5 "$RUNNER_TEMP/failed-up"
+          echo "up exit code: $code"
+          test "$code" != "0"
+          test "$code" != "124"
+          grep -q 'service "startup" didn.t complete successfully' "$RUNNER_TEMP/failed-up"
+          startup=$($compose ps -a -q startup)
+          app=$($compose ps -a -q app)
+          echo "start-up service: $(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$startup")"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$startup")" = "1"
+          state=$(docker inspect --format '{{.State.Status}}' "$app")
+          echo "app container: $state"
+          test "$state" = "created"
+          status=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
+          echo "GET /health -> $status"
+          test "$status" = "000"
       - name: Compose logs
         if: always()
         run: timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml logs || true

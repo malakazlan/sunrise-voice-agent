@@ -115,9 +115,10 @@ def test_one_env_file_serves_both_settings_classes(
     ]
 
 
-def test_settings_check_reports_both_classes(tmp_path: Path) -> None:
-    # `python -m app.config`, the container's first step. Only what the interpreter needs to
-    # start is kept from this environment.
+def test_settings_check_reports_the_startup_settings(tmp_path: Path) -> None:
+    # `python -m app.config`, the start-up service's first step, given only the start-up
+    # settings' variables. Only what the interpreter needs to start is kept from this
+    # environment.
     base = {key: value for key, value in os.environ.items() if key in ("PATH", "SYSTEMROOT")}
     base["PYTHONPATH"] = str(REPO_ROOT)
 
@@ -133,47 +134,60 @@ def test_settings_check_reports_both_classes(tmp_path: Path) -> None:
 
     refused = check({"APP_ENV": "prod"})
     assert refused.returncode == 1
-    for name in (
-        *sorted(STARTUP_FIELDS - {"app_env", "log_level", "postgres_port"}),
-        "audit_hmac_key",
-        "turn_shared_secret",
-        "turn_host",
-        "demo_access_token",
-    ):
+    for name in sorted(STARTUP_FIELDS - {"app_env", "log_level", "postgres_port"}):
         assert name in refused.stderr, name
     assert re.search(r"validation errors? for StartupSettings$", refused.stderr, re.MULTILINE)
-    assert re.search(r"validation errors? for Settings$", refused.stderr, re.MULTILINE)
+    assert "audit_hmac_key" not in refused.stderr
 
-    accepted = check({**OFFLINE_DB_ENV, "APP_ENV": "dev"})
+    startup_only = {
+        key: value for key, value in OFFLINE_DB_ENV.items() if key.lower() in STARTUP_FIELDS
+    }
+    assert "AUDIT_HMAC_KEY" not in startup_only
+    accepted = check({**startup_only, "APP_ENV": "dev"})
     assert accepted.returncode == 0, accepted.stderr
     assert accepted.stderr == ""
 
 
-# The container's start command: the start-up steps, then uvicorn without the owner's variables.
-START_COMMAND = re.compile(r'^CMD \["sh", "-c", "(?P<command>[^"]*)"\]$', re.MULTILINE)
+# The image serves: uvicorn, started straight by Docker, so it is PID 1 and receives signals.
+SERVE_COMMAND = (
+    'CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",'
+    ' "--workers", "1", "--no-access-log"]'
+)
+# The start-up steps, which the one-shot start-up service runs; any failure stops it there.
+STARTUP_COMMAND = (
+    'command: ["sh", "-c", "python -m app.config && alembic upgrade head'
+    ' && python -m app.db.roles && python -m app.db.seed"]'
+)
 
 
-def test_container_start_drops_the_owner_identity() -> None:
-    match = START_COMMAND.search((REPO_ROOT / "Dockerfile").read_text(encoding="utf-8"))
-    assert match is not None
-    steps = match["command"].split(" && ")
+def compose_service(name: str) -> list[str]:
+    """The lines of one service in deploy/docker-compose.yml, its own header excluded."""
+    lines = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8").splitlines()
+    start = lines.index(f"  {name}:") + 1
+    end = next(
+        (
+            index
+            for index in range(start, len(lines))
+            if lines[index] and not lines[index].startswith("    ")
+        ),
+        len(lines),
+    )
+    return [line.strip() for line in lines[start:end]]
 
-    assert steps[:4] == [
-        "python -m app.config",
-        "alembic upgrade head",
-        "python -m app.db.roles",
-        "python -m app.db.seed",
-    ]
-    [serve] = steps[4:]
-    words = serve.split()
-    # exec: uvicorn replaces the shell, so it is PID 1 and receives the container's signals.
-    assert words[:2] == ["exec", "env"]
-    removed = {words[index + 1] for index, word in enumerate(words) if word == "-u"}
-    assert removed == {name.upper() for name in OWNER_FIELDS}
-    assert removed == {name.upper() for name in StartupSettings.model_fields} - {
-        name.upper() for name in Settings.model_fields
-    }
-    assert words[2 + 2 * len(removed)] == "uvicorn"
+
+def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert [line for line in dockerfile.splitlines() if line.startswith("CMD")] == [SERVE_COMMAND]
+    assert "env -u" not in dockerfile
+
+    startup = compose_service("startup")
+    assert STARTUP_COMMAND in startup
+    assert 'restart: "no"' in startup
+    app = compose_service("app")
+    assert not any(line.startswith("command:") for line in app)
+    # The app waits for the start-up service to have exited with 0; a failure keeps it down.
+    depends = app[app.index("depends_on:") :]
+    assert depends[:3] == ["depends_on:", "startup:", "condition: service_completed_successfully"]
 
 
 @pytest.mark.usefixtures("offline_env")

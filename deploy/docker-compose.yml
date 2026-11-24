@@ -3,16 +3,28 @@ name: sunrise-voice-agent
 # Run from the repo root: docker compose --env-file .env -f deploy/docker-compose.yml up --build
 #
 # Every value is interpolated from --env-file .env (or the shell), and each container receives
-# only the variables it needs: db its three credentials (the owner), app its settings (the
-# owner, for the start-up steps, and the runtime role it serves as; the application process
-# itself is started without the owner's, see the Dockerfile), coturn its own. Compose
-# refuses to start without the owner's credentials or APP_ENV. The app and coturn check the
-# rest themselves and stop when a value they need is missing; an empty value counts
-# as unset, so the app's own defaults apply.
+# only the variables it needs: db its three credentials (the owner); startup, a one-shot run of
+# the start-up steps, the start-up settings (the owner and the runtime role it sets up); app
+# the application's settings, which hold no part of the owner's identity; coturn its own.
+# Compose refuses to start without the owner's credentials or APP_ENV. The services check the
+# rest themselves and stop when a value they need is missing; an empty value counts as unset,
+# so the app's own defaults apply. CI checks each service's variables against app/config.py.
 x-database-credentials: &database-credentials
   POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
   POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set; pass --env-file .env}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set; pass --env-file .env}
+# Where the database is and the runtime role, for startup and app alike. Inside Compose the
+# database is always db:5432.
+x-runtime-database: &runtime-database
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  APP_DB_USER: ${APP_DB_USER:-}
+  APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
+  APP_ENV: ${APP_ENV:?APP_ENV is not set; pass --env-file .env}
+  LOG_LEVEL: ${LOG_LEVEL:-}
+x-app-image: &app-image
+  context: ..
+  dockerfile: Dockerfile
 
 services:
   db:
@@ -38,24 +50,33 @@ services:
       timeout: 5s
       retries: 30
 
+  # The start-up steps, as the owner, once per start of the stack: check the settings, migrate,
+  # set up the runtime role, seed. It exits when done; a failure in any step ends it with a
+  # non-zero code, and then app does not start.
+  startup:
+    build: *app-image
+    command: ["sh", "-c", "python -m app.config && alembic upgrade head && python -m app.db.roles && python -m app.db.seed"]
+    restart: "no"
+    # The image's HEALTHCHECK asks the server, which this container never runs.
+    healthcheck:
+      disable: true
+    # Exactly the start-up settings' fields (StartupSettings in app/config.py).
+    environment:
+      <<: [*database-credentials, *runtime-database]
+    depends_on:
+      db:
+        condition: service_healthy
+
   app:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    build: *app-image
     # Loopback only: on a server the app is reached through the HTTPS proxy, not this port.
     ports:
       - "127.0.0.1:8000:8000"
-    # Exactly the fields of both settings classes in app/config.py (CI checks it): the start-up
-    # steps' (with the owner) and the application's (without).
+    # Exactly the application settings' fields (Settings in app/config.py): the runtime role,
+    # never the owner.
     environment:
-      <<: *database-credentials
-      # Inside Compose the app always reaches the database as db:5432.
-      POSTGRES_HOST: db
-      POSTGRES_PORT: "5432"
-      APP_DB_USER: ${APP_DB_USER:-}
-      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
-      APP_ENV: ${APP_ENV:?APP_ENV is not set; pass --env-file .env}
-      LOG_LEVEL: ${LOG_LEVEL:-}
+      <<: *runtime-database
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
       SIMULATED_NOW: ${SIMULATED_NOW:-}
       AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
       MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
@@ -64,6 +85,8 @@ services:
       TURN_HOST: ${TURN_HOST:-}
       DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
     depends_on:
+      startup:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
 

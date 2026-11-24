@@ -144,7 +144,10 @@ RAW_CONNECTION_ACCESS = {
     "dbapi_connection",
 }
 DRIVER_CONNECTION_CLASSES = {"Connection", "AsyncConnection"}
-RAW_CONNECTION_ALLOWED = {ENGINE_MODULE, "tests/conftest.py"}
+# CI's check of the app container (not shipped in the image) opens plain logins on purpose:
+# it tries, as an intruder would, every value the container holds as the owner's password.
+PROCESS_CHECK = "scripts/check_app_processes.py"
+RAW_CONNECTION_ALLOWED = {ENGINE_MODULE, "tests/conftest.py", PROCESS_CHECK}
 
 
 def raw_connection_uses(source: str) -> list[str]:
@@ -310,8 +313,8 @@ def test_trigger_bypass_only_in_the_tamper_fixture() -> None:
 
 # The owner's settings class, engines and URL. Outside the tests only the modules that define
 # them (settings, session) and the start-up steps (migrations, role set-up, seed) may name them;
-# the application runs as the runtime role, and its process does not have the owner's
-# variables (the Dockerfile's start command). Like the scans above, a lint against accidents:
+# the application runs as the runtime role, and its container is never given the owner's
+# variables (deploy/docker-compose.yml). Like the scans above, a lint against accidents:
 # the runtime role's privileges are the control.
 OWNER_NAMES = {
     "StartupSettings",
@@ -320,7 +323,8 @@ OWNER_NAMES = {
     "owner_database_url",
 }
 STARTUP_MODULES = {"app/db/migrations/env.py", "app/db/roles.py", "app/db/seed.py"}
-OWNER_ALLOWED = {"app/config.py", ENGINE_MODULE, *STARTUP_MODULES}
+# The process check names the start-up settings to know which variables are the owner's.
+OWNER_ALLOWED = {"app/config.py", ENGINE_MODULE, PROCESS_CHECK, *STARTUP_MODULES}
 
 
 def owner_engine_uses(source: str) -> list[str]:
