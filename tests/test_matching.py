@@ -326,13 +326,31 @@ def test_strength_and_form_words_are_ignored() -> None:
     assert wrong_medications(rows) == []
 
 
-def test_numbers_without_a_unit_are_kept() -> None:
-    # Splitting on "." and "%" leaves a bare number that no unit follows.
+def test_decimal_and_percent_strengths_are_dropped() -> None:
+    hydrocortisone = ["Hydrocortisone 1% cream"]
+    timolol = ["Timolol 0.5% solution"]
     rows: list[tuple[str, list[str], str | None]] = [
-        ("metformin 2.5mg capsule", ["Metformin 500mg"], None),
-        ("hydrocortisone cream", ["Hydrocortisone 1% cream"], None),
-        ("timolol drops", ["Timolol 0.5% solution"], None),
-        ("clonazepam", ["Clonazepam 0.5mg"], None),
+        ("clonazepam", ["Clonazepam 0.5mg"], "Clonazepam 0.5mg"),
+        ("clonazepam 0.5 mg", ["Clonazepam 0.5mg"], "Clonazepam 0.5mg"),
+        ("hydrocortisone cream", hydrocortisone, "Hydrocortisone 1% cream"),
+        ("hydrocortisone", hydrocortisone, "Hydrocortisone 1% cream"),
+        ("hydrocortisone 1 percent", hydrocortisone, "Hydrocortisone 1% cream"),
+        ("timolol drops", timolol, "Timolol 0.5% solution"),
+        ("timolol", timolol, "Timolol 0.5% solution"),
+        ("metformin", ["Metformin 2.5mg capsule"], "Metformin 2.5mg capsule"),
+        ("metformin 2.5mg capsule", ["Metformin 500mg"], "Metformin 500mg"),
+        ("hydrocortisone 1 %", hydrocortisone, "Hydrocortisone 1% cream"),
+    ]
+
+    assert wrong_medications(rows) == []
+
+
+def test_numbers_without_a_unit_are_kept() -> None:
+    # A number, decimals included, that no unit marks as a strength must match exactly.
+    rows: list[tuple[str, list[str], str | None]] = [
+        ("clonazepam 0.5", ["Clonazepam 0.5mg"], None),
+        ("clonazepam 1", ["Clonazepam 0.5mg"], None),
+        ("lisinopril 20", ["Lisinopril 10mg"], None),
     ]
 
     assert wrong_medications(rows) == []
@@ -350,8 +368,9 @@ def test_medications_with_numbers_that_match() -> None:
         ("vitamin d 3", vitamin_d, "Vitamin D-3 2000 IU"),
         ("vitamin d", vitamin_d, "Vitamin D 50mcg"),
         ("humulin 70/30", humulin, "Humulin 70/30"),
-        # A ratio spoken as two numbers is two tokens, so it is not 7030.
+        # A number spoken apart from its word stays a separate token.
         ("humulin 70 30", humulin, None),
+        ("omega 3", ["Omega-3"], None),
         ("humulin r u-500", ["Humulin R U-500"], "Humulin R U-500"),
         ("humulin r u 500", ["Humulin R U-500"], "Humulin R U-500"),
         ("omega-3", ["Omega-3"], "Omega-3"),

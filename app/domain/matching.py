@@ -25,11 +25,14 @@ TITLES_AND_SUFFIXES = frozenset({"dr", "mr", "mrs", "ms", "miss", "jr", "sr", "i
 # A hyphen or slash between two letters or digits, at least one of them a digit, joins them:
 # "b-12" is "b12", "70/30" is "7030".
 DIGIT_JOINER = re.compile(r"(?<=[0-9])[-/](?=[a-z0-9])|(?<=[a-z0-9])[-/](?=[0-9])")
-MEDICATION_TOKENS = re.compile(r"[a-z0-9]+")
-UNITS = r"(?:mg|mcg|g|ml|milligrams?|micrograms?|grams?|units?|iu)"
+# Runs of letters and digits, where a point between two digits ("0.5") belongs to the run;
+# "%" is a token of its own, so "1%" is a number followed by a unit word.
+MEDICATION_TOKENS = re.compile(r"(?:[a-z0-9]|(?<=[0-9])\.(?=[0-9]))+|%")
+UNITS = r"(?:mg|mcg|g|ml|milligrams?|micrograms?|grams?|units?|iu|percent|%)"
 UNIT_WORD = re.compile(UNITS)
-NUMBER_WITH_UNIT = re.compile(rf"[0-9]+{UNITS}")
-BARE_NUMBER = re.compile(r"[0-9]+")
+NUMBER = r"[0-9]+(?:\.[0-9]+)?"
+NUMBER_WITH_UNIT = re.compile(rf"{NUMBER}{UNITS}")
+BARE_NUMBER = re.compile(NUMBER)
 FORM_WORDS = frozenset(
     {
         "tablet",

@@ -34,8 +34,10 @@ All data used by this project is synthetic. No real customer or personal data is
     It ignores case; form words (`tablet(s)`, `tab(s)`, `capsule(s)`, `cap(s)`, `pill(s)`,
     `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`, `drops`, `spray`);
     unit words (`mg`, `mcg`, `g`, `ml`, `milligram(s)`, `microgram(s)`, `gram(s)`,
-    `unit(s)`, `iu`); and a number only when it is a strength, with a unit attached (`10mg`)
-    or right before a unit word (`10 mg`, `2000 IU`). Every other number is kept and must
+    `unit(s)`, `iu`, `percent`, `%`); and a number, which may have one decimal point
+    (`0.5`), only when it is a strength, with a unit attached (`10mg`, `0.5mg`, `1%`) or
+    right before a unit word (`10 mg`, `2000 IU`, `1 percent`). A decimal comma is not
+    understood. Every other number is kept and must
     match: `Humulin R U-500`, `Humulin 70/30` and `Vitamin B-12` keep theirs. A hyphen or
     slash next to a digit joins (`B-12` is `b12`, `70/30` is `7030`), and a single letter
     followed by a number is one word (`b 12` is `b12`). The remaining words must match one

@@ -322,7 +322,14 @@ def test_domain_is_pure() -> None:
         "().__class__.__base__.__subclasses__()\n",
         "import dataclasses\ndataclasses.inspect.getmodule(dataclasses)\n",
         "import typing\ntyping.linecache.getlines('.env')\n",
+        # The re-review's six bypasses, verbatim.
         "breakpoint()\n",
+        "__loader__.get_data('.env')\n",
+        "[c for c in ().__class__.__base__.__subclasses__()"
+        " if c.__name__ == 'FileIO'][0]('.env')\n",
+        "dataclasses.inspect.linecache.getlines('.env')\n",
+        "typing.__dict__['s'+'ys']\n",
+        "typing.__getattribute__('s'+'ys')\n",
         # Caught only by the bare-name ban: the attribute (open) is not banned.
         "__builtins__.open('.env')\n",
     ):
