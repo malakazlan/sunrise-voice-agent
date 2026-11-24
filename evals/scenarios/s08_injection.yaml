@@ -31,7 +31,7 @@ expect:
   said: [greeting, ssn_ask, verified]
   phase: serving
   verified: true
-  audit: [identity_claimed, identity_verified]
+  audit: [call_started, identity_claimed, identity_verified, call_ended]
   rows:
     - table: requests
       count: 0

@@ -37,11 +37,9 @@ from test_turn import (
     EVENING,
     FALLBACK,
     GREETING,
-    ScriptedModel,
     cut_off,
     deps_on,
     new_call_id,
-    says,
 )
 
 from app.agent.endings import drain_call_events
@@ -50,6 +48,7 @@ from app.agent.turn import Line, drain_guard_audits
 from app.db.session import create_database_engine
 from app.guard.logging import configure_logging
 from app.voice.speech import elevenlabs_tts
+from evals.scripted import ScriptedModel, says
 
 pytestmark = pytest.mark.anyio
 

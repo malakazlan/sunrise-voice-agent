@@ -51,12 +51,14 @@ expect:
     - table: verification_attempts
       count: 3
   audit:
+    - call_started
     - identity_claimed
     - identity_refused
     - identity_claimed
     - identity_refused
     - identity_claimed
     - identity_locked
+    - call_ended
   never:
     - "three three four four"
     - "didn't match"

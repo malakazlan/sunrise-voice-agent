@@ -20,11 +20,8 @@ from test_turn import (
     GREETING,
     SEED_DAY,
     T0,
-    ScriptedModel,
-    calls,
     deps_on,
     new_call_id,
-    says,
 )
 
 from app.agent.endings import drain_call_events
@@ -34,6 +31,7 @@ from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
 from app.agent.turn import CallAgent
 from app.db.seed import load_seed_data, seed
+from evals.scripted import ScriptedModel, calls, says
 
 pytestmark = pytest.mark.anyio
 

@@ -958,9 +958,11 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
   role of the evals' own (`sva_eval_<random>_app`, which must not exist yet and is dropped at
   the end), seeded for the scenario's day. The database is dropped after the run.
 - A run is one call as the live pipeline makes it: a call id from the call registry,
-  `start_call` on the application's tools, each caller turn through `CallAgent.handle` (the
-  input guard, the gate, dispatch, the scripted lines). The call's clock is the scenario's
-  `now`; the audit and claim keys are random for the run.
+  `start_call` on the application's tools (`call_started`), each caller turn through
+  `CallAgent.handle` (the input guard, the gate, dispatch, the scripted lines), then
+  `CallAgent.end` (`call_ended`): for the reason the call's last phase gives, or as a caller who
+  hangs up after the last turn. The phase a scenario expects is that last phase. The call's
+  clock is the scenario's `now`; the audit and claim keys are random for the run.
 - Expectations, after a turn and at the end of the call: the scripted lines said, by id; the
   tools the model asked for, in order, with chosen arguments and chosen values of what each
   returned; phase and verified; the rows the call wrote (table, count, column values, compared
