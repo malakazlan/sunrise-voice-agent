@@ -5,19 +5,24 @@ reaches a vendor: speech-to-text is replaced by a pass-through and the model is 
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, date, datetime
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection
 from aiortc.mediastreams import AudioStreamTrack
 from conftest import REPO_ROOT, VOICE_SECRETS, offline_settings
+from deepgram.core.jsonable_encoder import jsonable_encoder
+from deepgram.core.query_encoder import encode_query
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pipecat.frames.frames import (
+    EndFrame,
     Frame,
     InterimTranscriptionFrame,
+    OutputTransportMessageUrgentFrame,
     TranscriptionFinalizedFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
@@ -38,6 +43,7 @@ from app.agent.tools import register_tools
 from app.agent.turn import CallAgent, Line, Speak, TurnResult, TurnTimings
 from app.audit.log import Reason
 from app.config import Settings
+from app.db.seed import load_seed_data
 from app.db.session import create_database_engine
 from app.guard.input import GuardAction
 from app.guard.output import OutputRule
@@ -45,6 +51,8 @@ from app.main import create_app
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, open_agent_call
 from app.voice.speech import Playback
+from app.voice.speech_check import SpeechCheck
+from app.voice.vocabulary import Vocabulary, keyterms
 from evals.scripted import ScriptedModel, says
 
 T0 = datetime(2026, 11, 24, 15, 0, tzinfo=UTC)
@@ -87,12 +95,16 @@ def agent_in_intake(
     return CallAgent(state, deps, model, register_tools(), clock=clock)
 
 
-def adapter(agent: Agent, clock: Clock) -> tuple[AgentProcessor, Playback]:
-    """The voice adapter around an agent the test built, OPENING its opening line."""
+def adapter(
+    agent: Agent, clock: Clock, refused: list[None] | None = None
+) -> tuple[AgentProcessor, Playback]:
+    """The voice adapter around an agent the test built, OPENING its opening line; each time it
+    asks why speech out refused, `refused` gets an entry."""
 
     async def start() -> tuple[Agent, Line]:
         return agent, Line(id=0, text=OPENING, script=ScriptId.GREETING)
 
+    asked = [] if refused is None else refused
     playback = Playback()
     processor = AgentProcessor(
         CALL_ID,
@@ -101,6 +113,7 @@ def adapter(agent: Agent, clock: Clock) -> tuple[AgentProcessor, Playback]:
         idle_seconds=30,
         max_seconds=600,
         vad_stop_seconds=0.5,
+        speech_refused=lambda: asked.append(None),
         clock=clock,
         sleep=FakeTime().sleep,
     )
@@ -289,17 +302,101 @@ async def test_a_failed_turn_ends_the_call(caplog: pytest.LogCaptureFixture) -> 
 
     assert agent.ended is Reason.ERROR
     assert [m for m in call.messages() if m["type"] == "ended"] == [
-        {"type": "ended", "reason": "error"}
+        {"type": "ended", "reason": "error", "hint": "The call ended because of an error."}
     ]
     assert f"turn_failed call_id={CALL_ID} error=RuntimeError" in caplog.text
     assert "an unknown state" not in caplog.text
 
 
+def ended_before_close(call: CallPipeline) -> list[dict[str, Any]]:
+    """The page's `ended` messages, each checked to have gone down before the end of the
+    pipeline."""
+    end = next(i for i, f in enumerate(call.down) if isinstance(f, EndFrame))
+    told = [
+        (i, f.message)
+        for i, f in enumerate(call.down)
+        if isinstance(f, OutputTransportMessageUrgentFrame) and f.message["type"] == "ended"
+    ]
+    assert all(i < end for i, _message in told)
+    return [message for _i, message in told]
+
+
+@pytest.mark.anyio
+async def test_the_page_is_told_why_a_call_ended() -> None:
+    # Speech out written off: the call ends with `error`, the page is told it was speech, and
+    # the check of why is asked for once.
+    refused: list[None] = []
+    agent = Withheld()
+    processor, playback = adapter(agent, Clock(), refused)
+    voice = FakeVoice()
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        # As ElevenLabs' service reports it, with its own text.
+        await voice.push_error("marker-vendor-text", force_treat_as_permanent=True)
+        await until(lambda: call.ended, "the call to end")
+    assert agent.ended is Reason.ERROR
+    assert ended_before_close(call) == [
+        {
+            "type": "ended",
+            "reason": "error",
+            "hint": "The speech service refused to speak. Check the voice id and the plan.",
+        }
+    ]
+    assert refused == [None]
+    assert "marker" not in json.dumps(call.messages())
+
+    # A pipeline that ends for another reason: the page is told, with the general hint, and
+    # nothing is checked.
+    refused = []
+    processor, playback = adapter(Withheld(), Clock(), refused)
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+    assert ended_before_close(call) == [
+        {"type": "ended", "reason": "error", "hint": "The call ended because of an error."}
+    ]
+    assert refused == []
+
+    # A call that ends itself is told its reason once, and no hint.
+    processor, playback = adapter(Closing(), Clock(), refused)
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("Goodbye.", finalized=True))
+        await until(lambda: call.ended, "the call to end")
+    assert ended_before_close(call) == [{"type": "ended", "reason": "completed"}]
+    assert refused == []
+
+    # The page shows the reason and the hint as text, and keeps them when the connection drops.
+    page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    assert 'show("ended", ended);' in page
+    assert 'const ended = typeof message.hint === "string"' in page
+    hang_up = page[page.index("const hangUp = () => {") :]
+    assert '"ended"' not in hang_up[: hang_up.index("};")]
+
+
+class Closing(Withheld):
+    """A turn that ends the call: its last line said, the call completes."""
+
+    ending: Reason | None = None
+
+    async def handle(self, transcript: str, speak: Speak | None = None) -> TurnResult:
+        self.ending = Reason.COMPLETED
+        return await super().handle(transcript, speak)
+
+
 def test_speech_to_text_options() -> None:
-    service = deepgram_stt(SecretStr(VOICE_SECRETS["DEEPGRAM_API_KEY"]))
+    seed_medications = [
+        medication["name"]
+        for patient in load_seed_data()["patients"]
+        for medication in patient["medications"]
+    ]
+    service = deepgram_stt(SecretStr(VOICE_SECRETS["DEEPGRAM_API_KEY"]), keyterms(seed_medications))
 
     # What goes to Deepgram as query parameters (pipecat-ai 1.17.0 builds them here), but the
-    # sample rate, which the pipeline sets when it starts. Nothing redacted or boosted.
+    # sample rate, which the pipeline sets when it starts. Nothing redacted; the clinic's own
+    # words boosted.
     options = service._build_connect_kwargs()
     assert {key: value for key, value in options.items() if key != "sample_rate"} == {
         "model": "nova-3-general",
@@ -307,6 +404,16 @@ def test_speech_to_text_options() -> None:
         "smart_format": "true",
         "numerals": "false",
         "punctuate": "true",
+        "keyterm": [
+            "Albuterol",
+            "Atorvastatin",
+            "Lee",
+            "Levothyroxine",
+            "Lisinopril",
+            "Metformin",
+            "Patel",
+            "Sunrise Family Clinic",
+        ],
         "interim_results": "true",
         "detect_entities": "false",
         "diarize": "false",
@@ -316,6 +423,20 @@ def test_speech_to_text_options() -> None:
         "multichannel": "false",
         "mip_opt_out": "true",
     }
+    # Deepgram's SDK (deepgram-sdk 7.19.0) sends a list as one parameter per term, in order;
+    # the clinic's name is one term.
+    query = urlencode(encode_query(jsonable_encoder({"keyterm": options["keyterm"]})) or [])
+    name = "keyterm"
+    assert parse_qsl(query, strict_parsing=True) == [
+        (name, "Albuterol"),
+        (name, "Atorvastatin"),
+        (name, "Lee"),
+        (name, "Levothyroxine"),
+        (name, "Lisinopril"),
+        (name, "Metformin"),
+        (name, "Patel"),
+        (name, "Sunrise Family Clinic"),
+    ]
     # Audio stops at speech-to-text; the agent's processor gets only frames about it.
     assert service._audio_passthrough is False
 
@@ -331,7 +452,7 @@ class PassThrough(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-def no_vendor(_key: SecretStr) -> FrameProcessor:
+def no_vendor(_key: SecretStr, _keyterms: Sequence[str]) -> FrameProcessor:
     return PassThrough()
 
 
@@ -364,10 +485,13 @@ def test_call_that_never_connects_ends_itself() -> None:
     async def scenario() -> None:
         engine = create_database_engine(offline_settings())
         try:
+            settings = offline_settings(**DEV_WITHOUT_VOICE)
             call = await open_agent_call(
-                offline_settings(**DEV_WITHOUT_VOICE),
+                settings,
                 deps_on(engine),
                 ScriptedModel(),
+                Vocabulary(),
+                SpeechCheck(settings),
                 CALL_ID,
                 await offer_without_candidates(),
                 "offer",
