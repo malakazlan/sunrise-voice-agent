@@ -208,6 +208,33 @@ All data used by this project is synthetic. No real customer or personal data is
       create objects there before the next start-up; that start-up then refuses to run until
       those objects are removed by hand.
 
+- Masked log output. `app/guard/logging.py` is the only place log output is configured; the
+  application and each start-up step call it first. Every line goes to stderr as
+  `timestamp LEVEL logger message`, and the message and any traceback pass through
+  `app/guard/mask.py` first, line by line. A record's `extra` fields are not printed.
+  - SSNs (`***-**-****`; after a cue such as `ssn`, `social`, `last four`, `ssn_last4`,
+    `ending in`, the digits or number words that follow become `****`), dates
+    (`****-**-DD`, Python's `datetime.date(...)` included), phone numbers (`***-***-` and
+    the last four digits) and email addresses (`s***@***.com`) are masked. A line longer than
+    10,000 characters is cut, with ` [cut]` at the end, before masking, so the last line of a
+    long traceback stays. Call ids, patient ids, times, amounts, years, version numbers and
+    four-digit numbers without a cue are left alone; a nine-digit or ten-digit number on its
+    own is masked whatever it is.
+  - Python's warnings, exceptions nobody catches (in the main thread or another) and records
+    that find no handler are logged through the same formatter.
+  - The level is `LOG_LEVEL`, for the root logger and uvicorn's loggers. uvicorn's access log
+    is off. Pipecat (through loguru) and its WebRTC stack (`aioice`, `aiortc`) keep only
+    warnings and errors, and loguru does not print the values of local variables.
+  - Masking free text is best effort. The controls that matter are that the app logs event
+    names, ids and counts, and that the input guard swallows SSN digits before anything
+    could log them.
+  - Not handled: digits said before the cue (`3344 is my ssn`), seven-digit local numbers,
+    international numbers, eight-digit compact dates, quoted or internationalized email
+    addresses, an identifier split across two log calls, and names. Pipecat prints a version
+    banner through loguru's own sink when it is imported, before the configuration runs; a
+    handler a library adds after the configuration is not covered. The repo's scans that
+    keep log configuration in one module are lints against accidents.
+
 ### Voice echo call
 
 The server sends the caller's own audio straight back over WebRTC (Pipecat's SmallWebRTC
@@ -416,7 +443,14 @@ same rules as the app and stops at start-up, naming the variable, if `TURN_HOST`
 `TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty
 `MAX_CONCURRENT_CALLS` means 3, as in the app. So the whole stack needs the TURN values set. coturn uses host networking, which needs a
 Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49359. The app is
-published on `127.0.0.1:8000` only.
+published on `127.0.0.1` only, port 8000 by default; on a server it is reached through the
+HTTPS proxy.
+
+When port 8000 is taken on the host, as on a server whose own dashboard uses it, set
+`APP_HOST_PORT` in the shell: `APP_HOST_PORT=8100 docker compose --env-file .env -f
+deploy/docker-compose.yml up --build` publishes the app on `127.0.0.1:8100`. It is a Compose
+variable only, not an application setting, and no container receives it, so it does not go in
+`.env`, whose unknown keys the app refuses.
 
 ## Run locally with uv
 
