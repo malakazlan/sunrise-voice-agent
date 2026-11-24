@@ -65,6 +65,9 @@ MAX_MODEL_FAILURES = 2
 # The Messages API takes a conversation that starts with the caller; this, fixed and written by
 # code, is the caller's first message, before the opening line.
 CALL_CONNECTED = "(The call has connected.)"
+# Where a swallowed turn was, in the history the call record keeps (app/agent/call_record.py);
+# never in the conversation the model is given.
+SWALLOWED_TURN = "(turn withheld)"
 
 # What the model is told about a tool call that ended its turn with a scripted line, and about
 # one asked for after it in the same reply, which does not run.
@@ -146,10 +149,21 @@ class CallAgent:
         self._failures = 0
         self._hand_off = False
         self._lock = asyncio.Lock()
+        # Where in the conversation each swallowed turn came: for the call record only.
+        self._swallowed: list[int] = []
 
     @property
     def state(self) -> CallState:
         return self._state
+
+    @property
+    def history(self) -> tuple[dict[str, Any], ...]:
+        """The conversation for the call record: what the model is given, with a SWALLOWED_TURN
+        caller message where each swallowed turn came. Never sent to the model."""
+        history = list(self._messages)
+        for at in reversed(self._swallowed):
+            history.insert(at, {"role": "user", "content": SWALLOWED_TURN})
+        return tuple(history)
 
     def say(self, script: ScriptId, values: Mapping[str, str] | None = None) -> str:
         """A scripted line, with exactly the values its placeholders name, added to the
@@ -175,6 +189,7 @@ class CallAgent:
 
     async def _handle(self, transcript: str) -> TurnResult:
         started = self._clock()
+        at = len(self._messages)
         decision = guard_input(transcript, self._state)
         lines: list[str] = []
         timings = TurnTimings(first_token_ms=None, last_token_ms=None, tool_rounds=0)
@@ -195,6 +210,8 @@ class CallAgent:
         elif decision.script is not None:
             lines.append(self.say(decision.script))
 
+        if decision.action is GuardAction.SWALLOW:
+            self._swallowed.append(at)
         if decision.action is GuardAction.SWALLOW or decision.text is None:
             return self._turn(decision.action, None, lines, timings)
 

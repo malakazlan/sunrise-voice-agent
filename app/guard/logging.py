@@ -24,6 +24,9 @@ WEBRTC_LOGGERS = ("aioice", "aiortc")
 # The vendors' clients: below WARNING they write the request bodies (the whole conversation sent
 # to the model) and websocket frames (transcripts). Only their warnings and errors are kept.
 VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "deepgram")
+# Presidio, which masks stored transcripts (app/agent/call_record.py): below WARNING it writes
+# words of the text it reads.
+PRESIDIO_LOGGERS = ("presidio-analyzer", "presidio-anonymizer", "decision_process")
 THIRD_PARTY_FLOOR = logging.WARNING
 
 
@@ -86,7 +89,7 @@ def configure_logging(settings: DatabaseSettings) -> None:
     access.handlers.clear()
     access.propagate = False
 
-    for name in (*WEBRTC_LOGGERS, *VENDOR_LOGGERS):
+    for name in (*WEBRTC_LOGGERS, *VENDOR_LOGGERS, *PRESIDIO_LOGGERS):
         logging.getLogger(name).setLevel(third_party_level)
     # A handler that fails to write would otherwise print the raw message and its arguments.
     logging.raiseExceptions = False
@@ -102,3 +105,14 @@ def configure_logging(settings: DatabaseSettings) -> None:
     # local variables out of its tracebacks.
     loguru_logger.remove()
     loguru_logger.add(handler, level=third_party_level, format="{message}", diagnose=False)
+
+
+def quiet_presidio() -> None:
+    """For app/agent/call_record.py, right after it imports Presidio, which happens on first use,
+    after configure_logging. That import gives Presidio's decision log a handler of its own,
+    unmasked, and sets it to INFO: the handler is removed, so its records reach the masking
+    handler above, and Presidio's loggers keep only warnings and errors again."""
+    logging.getLogger("decision_process").handlers.clear()
+    level = max(logging.getLogger().level, THIRD_PARTY_FLOOR)
+    for name in PRESIDIO_LOGGERS:
+        logging.getLogger(name).setLevel(level)

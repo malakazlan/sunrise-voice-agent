@@ -36,6 +36,8 @@ WEBRTC_LOGGERS = ("aioice", "aiortc")
 # The vendors' clients: below WARNING they write request bodies (the conversation sent to the
 # model) and websocket frames (transcripts).
 VENDOR_LOGGERS = ("anthropic", "httpx2", "httpx", "httpcore", "websockets", "deepgram")
+# Presidio, which masks stored transcripts: below WARNING it writes words of the text it reads.
+PRESIDIO_LOGGERS = ("presidio-analyzer", "presidio-anonymizer", "decision_process")
 
 CONFIGURE = (
     "import sys\n"
@@ -323,6 +325,7 @@ def test_vendor_clients_log_warnings_only(log_level: LogLevel, expected: int) ->
     create_app(offline_settings(log_level=log_level))
 
     assert [logging.getLogger(name).level for name in VENDOR_LOGGERS] == [expected] * 6
+    assert [logging.getLogger(name).level for name in PRESIDIO_LOGGERS] == [expected] * 3
     # The model's client writes the whole request at DEBUG: that level is off for it.
     assert not logging.getLogger("anthropic._base_client").isEnabledFor(logging.DEBUG)
 

@@ -121,6 +121,8 @@ class Action(StrEnum):
     ADMIN_READ_MESSAGES = "admin_read_messages"
     ADMIN_READ_AUDIT = "admin_read_audit"
     ADMIN_VERIFY_AUDIT = "admin_verify_audit"
+    ADMIN_READ_CALLS = "admin_read_calls"
+    ADMIN_READ_CALL = "admin_read_call"
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"

@@ -1,11 +1,13 @@
-"""The admin API: read-only views of the requests, the messages and the audit log, behind
-HTTP Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is set.
+"""The admin API: read-only views of the requests, the messages, the calls and the audit log,
+behind HTTP Basic sign-in. app/main.py mounts it at PREFIX only when ADMIN_PASSWORD is set.
 
 Every successful read appends one audit event naming the admin, in the transaction that read
-the rows, and the rows leave only once that transaction has committed. Every text value from
-the database passes `mask` on its way out, and a callback number shows only its last four
-digits, whatever its shape. Every response carries `Cache-Control: no-store`, errors included.
-One verification of the chain runs at a time.
+the rows, and the rows leave only once that transaction has committed. A call that is not
+there, or an id that is not a call id, is answered as an unknown path is, and not audited. The
+list of calls carries no transcript; only the read of one call does. Every text value from the
+database passes `mask` on its way out, transcripts included, and a callback number shows only
+its last four digits, whatever its shape. Every response carries `Cache-Control: no-store`,
+errors included. One verification of the chain runs at a time.
 """
 
 import hashlib
@@ -68,6 +70,19 @@ MESSAGE_COLUMNS = (
     models.Message.body,
     models.Message.patient_id,
 )
+CALL_COLUMNS = (
+    models.CallSession.id,
+    models.CallSession.call_id,
+    models.CallSession.started_at,
+    models.CallSession.ended_at,
+    models.CallSession.office_open,
+    models.CallSession.verified,
+    models.CallSession.patient_id,
+    models.CallSession.end_reason,
+    models.CallSession.turn_count,
+)
+# The same body as a path that does not exist.
+NOT_FOUND = "Not Found"
 
 
 class Page(BaseModel):
@@ -164,6 +179,15 @@ async def _newest(
     return [dict(row._mapping) for row in rows]
 
 
+async def _call(session: AsyncSession, call_id: str) -> dict[str, Any] | None:
+    """The stored call with its transcript, or None."""
+    statement = select(
+        *CALL_COLUMNS, models.CallSession.transcript, models.CallSession.transcript_truncated
+    ).where(models.CallSession.call_id == call_id)
+    row = (await session.execute(statement)).first()
+    return None if row is None else dict(row._mapping)
+
+
 class _NoStore:
     """Sets `Cache-Control: no-store` on every response of the app it wraps, whatever made
     the response: a route, an error handler or the server-error fallback."""
@@ -235,29 +259,36 @@ def build_admin_app(
         )
 
     async def read_and_audit[T](
-        action: Action, resource_type: ResourceType, read: Callable[[AsyncSession], Awaitable[T]]
+        action: Action,
+        resource_type: ResourceType,
+        read: Callable[[AsyncSession], Awaitable[T | None]],
+        resource_id: str | None = None,
     ) -> T:
         """The read and its audit event in one transaction; nothing is returned unless both
-        committed."""
+        committed. A read that finds nothing (None) writes no event and is answered 404."""
         try:
             async with sessions() as session:
                 result = await read(session)
-                await audit.append(
-                    session,
-                    Event(
-                        actor=actor,
-                        action=action,
-                        resource_type=resource_type,
-                        outcome=Outcome.SUCCESS,
-                    ),
-                    now=datetime.now(UTC),
-                )
-                await session.commit()
+                if result is not None:
+                    await audit.append(
+                        session,
+                        Event(
+                            actor=actor,
+                            action=action,
+                            resource_type=resource_type,
+                            outcome=Outcome.SUCCESS,
+                            resource_id=resource_id,
+                        ),
+                        now=datetime.now(UTC),
+                    )
+                    await session.commit()
         except Exception as error:
             logger.error("admin_read_failed action=%s error=%s", action.value, type(error).__name__)
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable"
             ) from None
+        if result is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
         logger.info("admin_read action=%s", action.value)
         return result
 
@@ -293,6 +324,27 @@ def build_admin_app(
                 for row in rows
             ]
         }
+
+    @app.get("/calls")
+    async def read_calls(page: Annotated[Page, Query()]) -> dict[str, Any]:
+        rows = await read_and_audit(
+            Action.ADMIN_READ_CALLS,
+            ResourceType.CALL,
+            lambda session: _newest(session, CALL_COLUMNS, models.CallSession.id, page),
+        )
+        return {"calls": [_masked(row) for row in rows]}
+
+    @app.get("/calls/{call_id}")
+    async def read_call(call_id: str, _query: Annotated[NoQuery, Query()]) -> dict[str, Any]:
+        if not CALL_ID.fullmatch(call_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
+        row = await read_and_audit(
+            Action.ADMIN_READ_CALL,
+            ResourceType.CALL,
+            lambda session: _call(session, call_id),
+            resource_id=call_id,
+        )
+        return {"call": _masked(row)}
 
     @app.get("/audit")
     async def read_audit(page: Annotated[AuditPage, Query()]) -> dict[str, Any]:

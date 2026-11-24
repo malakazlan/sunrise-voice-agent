@@ -58,12 +58,13 @@ EXPECTED_TABLES = {
     "verification_attempts": {"SELECT", "INSERT"},
     "requests": {"SELECT", "INSERT"},
     "messages": {"SELECT", "INSERT"},
+    "call_sessions": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
 # Beyond its table's privileges, a column's own: booking takes a slot by changing this one.
 EXPECTED_COLUMNS = {("available_slots", "is_available"): {"UPDATE"}}
-# Only the appointments, verification attempts, requests and messages inserts take a number
-# from a sequence; patients have text ids and audit_events numbers its own rows.
+# Only the appointments, verification attempts, requests, messages and call sessions inserts take
+# a number from a sequence; patients have text ids and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
     "appointments_id_seq": {"USAGE"},
     "verification_attempts_id_seq": {"USAGE"},
@@ -71,6 +72,7 @@ EXPECTED_SEQUENCES = {
     "medications_id_seq": set(),
     "requests_id_seq": {"USAGE"},
     "messages_id_seq": {"USAGE"},
+    "call_sessions_id_seq": {"USAGE"},
 }
 # The trigger functions of audit_events run as triggers whoever may call them; nobody needs
 # EXECUTE, which Postgres gives everyone by default. Nor the catalog's large-object creators:
@@ -435,6 +437,7 @@ FIRST_COLUMN = {
     "verification_attempts": "success",
     "requests": "patient_id",
     "messages": "name",
+    "call_sessions": "patient_id",
     "alembic_version": "version_num",
 }
 

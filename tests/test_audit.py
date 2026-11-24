@@ -1380,6 +1380,8 @@ def test_only_registry_members_are_accepted() -> None:
         "admin_read_messages",
         "admin_read_audit",
         "admin_verify_audit",
+        "admin_read_calls",
+        "admin_read_call",
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
