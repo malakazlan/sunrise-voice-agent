@@ -1,0 +1,48 @@
+# Sarah asks for Metformin, which has no refills left: the request goes to the doctor, and the
+# refill is never called approved.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+  - caller: "three three four four"
+    expect:
+      said: [verified]
+  - caller: "Can I get a refill of my Metformin?"
+    model:
+      - call: request_refill
+        args: {medication_name: "Metformin", confirmed: false}
+      - say: "That's Metformin 500mg, to CVS Main St. Shall I send the request?"
+    expect:
+      tools:
+        - call: request_refill
+          args: {confirmed: false}
+          returns:
+            status: needs_confirmation
+            medication: "Metformin 500mg"
+            pharmacy: "CVS Main St"
+  - caller: "Yes, please."
+    model:
+      - call: request_refill
+        args: {medication_name: "Metformin", confirmed: true}
+      - say: >-
+          You have no refills left on Metformin, so I've sent the request to your doctor to
+          review.
+    expect:
+      tools:
+        - call: request_refill
+          args: {confirmed: true}
+          returns: {status: sent_to_doctor, medication: "Metformin 500mg"}
+expect:
+  said: [greeting, ssn_ask, verified]
+  phase: serving
+  verified: true
+  rows:
+    - table: requests
+      where: {type: refill, patient_id: P001, summary: "Metformin 500mg at CVS Main St"}
+      count: 1
+    - table: requests
+      count: 1
+  audit: [identity_claimed, identity_verified, refill_previewed, refill_requested]
+  never: ["approved"]

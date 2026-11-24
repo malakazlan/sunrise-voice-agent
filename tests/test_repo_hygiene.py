@@ -391,8 +391,11 @@ OWNER_NAMES = {
     "owner_database_url",
 }
 STARTUP_MODULES = {"app/db/migrations/env.py", "app/db/roles.py", "app/db/seed.py"}
-# The process check names the start-up settings to know which variables are the owner's.
-OWNER_ALLOWED = {"app/config.py", ENGINE_MODULE, PROCESS_CHECK, *STARTUP_MODULES}
+# The process check names the start-up settings to know which variables are the owner's. The
+# evals (not shipped in the image) make, set up, seed and drop a database for each run, as the
+# test suite does.
+EVAL_DATABASES = "evals/database.py"
+OWNER_ALLOWED = {"app/config.py", ENGINE_MODULE, PROCESS_CHECK, EVAL_DATABASES, *STARTUP_MODULES}
 
 
 def owner_engine_uses(source: str) -> list[str]:

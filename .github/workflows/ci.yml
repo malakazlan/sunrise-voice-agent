@@ -35,7 +35,7 @@ jobs:
         with:
           version: "0.10.4"
       - run: uv sync --locked
-      - run: uv run mypy --strict app tests scripts
+      - run: uv run mypy --strict app tests scripts evals
 
   test:
     runs-on: ubuntu-24.04

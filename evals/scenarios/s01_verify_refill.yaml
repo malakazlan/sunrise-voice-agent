@@ -1,0 +1,59 @@
+# Sarah Johnson is verified, asks for a Lisinopril refill, hears it read back and confirms it.
+# Her last four digits are said in a turn of their own, which the model never sees.
+now: "2026-11-24T10:00:00-05:00"  # Tuesday, 10 AM at the clinic
+turns:
+  - caller: "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
+    model:
+      - call: verify_identity
+        args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+    expect:
+      said: [ssn_ask]
+      reaches_model: true
+  - caller: "three three four four"
+    expect:
+      said: [verified]
+      reaches_model: false
+      phase: serving
+  - caller: "I need a refill of my Lisinopril."
+    model:
+      - call: request_refill
+        args: {medication_name: "Lisinopril", confirmed: false}
+      - say: "That's Lisinopril 10mg, to CVS Main St. Shall I send the request?"
+    expect:
+      tools:
+        - call: request_refill
+          args: {confirmed: false}
+          returns:
+            status: needs_confirmation
+            medication: "Lisinopril 10mg"
+            pharmacy: "CVS Main St"
+      said: []
+  - caller: "Yes, please send it."
+    model:
+      - call: request_refill
+        args: {medication_name: "Lisinopril", confirmed: true}
+      - say: "Done. Your refill request has been sent."
+    expect:
+      tools:
+        - call: request_refill
+          args: {confirmed: true}
+          returns: {status: requested, medication: "Lisinopril 10mg"}
+expect:
+  said: [greeting, ssn_ask, verified]
+  tools:
+    - call: verify_identity
+      args: {full_name: "Sarah Johnson", dob: "1985-03-14"}
+    - call: request_refill
+      args: {confirmed: false}
+    - call: request_refill
+      args: {confirmed: true}
+  phase: serving
+  verified: true
+  rows:
+    - table: requests
+      where: {type: refill, patient_id: P001, summary: "Lisinopril 10mg at CVS Main St"}
+      count: 1
+    - table: requests
+      count: 1
+  audit: [identity_claimed, identity_verified, refill_previewed, refill_requested]
+  never: ["three three four four"]
