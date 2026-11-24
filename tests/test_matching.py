@@ -20,10 +20,11 @@ MARIA_GARCIA = person("Maria", "Garcia")
 MICHAEL_BROWN = person("Michael", "Brown")
 JOHN_SMITH = person("John", "Smith")
 JOHN_SMITH_JR = person("John", "Smith Jr")
+ANN_LEE = person("Ann", "Lee")
 
-# Longer than the 200-character cap, and a strict match for Sarah Johnson without it.
-NAME_201 = "Sarah " + "m" * 187 + " Johnson"
-NAME_200 = "Sarah " + "m" * 186 + " Johnson"
+# Longer than the 200-character cap, and a match for Sarah Johnson without it.
+NAME_201 = "Sarah" + " " * 189 + "Johnson"
+NAME_200 = "Sarah" + " " * 188 + "Johnson"
 
 
 def wrong_picks(rows: list[tuple[str, Record]], expect_match: bool) -> list[str]:
@@ -34,161 +35,167 @@ def wrong_picks(rows: list[tuple[str, Record]], expect_match: bool) -> list[str]
     ]
 
 
-def test_strict_name_matches() -> None:
+def test_names_that_match() -> None:
+    o_connor = person("Ann", "O'Connor")
+    smith_jones = person("Mary", "Smith-Jones")
+    de_la_cruz = person("Maria", "De La Cruz")
+    mary_ann = person("Mary Ann", "Lee")
+    mcdonald = person("John", "McDonald")
     rows = [
         ("Sarah Johnson", SARAH_JOHNSON),
         ("sarah johnson", SARAH_JOHNSON),
         ("  Sarah   Johnson ", SARAH_JOHNSON),
         ("Sarah-Johnson.", SARAH_JOHNSON),
-        ("Sarah Marie Johnson", SARAH_JOHNSON),
         ("Dr Sarah Johnson", SARAH_JOHNSON),
         ("Sarah Johnson Jr", SARAH_JOHNSON),
         ("Mrs. Sarah Johnson", SARAH_JOHNSON),
         ("John Smith", JOHN_SMITH_JR),
         ("María García", MARIA_GARCIA),
-        ("Phillip Lee", person("Phillip", "Lee")),
-        ("Sean O'Brien", person("Sean", "O'Brien")),
-        ("Sean O’Brien", person("Sean", "O'Brien")),
-        ("Sean OBrien", person("Sean", "O'Brien")),
+        ("Ann O'Connor", o_connor),
+        ("Ann O’Connor", o_connor),
+        ("Ann OConnor", o_connor),
+        ("Ann O Connor", o_connor),
+        ("Mary Smith-Jones", smith_jones),
+        ("Mary Smith Jones", smith_jones),
+        ("Mary SmithJones", smith_jones),
+        ("Maria De La Cruz", de_la_cruz),
+        ("Maria Delacruz", de_la_cruz),
+        ("Mary Ann Lee", mary_ann),
+        ("Maryann Lee", mary_ann),
+        ("Mary-Ann Lee", mary_ann),
+        ("John Mc Donald", mcdonald),
+        ("John McDonald", mcdonald),
         (NAME_200, SARAH_JOHNSON),
     ]
 
     assert wrong_picks(rows, expect_match=True) == []
-    # Strict: the normalized pairs are equal.
-    unequal = [
-        claimed
-        for claimed, candidate in rows
-        if normalize_name(claimed)
-        != normalize_name(f"{candidate.first_name} {candidate.last_name}")
-    ]
-    assert unequal == []
-    assert normalize_name("Mrs. Sarah Johnson Jr") == ("sarah", "johnson")
-    assert normalize_name("Sean O’Brien") == ("sean", "obrien")
-
-
-def test_variant_name_matches() -> None:
-    rows = [
-        ("Sara Johnson", SARAH_JOHNSON),
-        ("Sarah Jonson", SARAH_JOHNSON),
-        ("Jon Smith", JOHN_SMITH),
-        ("Maria Garsia", MARIA_GARCIA),
-        ("John Smyth", JOHN_SMITH),
-        ("Bryan Carter", person("Brian", "Carter")),
-        ("Philip Lee", person("Phillip", "Lee")),
-        ("Katherine Brown", person("Catherine", "Brown")),
-        ("Maria Gonzales", person("Maria", "Gonzalez")),
-        # Pins rule 1 (ph to f): without it Sophia reduces to "sopia".
-        ("Sofia Garcia", person("Sophia", "Garcia")),
-    ]
-
-    assert wrong_picks(rows, expect_match=True) == []
-    # Variant, not strict: the normalized pairs differ.
-    equal = [
-        claimed
-        for claimed, candidate in rows
-        if normalize_name(claimed)
-        == normalize_name(f"{candidate.first_name} {candidate.last_name}")
-    ]
-    assert equal == []
 
 
 def test_names_that_must_not_match() -> None:
-    paul, eric, carl = person("Paul", "Smith"), person("Eric", "Smith"), person("Carl", "Smith")
-    daniel, louis = person("Daniel", "Smith"), person("Louis", "Smith")
-    francis, jane = person("Francis", "Smith"), person("Jane", "Smith")
-    dean, tom, kevin = person("Dean", "Smith"), person("Tom", "Smith"), person("Kevin", "Smith")
-    lee, joe, bo = person("Lee", "Smith"), person("Joe", "Smith"), person("Bo", "Smith")
-    raj, carter = person("Raj", "Patel"), person("James", "Carter")
-    martin, miller = person("Ann", "Martin"), person("Ann", "Miller")
-    ann_brown, wei = person("Ann", "Brown"), person("Wei", "Chen")
-    mei, min_kim = person("Mei", "Lin"), person("Min", "Kim")
-    ho, ann_lee, nguyen = person("Ann", "Ho"), person("Ann", "Lee"), person("Emily", "Nguyen")
-    j_smith = person("J", "Smith")
-    rows = [
-        ("Sandra Johnson", SARAH_JOHNSON),
-        ("Sarah Jackson", SARAH_JOHNSON),
-        ("Sarah Johnston", SARAH_JOHNSON),
-        ("Mary Johnson", SARAH_JOHNSON),
-        ("Johnson Sarah", SARAH_JOHNSON),
-        ("Sarah Johnsen", SARAH_JOHNSON),
-        ("Michelle Brown", MICHAEL_BROWN),
-        ("Micheal Brown", MICHAEL_BROWN),
-        ("Michael Browne", MICHAEL_BROWN),
-        ("Michael Braun", MICHAEL_BROWN),
-        ("Paula Smith", paul),
-        ("Erica Smith", eric),
-        ("Carla Smith", carl),
-        ("Carol Smith", carl),
-        ("Daniela Smith", daniel),
-        ("Danielle Smith", daniel),
-        ("Louise Smith", louis),
-        ("Lois Smith", louis),
-        ("Frances Smith", francis),
-        ("Joan Smith", JOHN_SMITH),
-        ("Jean Smith", JOHN_SMITH),
-        ("Juan Smith", JOHN_SMITH),
-        ("Jan Smith", JOHN_SMITH),
-        ("Jen Smith", JOHN_SMITH),
-        ("June Smith", jane),
-        ("Mario Garcia", MARIA_GARCIA),
-        ("Marie Garcia", MARIA_GARCIA),
-        ("Mary Garcia", MARIA_GARCIA),
-        ("Diane Smith", dean),
-        ("Dawn Smith", dean),
-        ("Don Smith", dean),
-        ("Dina Smith", dean),
-        ("Tim Smith", tom),
-        ("Tam Smith", tom),
-        ("Gavin Smith", kevin),
-        ("Leo Smith", lee),
-        ("Jay Smith", joe),
-        ("Joy Smith", joe),
-        ("Raj Patil", raj),
-        ("Maria Gracia", MARIA_GARCIA),
-        ("James Cartier", carter),
-        ("James Crater", carter),
-        ("James Carver", carter),
-        ("Ann Morton", martin),
-        ("Ann Mailer", miller),
-        ("Ann Brian", ann_brown),
-        ("Wei Chan", wei),
-        ("Wei Chin", wei),
-        ("Wei Chun", wei),
-        ("Mei Lan", mei),
-        ("Mei Len", mei),
-        ("Mei Lane", mei),
-        ("Min Kam", min_kim),
-        ("Min Kum", min_kim),
-        ("Ann Hu", ho),
-        ("Ann Loy", ann_lee),
-        ("Ann Low", ann_lee),
-        ("Ann Lau", ann_lee),
-        ("Ann Li", ann_lee),
-        ("Ann Leigh", ann_lee),
-        ("Emily Newton", nguyen),
-        ("Emily Wen", nguyen),
-        ("John Schmidt", JOHN_SMITH),
-        ("J Smith", joe),
-        ("B Smith", bo),
-        ("Jo Smith", j_smith),
+    sarah = [
+        "Sara Johnson",
+        "Sarah Jonson",
+        "Sarah Johnsen",
+        "Sandra Johnson",
+        "Sarah Jackson",
+        "Sarah Johnston",
+        "Mary Johnson",
+        "Johnson Sarah",
+        "Zara Johnson",
+        "Zahra Johnson",
+        "Sarah Marie Johnson",
+    ]
+    john = ["Jon Smith", "Joan Smith", "Jean Smith", "Juan Smith", "Jan Smith", "Jen Smith"]
+    john += ["Johan Smith", "John Smyth", "John Schmidt", "John Smit"]
+    michael = ["Michelle Brown", "Micheal Brown", "Michael Browne", "Michael Braun"]
+    maria = ["Maria Garsia", "Maria Gracia", "Mario Garcia", "Marie Garcia", "Mary Garcia"]
+    rows = [(claimed, SARAH_JOHNSON) for claimed in sarah]
+    rows += [(claimed, JOHN_SMITH) for claimed in john]
+    rows += [(claimed, MICHAEL_BROWN) for claimed in michael]
+    rows += [(claimed, MARIA_GARCIA) for claimed in maria]
+    rows += [
+        ("Maria Gonzales", person("Maria", "Gonzalez")),
+        ("Bryan Carter", person("Brian", "Carter")),
+        ("Philip Lee", person("Phillip", "Lee")),
+        ("Katherine Brown", person("Catherine", "Brown")),
+        ("Sofia Garcia", person("Sophia", "Garcia")),
+    ]
+    smith_first_names = [
+        ("Paula", "Paul"),
+        ("Erica", "Eric"),
+        ("Carla", "Carl"),
+        ("Carol", "Carl"),
+        ("Daniela", "Daniel"),
+        ("Danielle", "Daniel"),
+        ("Louise", "Louis"),
+        ("Lois", "Louis"),
+        ("Frances", "Francis"),
+        ("June", "Jane"),
+        ("Diane", "Dean"),
+        ("Dawn", "Dean"),
+        ("Don", "Dean"),
+        ("Dina", "Dean"),
+        ("Tim", "Tom"),
+        ("Tam", "Tom"),
+        ("Gavin", "Kevin"),
+        ("Leo", "Lee"),
+        ("Jay", "Joe"),
+        ("Joy", "Joe"),
+        ("Hanna", "Anna"),
+        ("Helen", "Ellen"),
+    ]
+    rows += [(f"{said} Smith", person(record, "Smith")) for said, record in smith_first_names]
+    rows += [
+        ("Raj Patil", person("Raj", "Patel")),
+        ("James Cartier", person("James", "Carter")),
+        ("James Crater", person("James", "Carter")),
+        ("James Carver", person("James", "Carter")),
+        ("Ann Morton", person("Ann", "Martin")),
+        ("Ann Mailer", person("Ann", "Miller")),
+        ("Ann Brian", person("Ann", "Brown")),
+        ("Wei Chan", person("Wei", "Chen")),
+        ("Wei Chin", person("Wei", "Chen")),
+        ("Wei Chun", person("Wei", "Chen")),
+        ("Wei Ken", person("Wei", "Chen")),
+        ("Mei Lan", person("Mei", "Lin")),
+        ("Mei Len", person("Mei", "Lin")),
+        ("Mei Lane", person("Mei", "Lin")),
+        ("Mei Linh", person("Mei", "Lin")),
+        ("Mei Lynn", person("Mei", "Lin")),
+        ("Min Kam", person("Min", "Kim")),
+        ("Min Kum", person("Min", "Kim")),
+        ("Minh Kim", person("Min", "Kim")),
+        ("Ann Hu", person("Ann", "Ho")),
+    ]
+    for said in ("Ann Le", "Ann Loy", "Ann Low", "Ann Lau", "Ann Li", "Ann Leigh"):
+        rows.append((said, ANN_LEE))
+    rows += [("Anh Lee", ANN_LEE), ("An Lee", ANN_LEE)]
+    ann_last_names = [
+        ("Zhu", "Su"),
+        ("Zhong", "Song"),
+        ("Zhang", "Sang"),
+        ("Khan", "Kan"),
+        ("Kahn", "Kan"),
+        ("Can", "Kan"),
+        ("Hahn", "Han"),
+        ("Hanh", "Han"),
+        ("Choo", "Cho"),
+        ("Koo", "Ko"),
+        ("Yoo", "Yo"),
+        ("Dhillon", "Dillon"),
+        ("Rahman", "Raman"),
+        ("Mehta", "Meta"),
+        ("Cao", "Kao"),
+        ("Cohen", "Koen"),
+    ]
+    rows += [(f"Ann {said}", person("Ann", record)) for said, record in ann_last_names]
+    lee_first_names = [("May", "Mai"), ("Kay", "Kai"), ("Ray", "Rai"), ("Rahul", "Raul")]
+    lee_first_names += [("Yan", "Ian")]
+    rows += [(f"{said} Lee", person(record, "Lee")) for said, record in lee_first_names]
+    rows += [
+        ("Emily Newton", person("Emily", "Nguyen")),
+        ("Emily Wen", person("Emily", "Nguyen")),
+        ("Maria Cruz", person("Maria", "De La Cruz")),
+        ("Juan De Leon", person("Juan", "Leon")),
+        ("Ann O Connor", person("Ann", "Connor")),
+        ("Ann OConnor", person("Ann", "Connor")),
+        ("John Mc Donald", person("John", "Donald")),
+        ("Ann Van Dyke", person("Ann", "Dyke")),
+        ("Jo Anderson", person("Joan", "Derson")),
+        ("Mary Jones", person("Mary", "Smith-Jones")),
+        ("J Smith", person("Joe", "Smith")),
+        ("B Smith", person("Bo", "Smith")),
+        ("Jo Smith", person("J", "Smith")),
         ("John Doe Jr", JOHN_SMITH_JR),
         ("John Jr", JOHN_SMITH_JR),
-        # ch, sh and th are kept as units: Chen is not Ken, Smith is not Smit.
-        ("Wei Ken", wei),
-        ("John Smit", JOHN_SMITH),
-        # A first-letter h is kept: Hanna is not Anna, Helen is not Ellen.
-        ("Hanna Smith", person("Anna", "Smith")),
-        ("Helen Smith", person("Ellen", "Smith")),
-        # Initials only ever match exactly, even where the rules would make them equal.
         ("C Smith", person("K", "Smith")),
         ("Z Smith", person("S", "Smith")),
         ("Y Smith", person("I", "Smith")),
+        ("Søren Johnson", person("S", "Johnson")),
     ]
-    for claimed in ("Sarah", "", "Dr", "Jr Jr", NAME_201):
-        rows += [
-            (claimed, candidate)
-            for candidate in (SARAH_JOHNSON, person("Sarah", "Sarah"), JOHN_SMITH_JR)
-        ]
+    any_record = [SARAH_JOHNSON, person("Sarah", "Sarah"), JOHN_SMITH_JR, person("S", "Johnson")]
+    for claimed in ("Sarah", "", "Dr", "Jr Jr", NAME_201, "Søren Johnson"):
+        rows += [(claimed, candidate) for candidate in any_record]
 
     assert wrong_picks(rows, expect_match=False) == []
 
@@ -196,55 +203,44 @@ def test_names_that_must_not_match() -> None:
 def test_no_candidates_means_no_match() -> None:
     assert pick_patient("Sarah Johnson", []) is None
     assert pick_patient("Sarah Johnson", ()) is None
-    assert pick_patient("Sara Johnson", iter([])) is None
+    assert pick_patient("Sarah Johnson", iter([])) is None
     # A name that is not among the candidates is not found anywhere else either.
     assert pick_patient("Sarah Johnson", [MARIA_GARCIA, MICHAEL_BROWN]) is None
 
 
 def test_ambiguous_candidates_return_nothing() -> None:
-    sara = person("Sara", "Johnson")
-    jonson = person("Sarah", "Jonson")
     duplicate = Record("p-sarah-2", "Sarah", "Johnson")
+    spaced = person("Sarah", "John Son")
 
-    assert pick_patient("Sarah Johnson", [sara, jonson]) is None
     assert pick_patient("Sarah Johnson", [SARAH_JOHNSON, duplicate]) is None
-    assert pick_patient("Sara Johnson", [SARAH_JOHNSON, duplicate]) is None
-    # Two strict matches are not resolved by falling through to the one other variant match.
-    assert pick_patient("Sarah Johnson", [SARAH_JOHNSON, duplicate, sara]) is None
+    assert pick_patient("Sarah Johnson", [SARAH_JOHNSON, spaced]) is None
     assert pick_patient("Sarah", [person("Sarah", "Sarah")]) is None
 
 
 def test_strict_match_preferred() -> None:
     sara = person("Sara", "Johnson")
+    jonson = person("Sarah", "Jonson")
 
-    assert pick_patient("Sarah Johnson", [SARAH_JOHNSON, sara]) is SARAH_JOHNSON
-    assert pick_patient("Sarah Johnson", [sara, SARAH_JOHNSON]) is SARAH_JOHNSON
-    assert pick_patient("Sara Johnson", [SARAH_JOHNSON, sara]) is sara
+    # One matching among three is that one.
+    assert pick_patient("Sarah Johnson", [sara, SARAH_JOHNSON, jonson]) is SARAH_JOHNSON
+    assert pick_patient("Sara Johnson", [SARAH_JOHNSON, jonson, sara]) is sara
+    assert pick_patient("Sarah Jonson", [jonson, sara, SARAH_JOHNSON]) is jonson
 
 
-def test_name_key_is_the_variant_form() -> None:
-    assert name_key("Sarah Johnson") == "sara jonson"
-    assert name_key("Sara Johnson") == "sara jonson"
-    assert name_key("Dr Sarah Marie Johnson Jr") == "sara jonson"
-    assert name_key("Phillip Lee") == "filip le"
-    assert name_key("Katherine Brown") == "katherine brown"
-    assert name_key("Catherine Brown") == "katherine brown"
-    assert name_key("Maria Gonzalez") == "maria gonsales"
-    assert name_key("John Smyth") == "jon smith"
-    assert name_key("Sarah Johnsen") != name_key("Sarah Johnson")
-    assert name_key("Paula Smith") != name_key("Paul Smith")
-    assert name_key("Johnson Sarah") != name_key("Sarah Johnson")
-    for not_a_name in ("Sarah", "", "Dr", "Jr Jr", NAME_201):
+def test_name_key_is_the_normalized_name() -> None:
+    assert name_key("Sarah Johnson") == "sarah johnson"
+    assert name_key("Dr Sarah Marie Johnson Jr") == "sarah marie johnson"
+    assert name_key("  Mrs. María   O’Connor-Smith ") == "maria oconnor smith"
+    assert name_key("Sarah") == "sarah"
+    assert name_key("Sara Johnson") != name_key("Sarah Johnson")
+    for not_a_name in ("", "   ", "Dr", "Jr Jr", NAME_201):
         assert name_key(not_a_name) is None, not_a_name
 
 
-def test_hyphenated_last_names_use_the_last_token() -> None:
-    smith_jones = person("Mary", "Smith-Jones")
-
-    assert normalize_name("Mary Smith-Jones") == ("mary", "jones")
-    assert pick_patient("Mary Smith Jones", [smith_jones]) is smith_jones
-    assert pick_patient("Mary Jones", [smith_jones]) is smith_jones
-    assert pick_patient("Mary Smith", [smith_jones]) is None
+def test_normalize_name_gives_every_token() -> None:
+    assert normalize_name("Mrs. Mary-Ann  O'Connor Jr") == ("mary", "ann", "oconnor")
+    assert normalize_name("Sarah") == ("sarah",)
+    assert normalize_name("Dr Jr") is None
 
 
 def test_non_latin_and_empty_input_never_match() -> None:
@@ -319,12 +315,78 @@ def test_strength_and_form_words_are_ignored() -> None:
         ("Metformin 500 mg tablet", ["Metformin 500mg"], "Metformin 500mg"),
         ("levothyroxine 50 mcg tablets", ["Levothyroxine 50mcg"], "Levothyroxine 50mcg"),
         ("atorvastatin", ["Atorvastatin 20 mg tablet"], "Atorvastatin 20 mg tablet"),
-        ("metformin 2.5mg capsule", ["Metformin 500mg"], "Metformin 500mg"),
         ("insulin 10 units injection", ["Insulin"], "Insulin"),
-        ("hydrocortisone cream", ["Hydrocortisone 1% cream"], "Hydrocortisone 1% cream"),
-        ("timolol drops", ["Timolol 0.5% solution"], "Timolol 0.5% solution"),
+        ("vitamin d", ["Vitamin D 2000 IU"], "Vitamin D 2000 IU"),
+        # The strength is dropped before a letter and a number merge.
+        ("vitamin c", ["Vitamin C 500 mg"], "Vitamin C 500 mg"),
         ("10 mg", LISINOPRIL_AND_METFORMIN, None),
         ("tablet", LISINOPRIL_AND_METFORMIN, None),
+    ]
+
+    assert wrong_medications(rows) == []
+
+
+def test_numbers_without_a_unit_are_kept() -> None:
+    # Splitting on "." and "%" leaves a bare number that no unit follows.
+    rows: list[tuple[str, list[str], str | None]] = [
+        ("metformin 2.5mg capsule", ["Metformin 500mg"], None),
+        ("hydrocortisone cream", ["Hydrocortisone 1% cream"], None),
+        ("timolol drops", ["Timolol 0.5% solution"], None),
+        ("clonazepam", ["Clonazepam 0.5mg"], None),
+    ]
+
+    assert wrong_medications(rows) == []
+
+
+def test_medications_with_numbers_that_match() -> None:
+    b12 = ["Vitamin B-12 1000mcg"]
+    vitamin_d = ["Vitamin D-3 2000 IU", "Vitamin D 50mcg"]
+    humulin = ["Humulin 70/30", "Humulin N"]
+    rows: list[tuple[str, list[str], str | None]] = [
+        ("vitamin b12", b12, "Vitamin B-12 1000mcg"),
+        ("vitamin b 12", b12, "Vitamin B-12 1000mcg"),
+        ("vitamin b-12", b12, "Vitamin B-12 1000mcg"),
+        ("vitamin d3", vitamin_d, "Vitamin D-3 2000 IU"),
+        ("vitamin d 3", vitamin_d, "Vitamin D-3 2000 IU"),
+        ("vitamin d", vitamin_d, "Vitamin D 50mcg"),
+        ("humulin 70/30", humulin, "Humulin 70/30"),
+        # A ratio spoken as two numbers is two tokens, so it is not 7030.
+        ("humulin 70 30", humulin, None),
+        ("humulin r u-500", ["Humulin R U-500"], "Humulin R U-500"),
+        ("humulin r u 500", ["Humulin R U-500"], "Humulin R U-500"),
+        ("omega-3", ["Omega-3"], "Omega-3"),
+    ]
+
+    assert wrong_medications(rows) == []
+
+
+def test_medications_with_numbers_that_must_not_match() -> None:
+    three = ["Seroquel 25mg", "Lamictal 100mg", "Depakote 250mg"]
+    rows: list[tuple[str, list[str], str | None]] = [
+        ("humulin r u 100", ["Humulin R U-500"], None),
+        ("humulin r u-100", ["Humulin R U-500"], None),
+        ("humulin r", ["Humulin R U-500"], None),
+        ("humulin r", ["Humulin 70/30"], None),
+        ("humulin n", ["Humulin 70/30"], None),
+        ("humulin", ["Humulin 70/30"], None),
+        ("novolin r", ["Novolin 70/30"], None),
+        ("seroquel x", three, None),
+        ("lamictal x", three, None),
+        ("depakote r", three, None),
+        ("humalog mix 50/50", ["Humalog Mix 75/25"], None),
+        ("vitamin b 6", ["Vitamin B-12 1000mcg"], None),
+        ("vitamin b-1", ["Vitamin B-12 1000mcg"], None),
+        ("vitamin b", ["Vitamin B-12 1000mcg"], None),
+        ("vitamin d", ["Vitamin D-3 2000 IU"], None),
+        ("vitamin d 3", ["Vitamin D 50mcg"], None),
+        ("vitamin d3", ["Vitamin D 50mcg"], None),
+        ("omega 6", ["Omega-3"], None),
+        ("omega", ["Omega-3"], None),
+        ("lisinopril 20", ["Lisinopril 10mg"], None),
+        # Joining needs every spoken word to have three letters or more ...
+        ("lo vastatin", ["Lovastatin 20mg"], None),
+        # ... and none with a digit.
+        ("omega 369", ["Omega-3-6-9"], None),
     ]
 
     assert wrong_medications(rows) == []

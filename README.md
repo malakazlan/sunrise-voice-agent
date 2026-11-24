@@ -24,20 +24,25 @@ All data used by this project is synthetic. No real customer or personal data is
   - `office_hours.is_open`: Monday to Friday, 09:00 up to but not including 17:00, clinic
     time; `office_hours.clinic_now` gives the current or simulated time, in clinic time.
   - `matching.pick_patient`: which of the records already matched on date of birth and SSN
-    last four the claimed name belongs to. A name is its first and last word, ignoring case,
-    accents, punctuation, titles (`Dr`, `Mr`, `Mrs`, `Ms`, `Miss`) and suffixes (`Jr`, `Sr`,
-    `II`, `III`, `IV`). One exact match wins; otherwise one match with the same
-    spelling-variant form (for example Sarah and Sara, Garcia and Garsia, Smith and Smyth);
-    two at the same level is no match. An initial only ever matches exactly.
-    `matching.name_key` is that spelling-variant form of a claimed name.
+    last four the claimed name belongs to. Names are matched exactly, ignoring case, accents,
+    spacing, hyphens, apostrophes, titles (`Dr`, `Mr`, `Mrs`, `Ms`, `Miss`) and suffixes
+    (`Jr`, `Sr`, `II`, `III`, `IV`): `Mary Ann Lee`, `Maryann Lee` and `Mary-Ann Lee` are
+    the record Mary Ann / Lee. Any other difference, a middle name included, is a different
+    name; there is no sound-alike or spelling-variant matching. Zero or two matching records
+    is no match. `matching.name_key` is the normalized name, its words joined by spaces.
   - `matching.match_medication`: which of the caller's own medications a spoken name means.
-    It ignores case, numbers, units (`mg`, `mcg`, `g`, `ml`, `milligram(s)`, `microgram(s)`,
-    `gram(s)`, `unit(s)`, `iu`) and form words (`tablet(s)`, `tab(s)`, `capsule(s)`,
-    `cap(s)`, `pill(s)`, `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`,
-    `drops`, `spray`). The remaining words must match one for one, in order; a word of only
-    letters, seven or more of them, may differ by one letter added, dropped, changed or
-    swapped with its neighbour, never the first letter. A spoken name split in two
-    (`met formin`) is joined when the listed name is one word. Zero or two matches is no
+    It ignores case; form words (`tablet(s)`, `tab(s)`, `capsule(s)`, `cap(s)`, `pill(s)`,
+    `inhaler`, `cream`, `ointment`, `solution`, `injection`, `patch`, `drops`, `spray`);
+    unit words (`mg`, `mcg`, `g`, `ml`, `milligram(s)`, `microgram(s)`, `gram(s)`,
+    `unit(s)`, `iu`); and a number only when it is a strength, with a unit attached (`10mg`)
+    or right before a unit word (`10 mg`, `2000 IU`). Every other number is kept and must
+    match: `Humulin R U-500`, `Humulin 70/30` and `Vitamin B-12` keep theirs. A hyphen or
+    slash next to a digit joins (`B-12` is `b12`, `70/30` is `7030`), and a single letter
+    followed by a number is one word (`b 12` is `b12`). The remaining words must match one
+    for one, in order; a word of only letters, seven or more of them, may differ by one
+    letter added, dropped, changed or swapped with its neighbour, never the first letter. A
+    spoken name split in two (`met formin`) is joined when the listed name is one word and
+    every spoken word has at least three letters and no digit. Zero or two matches is no
     match. Filler words (`my albuterol`) are not removed.
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
