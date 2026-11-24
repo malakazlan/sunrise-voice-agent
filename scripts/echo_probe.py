@@ -6,6 +6,10 @@ call's audio, or a recording, fails. A call that ends before the requested lengt
 
     uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2 [--relay]
 
+With --hoard N it first opens N relay-only connections on one credential, as a greedy client
+would, and holds them while the calls run; --expect-hoarded M fails the run unless exactly M of
+them got a relay (coturn's per-credential quota).
+
 The access token is read from the PROBE_TOKEN environment variable. Exit code 0 means
 every call heard its own tone back.
 """
@@ -163,23 +167,81 @@ async def one_call(
     return ok
 
 
+async def hoard_relays(url: str, token: str | None, count: int) -> list[RTCPeerConnection]:
+    """Open `count` relay-only peer connections on one credential, as a greedy client would.
+
+    Each one asks coturn for an allocation while gathering; the ones refused by coturn's
+    per-user quota end up with no relay candidate.
+    """
+    ice = await asyncio.to_thread(http, "GET", f"{url}/ice-servers", token)
+    servers = [
+        RTCIceServer(urls=s["urls"], username=s.get("username"), credential=s.get("credential"))
+        for s in ice["iceServers"]
+    ]
+    connections = [
+        RTCPeerConnection(
+            RTCConfiguration(iceServers=servers, iceTransportPolicy=RTCIceTransportPolicy.RELAY)
+        )
+        for _ in range(count)
+    ]
+
+    async def gather(pc: RTCPeerConnection) -> None:
+        pc.addTransceiver("audio", direction="sendrecv")
+        await pc.setLocalDescription(await pc.createOffer())
+
+    await asyncio.gather(*(gather(pc) for pc in connections), return_exceptions=True)
+    return connections
+
+
+def relay_count(connections: list[RTCPeerConnection]) -> int:
+    return sum(
+        1
+        for pc in connections
+        if pc.localDescription is not None
+        and candidate_types(pc.localDescription.sdp).get("relay", 0) > 0
+    )
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--calls", type=int, default=1, choices=range(1, MAX_CALLS + 1))
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--relay", action="store_true", help="use TURN relay candidates only")
+    parser.add_argument(
+        "--hoard",
+        type=int,
+        default=0,
+        help="first open this many relay-only connections on one credential and hold them",
+    )
+    parser.add_argument(
+        "--expect-hoarded",
+        type=int,
+        default=None,
+        help="fail unless exactly this many of the hoarding connections got a relay",
+    )
     args = parser.parse_args()
+    url = args.url.rstrip("/")
     token = os.environ.get("PROBE_TOKEN")
 
-    results = await asyncio.gather(
-        *(
-            one_call(args.url.rstrip("/"), token, tone, args.relay, args.seconds)
-            for tone in random.SystemRandom().sample(TONES_HZ, args.calls)
+    hoarded: list[RTCPeerConnection] = []
+    try:
+        hoard_ok = True
+        if args.hoard:
+            hoarded = await hoard_relays(url, token, args.hoard)
+            relays = relay_count(hoarded)
+            print(f"hoarded relays: {relays} of {args.hoard} connections on one credential")
+            hoard_ok = args.expect_hoarded is None or relays == args.expect_hoarded
+        results = await asyncio.gather(
+            *(
+                one_call(url, token, tone, args.relay, args.seconds)
+                for tone in random.SystemRandom().sample(TONES_HZ, args.calls)
+            )
         )
-    )
+    finally:
+        await asyncio.gather(*(pc.close() for pc in hoarded))
     print(f"{sum(results)}/{len(results)} calls heard their own tone back")
-    return 0 if all(results) else 1
+    return 0 if all(results) and hoard_ok else 1
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ services:
       context: coturn
     # Host networking, as the coturn image recommends: relayed addresses are the server's own
     # and relay-to-relay traffic stays on the host. Open 3478/udp, 3478/tcp and
-    # 49160-49200/udp in the server firewall.
+    # 49160-49359/udp in the server firewall.
     network_mode: host
     restart: unless-stopped
     environment:

@@ -236,18 +236,57 @@ jobs:
           docker exec "$coturn" grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
             > "$RUNNER_TEMP/coturn-settings"
           cat "$RUNNER_TEMP/coturn-settings"
-          for line in realm=127.0.0.1 user-quota=9 total-quota=9 max-bps=64000 \
-            bps-capacity=576000 use-auth-secret no-tls no-tcp-relay no-multicast-peers \
-            min-port=49160 max-port=49200 log-file=/dev/null \
+          for line in realm=127.0.0.1 user-quota=4 total-quota=27 max-bps=64000 \
+            bps-capacity=1728000 max-allocate-lifetime=120 use-auth-secret no-tls \
+            no-tcp-relay no-multicast-peers min-port=49160 max-port=49359 log-file=/dev/null \
             denied-peer-ip=0.0.0.0-0.255.255.255 denied-peer-ip=10.0.0.0-10.255.255.255 \
             denied-peer-ip=100.64.0.0-100.127.255.255 denied-peer-ip=127.0.0.0-127.255.255.255 \
             denied-peer-ip=169.254.0.0-169.254.255.255 denied-peer-ip=172.16.0.0-172.31.255.255 \
-            denied-peer-ip=192.168.0.0-192.168.255.255 denied-peer-ip=:: denied-peer-ip=::1 \
+            denied-peer-ip=192.168.0.0-192.168.255.255 denied-peer-ip=::1 \
             denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff \
             denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff; do
             grep -qxF "$line" "$RUNNER_TEMP/coturn-settings" || { echo "missing: $line"; exit 1; }
           done
           echo "coturn settings checked"
+      - name: coturn's entrypoint accepts and refuses the same values as the app
+        run: |
+          # A stub turnserver shows what the entrypoint would start coturn with; the app side
+          # of the same table (deploy/coturn/validation-cases.json) is a pytest test.
+          coturn=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q coturn)
+          image=$(docker inspect --format '{{.Config.Image}}' "$coturn")
+          python3 scripts/check_coturn_entrypoint.py --image "$image"
+      - name: Forced-relay echo through coturn, and the per-credential relay quota
+        run: |
+          # Only networking differs from the stack above: app and coturn join a network whose
+          # addresses coturn does not deny, so no peer is allowed and every deny rule applies.
+          echo "--- override used only by this step"
+          cat deploy/docker-compose.relay-test.yml
+          export TURN_HOST=203.0.113.10
+          relay() { docker compose --env-file .env -f deploy/docker-compose.yml \
+            -f deploy/docker-compose.relay-test.yml "$@"; }
+          relay up -d --build
+          status=000
+          for _ in $(seq 1 60); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
+            [ "$status" = "200" ] && break
+            sleep 1
+          done
+          test "$status" = "200"
+          coturn=$(relay ps -q coturn)
+          docker exec "$coturn" grep -v -e '^static-auth-secret=' -e '^#' /tmp/turnserver.conf \
+            > "$RUNNER_TEMP/relay-settings"
+          echo "--- coturn settings here against the committed run (only the realm may differ)"
+          diff "$RUNNER_TEMP/coturn-settings" "$RUNNER_TEMP/relay-settings" || true
+          diff <(grep -v '^realm=' "$RUNNER_TEMP/coturn-settings") \
+            <(grep -v '^realm=' "$RUNNER_TEMP/relay-settings")
+          token=$(sed -n 's/^DEMO_ACCESS_TOKEN=//p' .env)
+          probe() { docker run --rm --network sunrise-voice-agent_relay-test \
+            -e PROBE_TOKEN="$token" -v "$PWD/scripts:/probe:ro" --entrypoint python \
+            sunrise-voice-agent:ci -I /probe/echo_probe.py --url http://app:8000 "$@"; }
+          echo "--- three calls, relay candidates only"
+          probe --calls 3 --relay
+          echo "--- one credential tries twelve relays; another caller still gets one"
+          probe --hoard 12 --expect-hoarded 4 --calls 1 --relay
       - name: Postgres logs no ERROR or WARNING lines, details or failing statements
         run: |
           show() {
