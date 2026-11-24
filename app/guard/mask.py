@@ -149,3 +149,17 @@ def mask(text: str) -> str:
     """The text with every identifier masked, line by line. A line longer than MAX_LENGTH is
     cut to that length, the marker included, before matching. mask(mask(text)) == mask(text)."""
     return "\n".join(_mask_line(line) for line in text.split("\n"))
+
+
+_SSN_KINDS = frozenset({"ssn", "cue"})
+
+
+def _replace_ssn(match: re.Match[str]) -> str:
+    return _replace(match) if match.lastgroup in _SSN_KINDS else match[0]
+
+
+def mask_ssns(text: str) -> str:
+    """The text with SSNs masked as `mask` masks them (a grouped or nine-digit number, digits
+    after a cue), line by line; every other identifier is kept as it is. For text that is
+    stored for people to read, such as a caller's message. Not cut."""
+    return "\n".join(_IDENTIFIER.sub(_replace_ssn, line) for line in text.split("\n"))

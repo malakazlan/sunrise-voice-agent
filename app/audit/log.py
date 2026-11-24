@@ -108,6 +108,11 @@ class Action(StrEnum):
     TOOL_CALLED = "tool_called"
     TOOL_REFUSED = "tool_refused"
     TOOL_FAILED = "tool_failed"
+    APPOINTMENT_READ = "appointment_read"
+    REFILL_REQUESTED = "refill_requested"
+    LAB_STATUS_READ = "lab_status_read"
+    BALANCE_READ = "balance_read"
+    DOCTOR_MESSAGE_SENT = "doctor_message_sent"
 
 
 class ResourceType(StrEnum):

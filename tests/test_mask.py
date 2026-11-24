@@ -5,7 +5,7 @@ import sys
 
 from conftest import REPO_ROOT
 
-from app.guard.mask import mask
+from app.guard.mask import mask, mask_ssns
 
 # Identifier samples are assembled from short pieces, so that no tracked file holds one.
 SSN_PARTS = ("123", "45", "6789")
@@ -190,6 +190,27 @@ def test_mask_table() -> None:
 
 def test_mask_leaves_other_text_alone() -> None:
     assert [text for text in LEFT_ALONE if mask(text) != text] == []
+
+
+def test_mask_ssns_masks_only_ssns() -> None:
+    rows = [
+        (SSN, "***-**-****"),
+        (SSN_PLAIN, "***-**-****"),
+        (f"call about {SSN} today", "call about ***-**-**** today"),
+        (f"my ssn last four is {LAST_FOUR}", "my ssn last four is ****"),
+        (f"social {LAST_FOUR}\nnext line {SSN}", "social ****\nnext line ***-**-****"),
+        # Phone numbers, dates and email addresses are left as they are.
+        (f"call {PHONE} after 1985-03-14", f"call {PHONE} after 1985-03-14"),
+        ("write to sarah.j@example.com", "write to sarah.j@example.com"),
+        (f"{PHONE} or {SSN}", f"{PHONE} or ***-**-****"),
+    ]
+    assert [
+        (given, mask_ssns(given)) for given, expected in rows if mask_ssns(given) != expected
+    ] == []
+    assert [text for text in LEFT_ALONE if mask_ssns(text) != text] == []
+    assert [
+        text[:80] for text in every_sample() if mask_ssns(mask_ssns(text)) != mask_ssns(text)
+    ] == []
 
 
 def fuzzed(count: int) -> list[str]:

@@ -10,7 +10,8 @@ All data used by this project is synthetic. No real customer or personal data is
 - Configuration through environment variables or an optional `.env` file, validated at startup.
 - Interactive API docs (`/docs`, `/redoc`, `/openapi.json`) are served only when `APP_ENV=dev`.
 - A Postgres database with four clinic tables (`patients`, `medications`, `appointments`,
-  `available_slots`) and the audit log (`audit_events`), created by Alembic migrations.
+  `available_slots`), what callers ask for (`requests`, `messages`) and the audit log
+  (`audit_events`), created by Alembic migrations.
 - A seed (`python -m app.db.seed`) that loads the synthetic patients and slots from
   `app/db/seed_data.json`, so running it again is safe:
   - A patient that is missing is inserted together with that patient's medications and
@@ -144,8 +145,9 @@ All data used by this project is synthetic. No real customer or personal data is
     A verifier in any other form is refused before it is sent.
   - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`,
     `UPDATE` on `patients` and `appointments`; `SELECT` on `medications`; `SELECT`, `UPDATE`
-    on `available_slots`; `SELECT`, `INSERT` on `audit_events`; nothing on `alembic_version`;
-    `USAGE` on the appointment id sequence only; no `EXECUTE` on the trigger functions (a
+    on `available_slots`; `SELECT`, `INSERT` on `audit_events`, `requests` and `messages`;
+    nothing on `alembic_version`; `USAGE` on the appointment, request and message id
+    sequences only; no `EXECUTE` on the trigger functions (a
     trigger runs its function whoever may call it) or on the functions that create large
     objects; `USAGE` on the schema; `CONNECT` on the application's database and nothing on any
     other database of the server. No table allows it `DELETE` or `TRUNCATE`. It cannot create
@@ -275,7 +277,8 @@ A generated slot never replaces an existing slot at the same doctor and time.
 
 ### Call state and the tool gate
 
-No real tool is registered yet; later slices add the tools and wire them to the model.
+The serving tools (below) are the tools registered so far; nothing wires dispatch to the model
+yet.
 
 - `app/agent/state.py`: a call's state (`CallState`, immutable) and its phases: `greeting`,
   `intake`, `serving`, `booking`, `emergency`, `handoff`, `closing`, `ended`. A call starts
@@ -347,6 +350,53 @@ No real tool is registered yet; later slices add the tools and wire them to the 
 - Limit: a handler that runs a raw `COMMIT` statement has committed its work before dispatch
   regains control, and dispatch cannot undo it. The call fails and no success event is
   written, but the committed rows stay; the scan keeps such SQL text out of `app/`.
+
+### Serving tools
+
+Five tools for a verified caller, in `app/agent/serving.py`, registered by `register_tools()`.
+Each is a patient-data tool offered only in `serving`, with the office open, and acts only on
+the state's patient id; none takes a patient identifier. Dispatch audits every call with the
+tool's own action (`appointment_read`, `refill_requested`, `lab_status_read`, `balance_read`,
+`doctor_message_sent`), resource type `patient` and the caller's patient id. No medication
+name, message text, balance or status reaches the audit log or the logs.
+
+- `get_next_appointment`: the caller's earliest `scheduled` appointment at or after now, as
+  `Thursday, December 3 at 10:30 AM with Dr. Patel` in clinic time, or none.
+- `request_refill(medication_name, confirmed)`: the name is matched with `match_medication`
+  against the caller's own medications only. No match, or more than one: `not_found` and
+  nothing else, no list. A match without `confirmed: true`: `needs_confirmation` with the
+  medication and pharmacy to read back. Confirmed: a `requests` row (type `refill`, summary
+  `<medication> at <pharmacy>`, built by code and cut to its first 200 characters) and `requested`, or `sent_to_doctor` when no
+  refills are left, with the medication and pharmacy. The refill count is never returned.
+- `get_lab_status`: the stored status text only; the clinic stores no results.
+- `get_balance`: the balance as an exact two-decimal string (`45.00`).
+- `send_message_to_doctor(summary_short, confirmed)`: 1 to 120 characters after trimming, with
+  no control character (C0, NUL included, or DEL) inside; anything else is refused without
+  echoing it. Without `confirmed: true`:
+  `needs_confirmation` with the text as it will be stored. Confirmed: a `messages` row (kind
+  `doctor_message`), a `requests` row (type `doctor_message`, the same text) and the message's
+  id.
+- Only a JSON `true` confirms; `"true"`, `"yes"` or `1` is refused.
+- A call asks for the same thing once. The same refill again in one call (the same medication,
+  however it is said) or the same message again returns what the first did and writes nothing:
+  the database's unique constraints decide (`requests` on call, type and summary; `messages` on
+  call, kind and body). A later call is a new request.
+- A failure part-way (a database error, or the audit event not written) leaves nothing
+  written, gives the model the generic failure and counts toward a hand-off.
+- Limits:
+  - Message text is the caller's, as the model wrote it down, and is stored as given except
+    that SSNs are masked as the logs mask them: a grouped or nine-digit number, and the digits
+    after a cue such as `ssn`, `last four` or `ending in`. Phone numbers, dates, names and
+    anything else in it are stored unmasked. The cue rule also masks an innocent number after
+    such words (`ends in 2 days`). An SSN said as number words without a cue (`one two three
+    four five six seven eight nine`) is not masked.
+  - "Now", for the next appointment, is when the call started (the clock reading office hours
+    are decided from), not the moment of the question: an appointment that starts during the
+    call is still told as next.
+  - The audit action names the tool, not what came of it: a `request_refill` that ends in
+    `needs_confirmation` or `not_found` is still recorded as `refill_requested`. The request
+    row is the record of what was asked for.
+  - A message id is a row number, so it tells roughly how many messages the clinic has.
 
 ## Configuration
 

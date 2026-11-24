@@ -14,7 +14,15 @@ from app.db.models import Base
 from app.db.session import create_owner_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TABLES = {"patients", "medications", "appointments", "available_slots", "audit_events"}
+TABLES = {
+    "patients",
+    "medications",
+    "appointments",
+    "available_slots",
+    "audit_events",
+    "requests",
+    "messages",
+}
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -125,16 +133,21 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 25
+    assert len(migrated_constraints) == 35
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
         "ck_audit_events_actor",
         "CHECK ((actor ~ '^[A-Za-z0-9_:.-]{1,64}$'::text))",
     ) in migrated_constraints
+    # A call asks for the same thing once, and leaves the same message once.
+    assert {
+        ("requests", "uq_requests_call_id_type_summary", "UNIQUE (call_id, type, summary)"),
+        ("messages", "uq_messages_call_id_kind_body", "UNIQUE (call_id, kind, body)"),
+    } <= migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 45
+    assert len(migrated_columns) == 59
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
     # seq has no default: the app assigns it under the lock, never a sequence.
