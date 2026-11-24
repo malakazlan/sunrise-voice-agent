@@ -147,9 +147,7 @@ All data used by this project is synthetic. No real customer or personal data is
     objects; `USAGE` on the schema; `CONNECT` on the application's database and nothing on any
     other database of the server. No table allows it `DELETE` or `TRUNCATE`. It cannot create
     a table, function, trigger, role or schema in the application's database, nor a temporary
-    table or function there, and it cannot connect to any database that existed at set-up time;
-    a database created after that gives everyone `CONNECT` and `TEMPORARY` by default until the
-    next start-up takes them away.
+    table or function there, and it cannot connect to any database that existed at set-up time.
   - Anything else it holds is taken away: grants the owner made it in this database and on
     databases, membership in other roles, settings attached to the role, parameter privileges,
     and what it can make itself own and Postgres cannot forbid: default privileges, and large
@@ -159,10 +157,21 @@ All data used by this project is synthetic. No real customer or personal data is
   - Then set-up compares what the role can effectively do (through its own grants, `PUBLIC`'s
     and any role it belongs to) and what it is (attributes, memberships, settings, what it
     owns) with the declaration, and stops the start on any difference, listed by kind and
-    name. A grant another role made with a grant option, which the owner cannot revoke, stops
-    it that way; so does a table no declaration covers. If the role owns anything else, such
-    as a table, function or schema, set-up stops and names the kind rather than drop it with
-    its contents.
+    name. It reads every privilege list Postgres keeps, system objects included: relations
+    and their columns, functions, schemas, types, languages, foreign-data wrappers and
+    servers, large objects, tablespaces, parameters, databases and default privileges. Any
+    entry there naming the runtime role must be one the declaration makes; `PUBLIC`'s entries
+    on everything the declaration does not manage must be exactly those Postgres installed
+    (`pg_init_privs`, and for `information_schema`, which initdb does not record there,
+    `USAGE` on the schema and `SELECT` on its relations but seven); no role may belong to the
+    runtime role, nor it to any. A grant another role made with a grant option, which the owner
+    cannot revoke, stops it that way; so does a table no declaration covers. If the role owns
+    anything else, such as a table, function or schema, set-up stops and names the kind rather
+    than drop it with its contents.
+  - Every session the start-up steps open (migrations, role set-up, seed) waits at most 30
+    seconds for any one lock and runs no statement longer than 5 minutes; the steps take about
+    one to two seconds each. A step that hits either limit stops the start with a message saying
+    what it waited for. No session of another role is ended.
   - The audit triggers' functions run with a pinned search path and name their table with its
     schema, so nothing created later can stand in for what they use.
   - What remains:
@@ -183,9 +192,17 @@ All data used by this project is synthetic. No real customer or personal data is
       session ends.
     - The role can end its own sessions (`pg_terminate_backend` on a backend of the same role).
     - A rotated password does not end sessions opened with the old one.
-    - Grants on databases belong to the whole server, and `DROP OWNED` takes them away
-      everywhere; set-up also takes `PUBLIC`'s privileges away on every other database. Use one
-      runtime role name, and one application database, per server.
+    - A hostile session of the runtime role can make start-up fail, by holding the role
+      set-up's advisory lock or a lock on a table it may write, until that session ends.
+      Restarting the database ends it.
+    - Use a dedicated database server. Do not point `POSTGRES_*` at a server that hosts other
+      applications: set-up takes `PUBLIC`'s privileges away on every other database on that
+      server, which locks those applications out, and `DROP OWNED` takes grants on databases
+      away server-wide. The Compose `db` service is such a dedicated server.
+    - Do not create other databases on this server. A database created after a start-up gives
+      everyone `CONNECT` and `TEMPORARY` by default, so the runtime role can connect to it and
+      create objects there before the next start-up; that start-up then refuses to run until
+      those objects are removed by hand.
 
 ### Voice echo call
 

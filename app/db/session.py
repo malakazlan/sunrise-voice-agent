@@ -5,6 +5,7 @@ from typing import Any
 
 from psycopg import Error as DriverError
 from psycopg import sql
+from psycopg.errors import LockNotAvailable, QueryCanceled
 from psycopg.pq import DiagnosticField, TransactionStatus
 from pydantic import SecretStr
 from sqlalchemy import URL, Connection, Engine, create_engine, event
@@ -137,20 +138,54 @@ def _withhold_driver_error(
 IDLE_IN_TRANSACTION_TIMEOUT_MS = 30_000
 
 
-def _connect_args() -> dict[str, Any]:
+# Every session of the start-up steps (the owner's engines) waits at most this long for any
+# one lock, and runs no statement longer than this, so a session of another role holding a lock
+# they need (the runtime role can take the role set-up's advisory lock, or lock a table it may
+# write) makes the step fail instead of waiting for ever. Measured on an empty database, the
+# longest start-up statement takes well under a second; a migration that rewrites a large table
+# would be the one to need more.
+STARTUP_LOCK_TIMEOUT_MS = 30_000
+STARTUP_STATEMENT_TIMEOUT_MS = 300_000
+
+
+def _connect_args(startup: bool = False) -> dict[str, Any]:
     # libpq's `options` sets the server setting for the whole session, at connect time.
-    return {"options": f"-c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"}
+    options = f"-c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"
+    if startup:
+        options += (
+            f" -c lock_timeout={STARTUP_LOCK_TIMEOUT_MS}"
+            f" -c statement_timeout={STARTUP_STATEMENT_TIMEOUT_MS}"
+        )
+    return {"options": options}
+
+
+def startup_wait_failure(
+    step: str, error: BaseException, waiting_for: str = "a lock on a database object"
+) -> RuntimeError | None:
+    """The failure a start-up step reports when its lock or statement timeout ended a
+    statement, naming what it waited for; None for any other error."""
+    original = getattr(error, "orig", error)
+    if isinstance(original, LockNotAvailable):
+        seconds = STARTUP_LOCK_TIMEOUT_MS // 1000
+        return RuntimeError(
+            f"{step}: waited more than {seconds} s for {waiting_for}, which another session"
+            " holds; stopping"
+        )
+    if isinstance(original, QueryCanceled):
+        seconds = STARTUP_STATEMENT_TIMEOUT_MS // 1000
+        return RuntimeError(f"{step}: a statement ran longer than {seconds} s; stopping")
+    return None
 
 
 def _protect(engine: Engine) -> None:
     event.listen(engine, "handle_error", withhold_row_values, retval=True)
 
 
-def _create_async_engine(url: URL) -> AsyncEngine:
+def _create_async_engine(url: URL, *, startup: bool = False) -> AsyncEngine:
     engine = create_async_engine(
         url,
         pool_pre_ping=True,
-        connect_args=_connect_args(),
+        connect_args=_connect_args(startup),
         **SAFE_ENGINE_OPTIONS,
     )
     _protect(engine.sync_engine)
@@ -168,13 +203,16 @@ def create_database_engine(settings: DatabaseSettings) -> AsyncEngine:
 
 def create_owner_engine(settings: StartupSettings) -> AsyncEngine:
     """The owner, asynchronous: for the seed."""
-    return _create_async_engine(settings.owner_database_url)
+    return _create_async_engine(settings.owner_database_url, startup=True)
 
 
 def create_owner_sync_engine(settings: StartupSettings, **options: Any) -> Engine:
     """The owner, synchronous: for Alembic, role set-up and test set-up."""
     engine = create_engine(
-        settings.owner_database_url, connect_args=_connect_args(), **options, **SAFE_ENGINE_OPTIONS
+        settings.owner_database_url,
+        connect_args=_connect_args(startup=True),
+        **options,
+        **SAFE_ENGINE_OPTIONS,
     )
     _protect(engine)
     return engine

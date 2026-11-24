@@ -26,22 +26,28 @@ declares, and nothing else:
   server (it keeps USAGE on the schema and CONNECT on this database).
 - Then the declaration is granted, and what the role can effectively do (by its own grants,
   PUBLIC's or any role's it belongs to) and is (its attributes, memberships, settings, what it
-  owns) is compared with it. Any difference stops the start and is listed by name. That is
-  also how a grant made by another role with a grant option, which the owner cannot revoke,
-  is caught.
+  owns) is compared with it, and so is every privilege list Postgres keeps, system objects
+  included: no entry may name the role beyond the declaration, PUBLIC's entries on what the
+  declaration does not manage must be the initial ones, and no role may belong to it. Any
+  difference stops the start and is listed by name. That is also how a grant made by another
+  role with a grant option, which the owner cannot revoke, is caught.
 
-Grants on shared objects, such as CONNECT on a database, are taken away server-wide: use one
-runtime role name per server.
+Its sessions have the start-up steps' lock and statement timeouts (app/db/session.py): a
+session holding the set-up lock, the runtime role's included, makes set-up fail, not wait.
+
+Grants on shared objects, such as CONNECT on a database, are taken away server-wide, and
+PUBLIC loses everything on the server's other databases: use a dedicated server.
 """
 
 import logging
 
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 from app.config import DatabaseSettings, StartupSettings
 from app.db import grants
-from app.db.session import create_owner_sync_engine, set_role_password
+from app.db.session import create_owner_sync_engine, set_role_password, startup_wait_failure
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +141,87 @@ ROLE_ATTRIBUTES = text(
     " FROM pg_roles WHERE oid = :role"
 )
 SETTINGS_COUNT = text("SELECT count(*) FROM pg_db_role_setting WHERE setrole = :role")
+MEMBERS = text(
+    "SELECT member.rolname FROM pg_auth_members m JOIN pg_roles member ON member.oid = m.member"
+    " WHERE m.roleid = :role ORDER BY 1"
+)
+# Every privilege list Postgres keeps (every aclitem[] column of the catalogs in Postgres 16:
+# pg_class, pg_attribute, pg_proc, pg_namespace, pg_type, pg_language, pg_foreign_data_wrapper,
+# pg_foreign_server, pg_largeobject_metadata, pg_tablespace, pg_parameter_acl, pg_database,
+# pg_default_acl), system objects included. For each object: what it grants the role by name,
+# what it grants PUBLIC, and what it granted PUBLIC initially: pg_init_privs records that for
+# what initdb (or an extension) installed with privileges other than the default, and an object
+# without a row there started with its default. initdb's grants on information_schema are
+# not recorded there (Postgres 16.16: USAGE on the schema, SELECT on every relation in it but
+# INFORMATION_SCHEMA_PRIVATE), so they are written out here. `schema` is the object's
+# schema, where it has one; `name` a relation's name.
+ACL_ENTRIES = text(
+    "WITH objects AS ("
+    " SELECT 'pg_class'::regclass AS classid, c.oid AS objid, 0 AS objsubid, c.relacl AS acl,"
+    " acldefault(CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::\"char\", c.relowner)"
+    " AS default_acl, n.nspname AS schema, c.relname AS name"
+    " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+    " UNION ALL SELECT 'pg_class'::regclass, a.attrelid, a.attnum::integer, a.attacl,"
+    " NULL::aclitem[], n.nspname, NULL FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid"
+    " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE a.attacl IS NOT NULL"
+    " UNION ALL SELECT 'pg_proc'::regclass, p.oid, 0, p.proacl, acldefault('f', p.proowner),"
+    " n.nspname, NULL FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
+    " UNION ALL SELECT 'pg_namespace'::regclass, n.oid, 0, n.nspacl,"
+    " acldefault('n', n.nspowner), n.nspname, NULL FROM pg_namespace n"
+    " UNION ALL SELECT 'pg_type'::regclass, t.oid, 0, t.typacl, acldefault('T', t.typowner),"
+    " n.nspname, NULL FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace"
+    " UNION ALL SELECT 'pg_language'::regclass, l.oid, 0, l.lanacl,"
+    " acldefault('l', l.lanowner), NULL, NULL FROM pg_language l"
+    " UNION ALL SELECT 'pg_foreign_data_wrapper'::regclass, w.oid, 0, w.fdwacl,"
+    " acldefault('F', w.fdwowner), NULL, NULL FROM pg_foreign_data_wrapper w"
+    " UNION ALL SELECT 'pg_foreign_server'::regclass, f.oid, 0, f.srvacl,"
+    " acldefault('S', f.srvowner), NULL, NULL FROM pg_foreign_server f"
+    " UNION ALL SELECT 'pg_largeobject'::regclass, m.oid, 0, m.lomacl,"
+    " acldefault('L', m.lomowner), NULL, NULL FROM pg_largeobject_metadata m"
+    " UNION ALL SELECT 'pg_tablespace'::regclass, t.oid, 0, t.spcacl,"
+    " acldefault('t', t.spcowner), NULL, NULL FROM pg_tablespace t"
+    " UNION ALL SELECT 'pg_parameter_acl'::regclass, a.oid, 0, a.paracl, NULL::aclitem[],"
+    " NULL, NULL"
+    " FROM pg_parameter_acl a"
+    " UNION ALL SELECT 'pg_database'::regclass, d.oid, 0, d.datacl,"
+    " acldefault('d', d.datdba), NULL, NULL FROM pg_database d"
+    " UNION ALL SELECT 'pg_default_acl'::regclass, d.oid, 0, d.defaclacl, NULL::aclitem[],"
+    " NULL, NULL"
+    " FROM pg_default_acl d"
+    "), entries AS ("
+    " SELECT o.classid, o.objid, o.objsubid, o.schema,"
+    " ARRAY(SELECT x.privilege_type FROM aclexplode(coalesce(o.acl, o.default_acl)) x"
+    " WHERE x.grantee = :role ORDER BY 1) AS to_role,"
+    " ARRAY(SELECT x.privilege_type FROM aclexplode(coalesce(o.acl, o.default_acl)) x"
+    " WHERE x.grantee = 0 ORDER BY 1) AS to_public,"
+    " CASE WHEN i.initprivs IS NULL AND o.schema = 'information_schema'"
+    " AND o.classid = 'pg_class'::regclass AND o.objsubid = 0"
+    " AND o.name <> ALL(CAST(:information_schema_private AS text[])) THEN ARRAY['SELECT']"
+    " WHEN i.initprivs IS NULL AND o.classid = 'pg_namespace'::regclass"
+    " AND o.schema = 'information_schema' THEN ARRAY['USAGE']"
+    " ELSE ARRAY(SELECT x.privilege_type FROM aclexplode(coalesce(i.initprivs, o.default_acl)) x"
+    " WHERE x.grantee = 0 ORDER BY 1) END AS initially_public,"
+    " o.classid = 'pg_proc'::regclass AND o.objid = ANY(ARRAY(SELECT to_regprocedure(signature)"
+    " FROM unnest(CAST(:catalog_functions AS text[])) signature)) AS execute_removed"
+    " FROM objects o LEFT JOIN pg_init_privs i"
+    " ON i.classoid = o.classid AND i.objoid = o.objid AND i.objsubid = o.objsubid"
+    ")"
+    " SELECT e.classid::regclass::text, e.schema, ident.type, ident.identity, e.to_role,"
+    " e.to_public, e.initially_public, e.execute_removed"
+    " FROM entries e CROSS JOIN LATERAL pg_identify_object(e.classid, e.objid, e.objsubid) ident"
+    " WHERE cardinality(e.to_role) > 0 OR e.to_public IS DISTINCT FROM e.initially_public"
+)
+SYSTEM_SCHEMAS = ("pg_catalog", "information_schema")
+# The information_schema relations PUBLIC is not given SELECT on.
+INFORMATION_SCHEMA_PRIVATE = [
+    "_pg_foreign_data_wrappers",
+    "_pg_foreign_servers",
+    "_pg_foreign_table_columns",
+    "_pg_foreign_tables",
+    "_pg_user_mappings",
+    "sql_parts",
+    "transforms",
+]
 
 
 def _refuse_what_it_must_not_own(connection: Connection, role: int) -> None:
@@ -169,6 +256,63 @@ def _declared(database: str, databases: set[str]) -> dict[tuple[str, str], froze
             frozenset(grants.DATABASE_PRIVILEGES) if name == database else frozenset()
         )
     return expected
+
+
+def _is_system_schema(schema: str) -> bool:
+    return schema in SYSTEM_SCHEMAS or schema.startswith(("pg_toast", "pg_temp_"))
+
+
+def _grant_differences(connection: Connection, role: int, database: str) -> list[str]:
+    """Grants anywhere Postgres records one that the declaration does not make: any privilege
+    list naming the role, and PUBLIC's privileges on everything the declaration does not
+    manage, which must be exactly the initial ones."""
+    named: dict[tuple[str, str], frozenset[str]] = {
+        ("table", f"{grants.SCHEMA}.{name}"): frozenset(privileges)
+        for name, privileges in grants.TABLE_PRIVILEGES.items()
+    }
+    named |= {
+        ("sequence", f"{grants.SCHEMA}.{name}"): frozenset(privileges)
+        for name, privileges in grants.SEQUENCE_PRIVILEGES.items()
+    }
+    named["schema", grants.SCHEMA] = frozenset(grants.SCHEMA_PRIVILEGES)
+    named["database", database] = frozenset(grants.DATABASE_PRIVILEGES)
+    catalog_functions = [
+        name for name in grants.FUNCTION_PRIVILEGES if name.startswith("pg_catalog.")
+    ]
+    differences = []
+    rows = connection.execute(
+        ACL_ENTRIES,
+        {
+            "role": role,
+            "catalog_functions": catalog_functions,
+            "information_schema_private": INFORMATION_SCHEMA_PRIVATE,
+        },
+    )
+    for catalog, schema, kind, identity, to_role, to_public, initially, removed in rows:
+        # The application's own relations, functions and schemas, and the databases: the
+        # declaration decides them, and the effective comparison checks them.
+        managed = catalog == "pg_database" or (
+            catalog in ("pg_class", "pg_proc", "pg_namespace")
+            and schema is not None
+            and not _is_system_schema(schema)
+        )
+        allowed = named.get((kind, identity), frozenset()) if managed else frozenset()
+        differences += [
+            f"{kind} {identity}: {privilege} granted to the runtime role"
+            for privilege in sorted(set(to_role) - allowed)
+        ]
+        if managed:
+            continue
+        expected = set(initially) - ({"EXECUTE"} if removed else set())
+        differences += [
+            f"{kind} {identity}: {privilege} granted to PUBLIC beyond its initial privileges"
+            for privilege in sorted(set(to_public) - expected)
+        ]
+        differences += [
+            f"{kind} {identity}: {privilege} taken from PUBLIC's initial privileges"
+            for privilege in sorted(expected - set(to_public))
+        ]
+    return differences
 
 
 def runtime_role_differences(connection: Connection, role_name: str) -> list[str]:
@@ -223,6 +367,11 @@ def runtime_role_differences(connection: Connection, role_name: str) -> list[str
         f"member of {granted}"
         for granted, _grantor in connection.execute(MEMBERSHIPS, {"role": role})
     ]
+    differences += [
+        f"role {member} is a member of the runtime role"
+        for member in connection.execute(MEMBERS, {"role": role}).scalars()
+    ]
+    differences += _grant_differences(connection, role, database)
     if connection.execute(SETTINGS_COUNT, {"role": role}).scalar_one():
         differences.append("session settings of its own")
     owned = {
@@ -236,7 +385,13 @@ def runtime_role_differences(connection: Connection, role_name: str) -> list[str
 def set_up_runtime_role(connection: Connection, settings: DatabaseSettings) -> None:
     """Set up the runtime role inside the caller's transaction, as the owner, and check the
     result against the declaration. The caller commits."""
-    connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": ROLE_SETUP_LOCK})
+    try:
+        connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": ROLE_SETUP_LOCK})
+    except DBAPIError as error:
+        failure = startup_wait_failure("role set-up", error, "the role set-up lock")
+        if failure is None:
+            raise
+        raise failure from error
     quote = connection.dialect.identifier_preparer.quote_identifier
     role = quote(settings.app_db_user)
     database = quote(connection.execute(text("SELECT current_database()")).scalar_one())
@@ -319,6 +474,11 @@ def main() -> None:
     try:
         with engine.begin() as connection:
             set_up_runtime_role(connection, settings)
+    except DBAPIError as error:
+        failure = startup_wait_failure("role set-up", error)
+        if failure is None:
+            raise
+        raise failure from error
     finally:
         engine.dispose()
 

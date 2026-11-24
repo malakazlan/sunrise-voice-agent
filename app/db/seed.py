@@ -15,11 +15,12 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import StartupSettings
 from app.db.models import Appointment, AvailableSlot, Medication, Patient
-from app.db.session import create_owner_engine, create_session_factory
+from app.db.session import create_owner_engine, create_session_factory, startup_wait_failure
 from app.domain.clinic import CLINIC_TZ, DR_LEE, DR_PATEL, clinic_date
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,11 @@ async def _run(settings: StartupSettings, today: date) -> None:
     try:
         async with create_session_factory(engine)() as session, session.begin():
             await seed(session, load_seed_data(), today)
+    except DBAPIError as error:
+        failure = startup_wait_failure("the seed", error)
+        if failure is None:
+            raise
+        raise failure from error
     finally:
         await engine.dispose()
 

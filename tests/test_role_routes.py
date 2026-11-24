@@ -3,6 +3,7 @@ give it, tried as the role where the role could try them, and what role set-up d
 each: close the route, repair what Postgres cannot forbid, or refuse to start.
 """
 
+import asyncio
 import functools
 import secrets
 import threading
@@ -19,9 +20,10 @@ from conftest import (
     new_role_name,
     set_up_roles,
 )
-from psycopg import sql
+from psycopg import errors, sql
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.pool import NullPool
 
@@ -241,16 +243,19 @@ def test_grants_by_another_grantor_stop_the_setup(
     assert str(excinfo.value) == (
         "the runtime role does not match the declaration:"
         f" database {fresh_role.postgres_db}: TEMPORARY not declared;"
-        " table audit_events: DELETE not declared"
+        " table audit_events: DELETE not declared;"
+        " table public.audit_events: DELETE granted to the runtime role"
     )
 
 
 SURPLUS = [
-    # (grant to the helper with grant option, the helper's grant, the difference reported)
+    # (grant to the helper with grant option, the helper's grant, the differences reported:
+    # what the role can do, and, for a grant naming the role, the grant itself)
     (
         "GRANT UPDATE ON medications TO {helper} WITH GRANT OPTION",
         "GRANT UPDATE ON medications TO {role}",
-        "table medications: UPDATE not declared",
+        "table medications: UPDATE not declared;"
+        " table public.medications: UPDATE granted to the runtime role",
     ),
     (
         "GRANT SELECT ON alembic_version TO {helper} WITH GRANT OPTION",
@@ -260,7 +265,8 @@ SURPLUS = [
     (
         "GRANT UPDATE (outcome) ON audit_events TO {helper} WITH GRANT OPTION",
         "GRANT UPDATE (outcome) ON audit_events TO {role}",
-        "table audit_events: UPDATE not declared",
+        "table audit_events: UPDATE not declared;"
+        " table column public.audit_events.outcome: UPDATE granted to the runtime role",
     ),
     (
         "GRANT USAGE ON SEQUENCE medications_id_seq TO {helper} WITH GRANT OPTION",
@@ -270,7 +276,8 @@ SURPLUS = [
     (
         "GRANT EXECUTE ON FUNCTION audit_events_refuse_change() TO {helper} WITH GRANT OPTION",
         "GRANT EXECUTE ON FUNCTION audit_events_refuse_change() TO {role}",
-        "function public.audit_events_refuse_change(): EXECUTE not declared",
+        "function public.audit_events_refuse_change(): EXECUTE granted to the runtime role;"
+        " function public.audit_events_refuse_change(): EXECUTE not declared",
     ),
     (
         "GRANT CREATE ON SCHEMA public TO {helper} WITH GRANT OPTION",
@@ -280,7 +287,8 @@ SURPLUS = [
     (
         "GRANT CREATE ON DATABASE {database} TO {helper} WITH GRANT OPTION",
         "GRANT CREATE ON DATABASE {database} TO {role}",
-        "database {database_name}: CREATE not declared",
+        "database {database_name}: CREATE granted to the runtime role;"
+        " database {database_name}: CREATE not declared",
     ),
 ]
 
@@ -314,6 +322,243 @@ def test_each_kind_of_surplus_stops_the_setup(
     assert str(excinfo.value) == (
         f"the runtime role does not match the declaration: {reported.format(**names)}"
     )
+
+
+# --- N1: grants anywhere Postgres records one -----------------------------------------------
+
+# The reviewer's three: a role holding grant options gives the runtime role a way to read the
+# owner's verifier, to read server files and to switch triggers off. Each is
+# (to the helper by the owner, by the helper, what set-up reports).
+REVIEWER_GRANTS = [
+    (
+        "GRANT SELECT ON pg_catalog.pg_authid TO {helper} WITH GRANT OPTION",
+        "GRANT SELECT ON pg_catalog.pg_authid TO {role}",
+        "table pg_catalog.pg_authid: SELECT granted to the runtime role",
+    ),
+    (
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO {helper} WITH GRANT OPTION",
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO {role}",
+        "function pg_catalog.pg_read_file(pg_catalog.text): EXECUTE granted to the runtime role",
+    ),
+    (
+        "GRANT SET ON PARAMETER session_replication_role TO {helper} WITH GRANT OPTION",
+        "GRANT SET ON PARAMETER session_replication_role TO {role}",
+        "parameter ACL session_replication_role: SET granted to the runtime role",
+    ),
+]
+# One of every other kind of object that carries a privilege list.
+OTHER_KINDS = [
+    (
+        "GRANT SELECT (rolname) ON pg_catalog.pg_authid TO {helper} WITH GRANT OPTION",
+        "GRANT SELECT (rolname) ON pg_catalog.pg_authid TO {role}",
+        "table column pg_catalog.pg_authid.rolname: SELECT granted to the runtime role",
+    ),
+    (
+        "GRANT USAGE ON SCHEMA information_schema TO {helper} WITH GRANT OPTION",
+        "GRANT USAGE ON SCHEMA information_schema TO {role}",
+        "schema information_schema: USAGE granted to the runtime role",
+    ),
+    (
+        "GRANT USAGE ON TYPE pg_catalog.int4 TO {helper} WITH GRANT OPTION",
+        "GRANT USAGE ON TYPE pg_catalog.int4 TO {role}",
+        "type integer: USAGE granted to the runtime role",
+    ),
+    (
+        "GRANT USAGE ON LANGUAGE plpgsql TO {helper} WITH GRANT OPTION",
+        "GRANT USAGE ON LANGUAGE plpgsql TO {role}",
+        "language plpgsql: USAGE granted to the runtime role",
+    ),
+    (
+        "CREATE FOREIGN DATA WRAPPER sva_fdw;"
+        " GRANT USAGE ON FOREIGN DATA WRAPPER sva_fdw TO {helper} WITH GRANT OPTION",
+        "GRANT USAGE ON FOREIGN DATA WRAPPER sva_fdw TO {role}",
+        "foreign-data wrapper sva_fdw: USAGE granted to the runtime role",
+    ),
+    (
+        "CREATE FOREIGN DATA WRAPPER sva_fdw;"
+        " CREATE SERVER sva_server FOREIGN DATA WRAPPER sva_fdw;"
+        " GRANT USAGE ON FOREIGN SERVER sva_server TO {helper} WITH GRANT OPTION",
+        "GRANT USAGE ON FOREIGN SERVER sva_server TO {role}",
+        "server sva_server: USAGE granted to the runtime role",
+    ),
+    (
+        "SELECT lo_create(4242); GRANT SELECT ON LARGE OBJECT 4242 TO {helper} WITH GRANT OPTION",
+        "GRANT SELECT ON LARGE OBJECT 4242 TO {role}",
+        "large object 4242: SELECT granted to the runtime role",
+    ),
+    (
+        "GRANT CREATE ON TABLESPACE pg_default TO {helper} WITH GRANT OPTION",
+        "GRANT CREATE ON TABLESPACE pg_default TO {role}",
+        "tablespace pg_default: CREATE granted to the runtime role",
+    ),
+]
+
+
+def granted_by_helper(
+    fresh_role: StartupSettings,
+    helper: StartupSettings,
+    owner_engine: Engine,
+    cases: list[tuple[str, str, str]],
+) -> str:
+    """Set the role up, apply the cases' grants (to the helper by the owner, then by the
+    helper), and return what the next set-up refuses with."""
+    set_up_roles(fresh_role)
+    names = {"helper": f'"{helper.postgres_user}"', "role": f'"{fresh_role.app_db_user}"'}
+    for to_helper, by_helper, _reported in cases:
+        grant_as_owner(owner_engine, *to_helper.format(**names).split("; "))
+        grant_as(helper, by_helper.format(**names))
+    with pytest.raises(RuntimeError) as excinfo:
+        set_up_roles(fresh_role)
+    return str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "case", REVIEWER_GRANTS, ids=["pg_authid", "pg_read_file", "session_replication_role"]
+)
+def test_each_reviewer_grant_stops_the_setup(
+    fresh_role: StartupSettings,
+    helper: StartupSettings,
+    owner_engine: Engine,
+    case: tuple[str, str, str],
+) -> None:
+    refusal = granted_by_helper(fresh_role, helper, owner_engine, [case])
+    assert refusal == f"the runtime role does not match the declaration: {case[2]}"
+
+
+def test_the_reviewer_grants_together_stop_the_setup(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    refusal = granted_by_helper(fresh_role, helper, owner_engine, REVIEWER_GRANTS)
+    reported = "; ".join(sorted(reported for _, _, reported in REVIEWER_GRANTS))
+    assert refusal == f"the runtime role does not match the declaration: {reported}"
+
+
+@pytest.mark.parametrize(
+    "case",
+    OTHER_KINDS,
+    ids=["column", "schema", "type", "language", "fdw", "server", "large-object", "tablespace"],
+)
+def test_a_grant_on_any_kind_of_object_stops_the_setup(
+    fresh_role: StartupSettings,
+    helper: StartupSettings,
+    owner_engine: Engine,
+    case: tuple[str, str, str],
+) -> None:
+    refusal = granted_by_helper(fresh_role, helper, owner_engine, [case])
+    assert refusal == f"the runtime role does not match the declaration: {case[2]}"
+
+
+def test_a_grant_on_another_database_stops_the_setup(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    case = (
+        "GRANT CONNECT ON DATABASE postgres TO {helper} WITH GRANT OPTION",
+        "GRANT CONNECT ON DATABASE postgres TO {role}",
+        "",
+    )
+    refusal = granted_by_helper(fresh_role, helper, owner_engine, [case])
+    assert refusal == (
+        "the runtime role does not match the declaration:"
+        " database postgres: CONNECT granted to the runtime role;"
+        " database postgres: CONNECT not declared"
+    )
+
+
+def test_default_privileges_another_role_gives_the_runtime_role_are_removed(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    set_up_roles(fresh_role)
+    grant_as(
+        helper,
+        f'ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO "{fresh_role.app_db_user}"',
+    )
+
+    set_up_roles(fresh_role)
+
+    with owner_engine.connect() as connection:
+        left = connection.execute(
+            text(
+                "SELECT count(*) FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) x"
+                " WHERE x.grantee = (SELECT oid FROM pg_roles WHERE rolname = :name)"
+            ),
+            {"name": fresh_role.app_db_user},
+        ).scalar_one()
+    assert left == 0
+
+
+def test_a_member_of_the_runtime_role_stops_the_setup(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    # A role that belongs to the runtime role has what it has; the other direction (the
+    # runtime role in another role) is taken away and checked by the attribute tests.
+    set_up_roles(fresh_role)
+    grant_as_owner(owner_engine, f'GRANT "{fresh_role.app_db_user}" TO "{helper.postgres_user}"')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        set_up_roles(fresh_role)
+
+    assert str(excinfo.value) == (
+        "the runtime role does not match the declaration:"
+        f" role {helper.postgres_user} is a member of the runtime role"
+    )
+
+
+PUBLIC_CHANGES = [
+    (
+        "GRANT SELECT ON pg_catalog.pg_authid TO PUBLIC",
+        "table pg_catalog.pg_authid: SELECT granted to PUBLIC beyond its initial privileges",
+    ),
+    (
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC",
+        "function pg_catalog.pg_read_file(pg_catalog.text):"
+        " EXECUTE granted to PUBLIC beyond its initial privileges",
+    ),
+    (
+        "GRANT UPDATE ON information_schema.sql_features TO PUBLIC",
+        "table information_schema.sql_features:"
+        " UPDATE granted to PUBLIC beyond its initial privileges",
+    ),
+    (
+        "REVOKE EXECUTE ON FUNCTION pg_catalog.now() FROM PUBLIC",
+        "function pg_catalog.now(): EXECUTE taken from PUBLIC's initial privileges",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("statement", "reported"),
+    PUBLIC_CHANGES,
+    ids=["pg_authid", "pg_read_file", "information_schema", "revoked"],
+)
+def test_public_privileges_on_system_objects_must_be_the_initial_ones(
+    fresh_role: StartupSettings, owner_engine: Engine, statement: str, reported: str
+) -> None:
+    set_up_roles(fresh_role)
+    grant_as_owner(owner_engine, statement)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        set_up_roles(fresh_role)
+
+    assert str(excinfo.value) == f"the runtime role does not match the declaration: {reported}"
+
+
+def test_a_parameter_grant_cannot_switch_the_triggers_off(
+    fresh_role: StartupSettings, helper: StartupSettings, owner_engine: Engine
+) -> None:
+    # R2 by the parameter route: one the owner made is taken away at the next start, so the
+    # role is refused the setting; one another role made stops the start (above).
+    set_up_roles(fresh_role)
+    role = f'"{fresh_role.app_db_user}"'
+    grant_as_owner(owner_engine, f"GRANT SET ON PARAMETER session_replication_role TO {role}")
+
+    set_up_roles(fresh_role)
+
+    with pytest.raises(DBAPIError) as excinfo:
+        asyncio.run(
+            as_role(fresh_role, "SET session_replication_role = replica"),
+            loop_factory=asyncio.SelectorEventLoop,
+        )
+    assert type(excinfo.value.orig) is errors.InsufficientPrivilege
 
 
 # --- F5: concurrent set-ups ------------------------------------------------------------------

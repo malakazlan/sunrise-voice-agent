@@ -290,7 +290,8 @@ def test_no_raw_savepoints_under_app() -> None:
 
 
 # Two ways to switch off a table's triggers by name. Only the tamper fixture in tests/conftest.py
-# may use them, and tests/test_roles.py, which shows the runtime role is refused both. A lint
+# may use them, and tests/test_roles.py and tests/test_role_routes.py, which show the runtime
+# role is refused them, by its privileges and by role set-up. A lint
 # against accidents, not a control: the table's owner can still drop the triggers, and a string
 # assembled at runtime is not seen. The names are assembled here so that this file does not
 # match its own scan.
@@ -308,7 +309,11 @@ def test_trigger_bypass_only_in_the_tamper_fixture() -> None:
     ):
         assert TRIGGER_BYPASS.search(sample), sample
 
-    assert set(files_matching(TRIGGER_BYPASS)) == {"tests/conftest.py", "tests/test_roles.py"}
+    assert set(files_matching(TRIGGER_BYPASS)) == {
+        "tests/conftest.py",
+        "tests/test_roles.py",
+        "tests/test_role_routes.py",
+    }
 
 
 # The owner's settings class, engines and URL. Outside the tests only the modules that define
