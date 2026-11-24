@@ -14,7 +14,6 @@ written or already there.
 handler context's `now`), so an appointment that began during the call is no longer next.
 """
 
-import unicodedata
 from datetime import datetime
 from typing import Literal, get_args
 
@@ -29,6 +28,7 @@ from app.audit.log import Action, Outcome, ResourceType
 from app.db.models import (
     MAX_MESSAGE_BODY,
     MAX_REQUEST_SUMMARY,
+    MESSAGE_KEY,
     SCHEDULED,
     Appointment,
     Medication,
@@ -39,6 +39,7 @@ from app.db.models import (
 from app.domain.clinic import CLINIC_TZ
 from app.domain.matching import match_medication
 from app.guard.mask import mask_ssns
+from app.guard.text import plain_text
 
 REFILL = "refill"
 DOCTOR_MESSAGE = "doctor_message"
@@ -48,11 +49,6 @@ NOT_FOUND = "not_found"
 REQUESTED = "requested"
 SENT_TO_DOCTOR = "sent_to_doctor"
 SENT = "sent"
-
-# Unicode categories never in text a caller gives to be stored: controls (C0 with NUL, DEL,
-# C1), format characters (bidi overrides, zero-width characters, soft hyphens), surrogates,
-# private use, unassigned code points, and line and paragraph separators.
-HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 Weekday = Literal["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 # The day names, Monday first, as datetime.weekday() counts them.
@@ -100,17 +96,6 @@ class MessageArguments(BaseModel):
 def trimmed(value: object) -> object:
     """Text trimmed before its length bounds apply; anything but text is left to be refused."""
     return value.strip() if isinstance(value, str) else value
-
-
-def plain_text(value: str, *, digits: bool) -> str:
-    """The text, unless it holds a character of HIDDEN_CATEGORIES or, where `digits` is false,
-    a digit of any script."""
-    for char in value:
-        if unicodedata.category(char) in HIDDEN_CATEGORIES:
-            raise ValueError("the text must not contain control or format characters")
-        if not digits and char.isdigit():
-            raise ValueError("the text must not contain digits")
-    return value
 
 
 def stored_text(value: str, longest: int) -> str:
@@ -246,7 +231,7 @@ async def send_message_to_doctor(
     message_id = await session.scalar(
         insert(Message)
         .values(call_id=state.call_id, patient_id=patient_id, kind=DOCTOR_MESSAGE, body=body)
-        .on_conflict_do_nothing(index_elements=["call_id", "kind", "body"])
+        .on_conflict_do_nothing(index_elements=MESSAGE_KEY)
         .returning(Message.id)
     )
     if message_id is None:
@@ -281,13 +266,14 @@ def _serving_tool(
         model_callable=True,
         phi=True,
         phases=frozenset({Phase.SERVING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=writes,
         may_verify=False,
         takes_date_of_birth=None,
         callers=frozenset({Caller.PATIENT}),
         audit_action=action,
         outcome_actions={} if outcome_actions is None else outcome_actions,
+        audit_reasons=frozenset(),
         resource_type=ResourceType.PATIENT,
     )
 

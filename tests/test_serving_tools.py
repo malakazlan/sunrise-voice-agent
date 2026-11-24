@@ -618,7 +618,7 @@ async def test_serving_tools_are_gated(
         name: (
             by_name[name].phi,
             by_name[name].phases,
-            by_name[name].office_open_only,
+            by_name[name].closed_phases,
             by_name[name].writes,
             by_name[name].may_verify,
             by_name[name].audit_action.value,
@@ -627,12 +627,14 @@ async def test_serving_tools_are_gated(
         for name in SERVING_TOOLS
     }
     serving_only = frozenset({Phase.SERVING})
+    # None runs while the office is closed.
+    never = frozenset[Phase]()
     assert declared == {
-        APPOINTMENT: (True, serving_only, True, False, False, "appointment_read", "patient"),
-        REFILL: (True, serving_only, True, True, False, "refill_requested", "patient"),
-        LAB: (True, serving_only, True, False, False, "lab_status_read", "patient"),
-        BALANCE: (True, serving_only, True, False, False, "balance_read", "patient"),
-        MESSAGE: (True, serving_only, True, True, False, "doctor_message_sent", "patient"),
+        APPOINTMENT: (True, serving_only, never, False, False, "appointment_read", "patient"),
+        REFILL: (True, serving_only, never, True, False, "refill_requested", "patient"),
+        LAB: (True, serving_only, never, False, False, "lab_status_read", "patient"),
+        BALANCE: (True, serving_only, never, False, False, "balance_read", "patient"),
+        MESSAGE: (True, serving_only, never, True, False, "doctor_message_sent", "patient"),
     }
 
     # Offered only to a verified caller, with the office open, in serving.
@@ -773,6 +775,12 @@ async def test_message_bounds(
         "tab\there",
         "hi\x1fthere",
         "hi\x7fthere",
+        # C1 controls and format characters: zero-width, bidi overrides and isolates.
+        "hi\x85there",
+        "hi​there",
+        "‮ereht ih",
+        "hi⁧there",
+        "hi­there",
     ]
     for body in (too_long, grows, "", "   ", "\n\t", *control):
         for confirmed in (None, True):
@@ -897,7 +905,7 @@ async def test_request_columns_are_constrained(owner_engine: Engine, seeded: Non
         " VALUES (:call_id, 'P001', :type, :summary)"
     )
     for request_type, summary, constraint in (
-        ("callback", "ok", "ck_requests_type"),
+        ("unknown", "ok", "ck_requests_type"),
         ("refill", "s" * 201, "ck_requests_summary_length"),
         ("refill", "", "ck_requests_summary_length"),
     ):

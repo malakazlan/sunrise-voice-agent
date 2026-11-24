@@ -69,7 +69,16 @@ ASK = ToolOutcome(
 )
 FAIL = ASK.model_copy(update={"script": ScriptId.VERIFY_FAIL})
 LOCKED = ASK.model_copy(update={"script": ScriptId.VERIFY_LOCKED})
-VERIFIED = ASK.model_copy(update={"script": ScriptId.VERIFIED})
+
+
+def verified(first_name: str) -> ToolOutcome:
+    """The line that greets a verified caller, with their first name as its value."""
+    return ASK.model_copy(
+        update={"script": ScriptId.VERIFIED, "script_values": {"first_name": first_name}}
+    )
+
+
+VERIFIED = verified("Sarah")
 REFUSED = ToolOutcome(
     status=Status.REFUSED, message="That is not available right now.", data={}, hand_off=False
 )
@@ -285,7 +294,7 @@ async def test_all_three_must_match_one_record(deps: Deps, seeded: Engine) -> No
         ("Bob Stone", "77" + "88", "P011", "Bob"),
     ):
         state, outcome = await attempt(deps, name, "1990-01-01", digits)
-        assert outcome == VERIFIED, name
+        assert outcome == verified(first), name
         assert (state.patient_id, state.patient_first_name, state.verified_ssn4) == (
             patient_id,
             first,
@@ -378,7 +387,7 @@ async def test_cross_call_lockout(deps: Deps, seeded: Engine, clock: Clock) -> N
     # Another identity is untouched by those failures.
     clock.now = T0
     state, outcome = await attempt(deps, "Michael Brown", "1972-11-08", "10" + "20")
-    assert outcome == VERIFIED
+    assert outcome == verified("Michael")
 
     # A success does not clear earlier failures: four, a success, one more locks.
     clock.now = T0 + timedelta(hours=3)
@@ -386,7 +395,7 @@ async def test_cross_call_lockout(deps: Deps, seeded: Engine, clock: Clock) -> N
         _state, outcome = await attempt(deps, "Ann Lee", "1990-01-01", "00" + "00")
         assert outcome == FAIL
     _state, outcome = await attempt(deps, "Ann Lee", "1990-01-01", "55" + "66")
-    assert outcome == VERIFIED
+    assert outcome == verified("Ann")
     _state, outcome = await claim(intake(), deps, "Ann Lee", "1990-01-01")
     assert outcome == ASK
     _state, outcome = await attempt(deps, "Ann Lee", "1990-01-01", "00" + "00")
@@ -400,7 +409,12 @@ async def test_cross_call_lockout(deps: Deps, seeded: Engine, clock: Clock) -> N
 
 async def test_no_verification_when_closed(deps: Deps, seeded: Engine) -> None:
     closed = intake(office_open=False)
-    assert REGISTRY.tools_for(closed) == []
+    # Only the message, the emergency line and the goodbye: nothing that verifies.
+    assert [item.name for item in REGISTRY.tools_for(closed)] == [
+        "take_message",
+        "report_emergency",
+        "close_call",
+    ]
     after, outcome = await claim(closed, deps, *SARAH)
     assert (after, outcome) == (closed.model_copy(update={"tool_refusals": 1}), REFUSED)
     assert after.expecting_ssn4 is False

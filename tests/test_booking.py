@@ -1017,7 +1017,8 @@ async def test_booking_tools_are_gated(
         name: (
             by_name[name].phi,
             by_name[name].phases,
-            by_name[name].office_open_only,
+            # Office open only: no phase while it is closed.
+            not by_name[name].closed_phases,
             by_name[name].writes,
             by_name[name].may_verify,
             by_name[name].model_callable,

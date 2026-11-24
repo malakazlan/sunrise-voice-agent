@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.claims import ClaimKeys
+from app.agent.endings import drain_call_events
 from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
@@ -59,6 +60,8 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
         await calls.close()
+        # The call events still being written (each bounded) end before the engine goes.
+        await drain_call_events()
         if model is not None:
             await model.close()
         await engine.dispose()
