@@ -191,13 +191,14 @@ def test_raw_driver_connections_only_in_allowed_modules() -> None:
 
 # app/audit/ is the only code that writes or verifies the audit log. Everywhere else under app/
 # the model may not be named and the table's name may not appear in a string (SQL text, a
-# metadata lookup). The model's own definition and the migrations that create the table are
-# the only other places that name them. Like the trigger scan below, this is a lint against
-# accidents: a name assembled at runtime gets past it. The control is the database role.
+# metadata lookup). The model's own definition, the migrations that create the table and the
+# runtime role's privilege declaration (which names every table) are the only other places that
+# name them. Like the trigger scan below, this is a lint against accidents: a name assembled at
+# runtime gets past it. The control is the database role.
 AUDIT_MODEL = "AuditEvent"
 AUDIT_TABLE = "audit_events"
 AUDIT_PACKAGE = "app/audit/"
-AUDIT_NAMED_IN = ("app/db/models.py", "app/db/migrations/versions/")
+AUDIT_NAMED_IN = ("app/db/models.py", "app/db/migrations/versions/", "app/db/grants.py")
 
 
 def audit_table_uses(source: str) -> list[str]:
@@ -286,9 +287,10 @@ def test_no_raw_savepoints_under_app() -> None:
 
 
 # Two ways to switch off a table's triggers by name. Only the tamper fixture in tests/conftest.py
-# may use the first; nothing may use the second. A lint against accidents, not a control: the
-# table's owner can still drop the triggers, and a string assembled at runtime is not seen. The
-# names are assembled here so that this file does not match its own scan.
+# may use them, and tests/test_roles.py, which shows the runtime role is refused both. A lint
+# against accidents, not a control: the table's owner can still drop the triggers, and a string
+# assembled at runtime is not seen. The names are assembled here so that this file does not
+# match its own scan.
 TRIGGER_BYPASS = re.compile(
     "session_" + "replication_role" + r"|disable\s+" + "trigger", re.IGNORECASE
 )
@@ -303,7 +305,57 @@ def test_trigger_bypass_only_in_the_tamper_fixture() -> None:
     ):
         assert TRIGGER_BYPASS.search(sample), sample
 
-    assert set(files_matching(TRIGGER_BYPASS)) == {"tests/conftest.py"}
+    assert set(files_matching(TRIGGER_BYPASS)) == {"tests/conftest.py", "tests/test_roles.py"}
+
+
+# The owner's engines and URL. Outside the tests only the session module (which builds them)
+# and the start-up steps (migrations, role set-up, seed) may name them; the application runs as
+# the runtime role. Like the scans above, a lint against accidents: the runtime role's
+# privileges are the control.
+OWNER_NAMES = {"create_owner_engine", "create_owner_sync_engine", "owner_database_url"}
+STARTUP_MODULES = {"app/db/migrations/env.py", "app/db/roles.py", "app/db/seed.py"}
+OWNER_ALLOWED = {ENGINE_MODULE, *STARTUP_MODULES}
+
+
+def owner_engine_uses(source: str) -> list[str]:
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name) and node.id in OWNER_NAMES:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in OWNER_NAMES:
+            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] in OWNER_NAMES:
+            uses.append(f"import {node.name}")
+    return uses
+
+
+def test_owner_engine_only_in_startup_modules() -> None:
+    for sample in (
+        "from app.db.session import create_owner_engine\n",
+        "from app.db.session import create_owner_sync_engine as make\n",
+        "from app.db import session\nsession.create_owner_engine(settings)\n",
+        "engine = create_owner_engine(settings)\n",
+        "url = settings.owner_database_url\n",
+        "getter = create_owner_sync_engine\n",
+    ):
+        assert owner_engine_uses(sample), sample
+    assert not owner_engine_uses(
+        "from app.db.session import create_database_engine\n"
+        "engine = create_database_engine(settings)\n"
+        "url = settings.runtime_database_url\n"
+    )
+
+    users = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in tracked_files()
+        if path.suffix == ".py"
+        and not path.relative_to(REPO_ROOT).as_posix().startswith("tests/")
+        and owner_engine_uses(path.read_text(encoding="utf-8"))
+    }
+
+    # Every start-up step reaches the owner through these names, so the scan sees them.
+    assert users >= STARTUP_MODULES
+    assert users <= OWNER_ALLOWED, users - OWNER_ALLOWED
 
 
 # app/domain/ decides office hours and identity from its arguments alone: no database, no

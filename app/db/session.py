@@ -1,10 +1,12 @@
 """The only place engines are built, so every engine gets the same safety options."""
 
+import re
 from typing import Any
 
 from psycopg import Error as DriverError
 from psycopg.pq import DiagnosticField, TransactionStatus
-from sqlalchemy import Engine, create_engine, event
+from pydantic import SecretStr
+from sqlalchemy import URL, Connection, Engine, create_engine, event
 from sqlalchemy.engine import ExceptionContext
 from sqlalchemy.exc import DBAPIError, StatementError
 from sqlalchemy.ext.asyncio import (
@@ -143,9 +145,9 @@ def _protect(engine: Engine) -> None:
     event.listen(engine, "handle_error", withhold_row_values, retval=True)
 
 
-def create_database_engine(settings: Settings) -> AsyncEngine:
+def _create_async_engine(url: URL) -> AsyncEngine:
     engine = create_async_engine(
-        settings.database_url,
+        url,
         pool_pre_ping=True,
         connect_args=_connect_args(),
         **SAFE_ENGINE_OPTIONS,
@@ -154,13 +156,55 @@ def create_database_engine(settings: Settings) -> AsyncEngine:
     return engine
 
 
-def create_sync_engine(settings: Settings, **options: Any) -> Engine:
-    """A synchronous engine, for Alembic and for test set-up."""
+def create_database_engine(settings: Settings) -> AsyncEngine:
+    """The application's engine: it connects as the runtime role (app/db/roles.py)."""
+    return _create_async_engine(settings.runtime_database_url)
+
+
+# The owner's engines are for the start-up steps only: migrations, role set-up and the seed
+# (a repo hygiene test keeps them there).
+
+
+def create_owner_engine(settings: Settings) -> AsyncEngine:
+    """The owner, asynchronous: for the seed."""
+    return _create_async_engine(settings.owner_database_url)
+
+
+def create_owner_sync_engine(settings: Settings, **options: Any) -> Engine:
+    """The owner, synchronous: for Alembic, role set-up and test set-up."""
     engine = create_engine(
-        settings.database_url, connect_args=_connect_args(), **options, **SAFE_ENGINE_OPTIONS
+        settings.owner_database_url, connect_args=_connect_args(), **options, **SAFE_ENGINE_OPTIONS
     )
     _protect(engine)
     return engine
+
+
+# What libpq's PQencryptPasswordConn returns for scram-sha-256 (RFC 5803's form):
+# SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>, the last three in base64.
+_BASE64 = "[A-Za-z0-9+/]+={0,2}"
+SCRAM_VERIFIER = re.compile(rf"SCRAM-SHA-256\$[1-9][0-9]*:{_BASE64}\${_BASE64}:{_BASE64}")
+
+
+def password_verifier(connection: Connection, role: str, password: SecretStr) -> str:
+    """The SCRAM-SHA-256 verifier of `password` for `role`, the form in which Postgres stores
+    a password, made on this side of the connection, so the password itself is never sent.
+
+    psycopg's `PGconn.encrypt_password` calls libpq's PQencryptPasswordConn. With the algorithm
+    named it computes the verifier locally (a fresh random salt each time, the iteration count
+    the server reported) and sends nothing; without one it would ask the server for its
+    `password_encryption` setting, which may be md5. Postgres stores a string in this form as
+    it is. The verifier cannot be used to log in, but it allows guessing the password offline,
+    so it is still not something to show anywhere it is not needed.
+    """
+    driver = connection.connection.driver_connection
+    if driver is None:
+        raise RuntimeError("the connection has no driver connection")
+    verifier: str = driver.pgconn.encrypt_password(
+        password.get_secret_value().encode("utf-8"), role.encode("utf-8"), b"scram-sha-256"
+    ).decode("ascii")
+    if not SCRAM_VERIFIER.fullmatch(verifier):
+        raise RuntimeError("the driver did not return a SCRAM-SHA-256 verifier")
+    return verifier
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

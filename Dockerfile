@@ -24,5 +24,6 @@ USER 10001:10001
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --start-interval=2s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
-# Migrate, seed, then serve. A failure in any step stops the container.
-CMD ["sh", "-c", "alembic upgrade head && python -m app.db.seed && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-access-log"]
+# As the owner: migrate, set up the runtime role, seed. Then serve, as the runtime role. A
+# failure in any step stops the container.
+CMD ["sh", "-c", "alembic upgrade head && python -m app.db.roles && python -m app.db.seed && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-access-log"]

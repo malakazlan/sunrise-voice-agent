@@ -1,5 +1,6 @@
 import asyncio
 import os
+import secrets
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -13,7 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
-from app.db.session import create_database_engine, create_session_factory, create_sync_engine
+from app.db.roles import set_up_runtime_role
+from app.db.session import (
+    create_database_engine,
+    create_owner_engine,
+    create_owner_sync_engine,
+    create_session_factory,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +34,8 @@ OFFLINE_DB_ENV = {
     "POSTGRES_DB": "sunrise_offline",
     "POSTGRES_USER": "sunrise_offline",
     "POSTGRES_PASSWORD": "offline-test-password",
+    "APP_DB_USER": "sunrise_offline_app",
+    "APP_DB_PASSWORD": "offline-test-app-password",
     "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
 }
 
@@ -113,10 +122,45 @@ def anyio_backend() -> tuple[str, dict[str, Any]]:
     return ("asyncio", {"loop_factory": asyncio.SelectorEventLoop})
 
 
+def new_role_name(kind: str) -> str:
+    """A runtime role name no other test run uses: roles belong to the whole server, so two
+    runs, or a role left behind by a run that crashed, never meet."""
+    return f"sva_test_{uuid4().hex[:12]}_{kind}"
+
+
+def drop_role(settings: Settings, name: str) -> None:
+    """Drop a runtime role, after revoking what it holds in this database and on shared
+    objects. Grants it still has in another database make the drop fail, so a leak shows."""
+    engine = admin_engine(settings)
+    quote = engine.dialect.identifier_preparer.quote_identifier
+    try:
+        with engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT 1 FROM pg_roles WHERE rolname = :name"), {"name": name}
+            ).first()
+            if exists is not None:
+                connection.execute(text(f"DROP OWNED BY {quote(name)}"))
+                connection.execute(text(f"DROP ROLE {quote(name)}"))
+    finally:
+        engine.dispose()
+
+
 @pytest.fixture(scope="session")
-def server_settings() -> Settings:
-    """The database server the tests run against, taken from the POSTGRES_* variables."""
-    return Settings(_env_file=None, app_env="dev", audit_hmac_key=TEST_AUDIT_KEY)
+def server_settings() -> Iterator[Settings]:
+    """The database server the tests run against: the owner from the POSTGRES_* variables,
+    and a runtime role of this test run's own, with a random password. The role is created in
+    each test database by the `database` fixture and dropped when the run ends."""
+    settings = Settings(
+        _env_file=None,
+        app_env="dev",
+        audit_hmac_key=TEST_AUDIT_KEY,
+        app_db_user=new_role_name("app"),
+        app_db_password=secrets.token_urlsafe(24),
+    )
+    try:
+        yield settings
+    finally:
+        drop_role(settings, settings.app_db_user)
 
 
 def with_database(settings: Settings, name: str) -> Settings:
@@ -124,7 +168,17 @@ def with_database(settings: Settings, name: str) -> Settings:
 
 
 def admin_engine(settings: Settings) -> Engine:
-    return create_sync_engine(settings, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    return create_owner_sync_engine(settings, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+
+
+def set_up_roles(settings: Settings) -> None:
+    """The start-up role set-up, run as the owner in the settings' database."""
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            set_up_runtime_role(connection, settings)
+    finally:
+        engine.dispose()
 
 
 def create_database(settings: Settings, name: str, template: str | None = None) -> None:
@@ -155,6 +209,8 @@ def database_env(settings: Settings) -> dict[str, str]:
         "POSTGRES_DB": settings.postgres_db,
         "POSTGRES_USER": settings.postgres_user,
         "POSTGRES_PASSWORD": settings.postgres_password.get_secret_value(),
+        "APP_DB_USER": settings.app_db_user,
+        "APP_DB_PASSWORD": settings.app_db_password.get_secret_value(),
         "AUDIT_HMAC_KEY": settings.audit_hmac_key.get_secret_value(),
     }
 
@@ -239,18 +295,23 @@ def migrated_template(
 
 @pytest.fixture
 def database(server_settings: Settings, migrated_template: str) -> Iterator[Settings]:
-    """A fresh database migrated to head, dropped after the test."""
+    """A fresh database migrated to head with the runtime role set up in it, as the container
+    starts it; dropped after the test. Database-level privileges are not copied from a
+    template, so the set-up runs for each database."""
     name = f"sva_test_{uuid4().hex[:12]}"
     create_database(server_settings, name, template=migrated_template)
     try:
-        yield with_database(server_settings, name)
+        settings = with_database(server_settings, name)
+        set_up_roles(settings)
+        yield settings
     finally:
         drop_database(server_settings, name)
 
 
 @pytest.fixture
-def sync_engine(database: Settings) -> Iterator[Engine]:
-    engine = create_sync_engine(database, poolclass=NullPool)
+def owner_engine(database: Settings) -> Iterator[Engine]:
+    """The owner, for set-up, schema checks and reading what the application committed."""
+    engine = create_owner_sync_engine(database, poolclass=NullPool)
     try:
         yield engine
     finally:
@@ -259,7 +320,19 @@ def sync_engine(database: Settings) -> Iterator[Engine]:
 
 @pytest.fixture
 async def session(database: Settings) -> AsyncIterator[AsyncSession]:
+    """A session as the application has it: the runtime role."""
     engine = create_database_engine(database)
+    try:
+        async with create_session_factory(engine)() as session:
+            yield session
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def owner_session(database: Settings) -> AsyncIterator[AsyncSession]:
+    """A session as the start-up seed has it: the owner."""
+    engine = create_owner_engine(database)
     try:
         async with create_session_factory(engine)() as session:
             yield session
@@ -299,8 +372,9 @@ def close_async_driver_connection() -> Callable[[AsyncConnection], Awaitable[Non
 # ordinary triggers off for one transaction with session_replication_role=replica, which only a
 # superuser may set. It is not the only way past them: whoever owns the table can disable or
 # drop the triggers, or drop the table. The hygiene scan that keeps this setting out of other
-# files is a lint against accidents, not a control; the control is a runtime role that neither
-# owns the table nor is a superuser.
+# files is a lint against accidents, not a control; the control is the runtime role the
+# application connects as (app/db/roles.py), which neither owns the table nor is a superuser and
+# may not set this (tests/test_roles.py). The engine passed in is the owner's.
 @pytest.fixture
 def tamper_with_audit_events() -> Callable[..., None]:
     """`tamper_with_audit_events(engine, *statements)`: run statements past audit_events'

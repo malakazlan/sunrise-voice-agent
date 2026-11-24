@@ -110,8 +110,36 @@ All data used by this project is synthetic. No real customer or personal data is
     against accidents, not controls: the savepoint scan reads literal strings only, so it does
     not see an SQL comment between `ROLLBACK` and `TO`, `ROLLBACK WORK TO` or
     `ROLLBACK TRANSACTION TO`, or text assembled at runtime. The control is the runtime
-    database role in the next change: the app will connect as a role that neither owns the
-    table nor is a superuser.
+    database role below: the app connects as a role that neither owns the table nor is a
+    superuser, and has no `UPDATE`, `DELETE` or `TRUNCATE` on it.
+
+- Two database identities. The owner (`POSTGRES_USER`, the superuser the Postgres image
+  creates) is used only by the start-up steps: migrations, role set-up and the seed. The
+  application connects as the runtime role (`APP_DB_USER`), which `python -m app.db.roles`
+  sets up as the owner on every start, in one transaction:
+  - It is created if missing, with `LOGIN` and nothing else: not a superuser, cannot create
+    roles or databases, no replication, no bypassing row security. It owns nothing; if it
+    ever does, set-up stops.
+  - Its password is set on every start, so a changed `APP_DB_PASSWORD` works after the next
+    start and the old one stops working. The password is never sent to the server: libpq
+    (through psycopg) turns it into a SCRAM-SHA-256 verifier on the app's side, and only that
+    goes into the `ALTER ROLE` statement, so a failing statement shows the verifier, never
+    the password. A verifier cannot be used to log in but allows guessing the password
+    offline, so the password rules below still matter.
+  - It may do exactly what `app/db/grants.py` declares, and nothing else: `SELECT`, `INSERT`,
+    `UPDATE` on `patients` and `appointments`; `SELECT` on `medications`; `SELECT`, `UPDATE`
+    on `available_slots`; `SELECT`, `INSERT` on `audit_events`; nothing on `alembic_version`;
+    `USAGE` on the appointment id sequence only; `USAGE` on the schema; `CONNECT` on the
+    database. No table allows it `DELETE` or `TRUNCATE`, and it may create no table,
+    temporary ones included, function, trigger, role or schema.
+  - Anything else it holds is taken away: other grants in this database and on the database
+    itself, membership in other roles, settings attached to the role, parameter and default
+    privileges. `PUBLIC` loses every privilege on the tables and sequences, `CREATE` on the
+    schema and `CREATE` and `TEMPORARY` on the database, so nothing reaches the role that way.
+    Grants it may hold in other databases on the same server are left alone.
+  - Limits: the app's container receives both identities, so the running app process still
+    has the owner's password in its environment and settings; the trigger functions keep
+    Postgres's default `EXECUTE` for everyone (they can only run as triggers).
 
 ### Voice echo call
 
@@ -163,6 +191,8 @@ A generated slot never replaces an existing slot at the same doctor and time.
 | `POSTGRES_DB`       | database name                       | none, required |
 | `POSTGRES_USER`     | user name                           | none, required |
 | `POSTGRES_PASSWORD` | password, never logged (see below)  | none, required |
+| `APP_DB_USER`       | runtime role: `a-z 0-9 _`, up to 63, not `pg_...`, not `POSTGRES_USER` | none, required |
+| `APP_DB_PASSWORD`   | runtime role's password, never logged, not `POSTGRES_PASSWORD` | none, required |
 | `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
@@ -175,10 +205,12 @@ an empty value counts as unset. Environment variables take precedence over `.env
 `POSTGRES_*` values configure the database container in Compose, so there is one set of
 database credentials.
 
-Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
-placeholder from `.env.example`; startup stops otherwise.
+Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` must be at least 16
+characters and must not be a placeholder from `.env.example`; startup stops otherwise. In
+every environment `APP_DB_PASSWORD` must not be empty and must differ from
+`POSTGRES_PASSWORD`, and `APP_DB_USER` must differ from `POSTGRES_USER`.
 
-Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `DEMO_ACCESS_TOKEN`,
+Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
 refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
@@ -205,17 +237,19 @@ and `APP_ENV` is `prod`.
 ## Run with Docker
 
 ```sh
-cp .env.example .env          # then choose your own POSTGRES_PASSWORD
+cp .env.example .env          # then choose your own POSTGRES_PASSWORD and APP_DB_PASSWORD
 docker compose --env-file .env -f deploy/docker-compose.yml up --build
 curl http://127.0.0.1:8000/health
 ```
 
-The app container runs `alembic upgrade head`, then the seed, then the server. A failure in
-any step stops the container. The database is not published to the host.
+The app container runs, as the owner, `alembic upgrade head`, the role set-up
+(`python -m app.db.roles`) and the seed, then the server, which connects as the runtime role.
+A failure in any step stops the container. The database is not published to the host.
 
 `--env-file .env` is required: Compose takes every value from it and refuses to start, naming
 the variable, if `APP_ENV` or a database credential is missing. Each container receives only
-its own variables: the database its three credentials, the app its settings, coturn
+its own variables: the database its three credentials (the owner), the app its settings
+(both identities), coturn
 `TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn checks those three by the
 same rules as the app and stops at start-up, naming the variable, if `TURN_HOST` or
 `TURN_SHARED_SECRET` is missing or any of the three is not valid; a missing or empty
@@ -233,6 +267,7 @@ cp .env.example .env          # POSTGRES_HOST=127.0.0.1
 uv sync
 docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up -d db
 uv run alembic upgrade head
+uv run python -m app.db.roles
 uv run python -m app.db.seed
 uv run uvicorn app.main:create_app --factory --port 8000 --no-access-log
 curl http://127.0.0.1:8000/health
@@ -259,3 +294,8 @@ environment variables (not from `.env`), for example after exporting the values 
 `.env`. The user must be a superuser: each test gets its own database, migrated with Alembic,
 and drops it afterwards, and the audit tamper tests switch the audit table's triggers off for
 one transaction to show that the chain catches edits. The tests use their own audit key.
+Each test run also creates its own runtime role (`sva_test_<random>_app`, a random password)
+and sets it up in every test database, so tests of the application run as that role; set-up,
+schema checks, the seed and the tamper fixture use the owner. Roles belong to the whole
+server, so every run and every role test uses a name of its own, and the role is dropped when
+the run ends; one left behind by a crashed run never meets another run.

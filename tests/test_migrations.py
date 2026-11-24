@@ -11,7 +11,7 @@ from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db.models import Base
-from app.db.session import create_sync_engine
+from app.db.session import create_owner_sync_engine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TABLES = {"patients", "medications", "appointments", "available_slots", "audit_events"}
@@ -38,7 +38,7 @@ CONSTRAINT_DEFINITIONS = text(
 
 
 def table_names(settings: Settings) -> set[str]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return set(inspect(connection).get_table_names())
@@ -57,7 +57,7 @@ COLUMN_DEFINITIONS = text(
 
 
 def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return {tuple(row) for row in connection.execute(COLUMN_DEFINITIONS).all()}
@@ -66,7 +66,7 @@ def column_definitions(settings: Settings) -> set[tuple[object, ...]]:
 
 
 def constraint_definitions(settings: Settings) -> set[tuple[str, str, str]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             rows = connection.execute(CONSTRAINT_DEFINITIONS).all()
@@ -87,7 +87,7 @@ FUNCTION_DEFINITIONS = text(
 
 
 def definitions(settings: Settings, query: TextClause) -> set[tuple[object, ...]]:
-    engine = create_sync_engine(settings, poolclass=NullPool)
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             return {tuple(row) for row in connection.execute(query).all()}
@@ -102,7 +102,7 @@ def test_migration_matches_models(
     upgrade = run_alembic(migrated, "upgrade", "head")
     assert upgrade.returncode == 0, upgrade.stderr
 
-    engine = create_sync_engine(migrated, poolclass=NullPool)
+    engine = create_owner_sync_engine(migrated, poolclass=NullPool)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection, opts=COMPARE_OPTIONS)
@@ -117,7 +117,7 @@ def test_migration_matches_models(
     # Alembic compares CHECK constraints by name only. Build the schema straight from the
     # models as well and compare every constraint's definition.
     from_models = new_database()
-    engine = create_sync_engine(from_models, poolclass=NullPool)
+    engine = create_owner_sync_engine(from_models, poolclass=NullPool)
     try:
         with engine.begin() as connection:
             Base.metadata.create_all(connection)

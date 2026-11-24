@@ -37,7 +37,7 @@ from app.audit.log import (
 )
 from app.config import Settings
 from app.db import session as session_module
-from app.db.session import create_database_engine, create_session_factory, create_sync_engine
+from app.db.session import create_database_engine, create_owner_sync_engine, create_session_factory
 
 pytestmark = pytest.mark.anyio
 
@@ -185,9 +185,9 @@ async def wait_for_lock_waiters(session: AsyncSession, expected: int) -> None:
     await session.rollback()
 
 
-def counts(sync_engine: Engine) -> tuple[int, int]:
+def counts(owner_engine: Engine) -> tuple[int, int]:
     """(patients, audit events) as committed."""
-    with sync_engine.connect() as connection:
+    with owner_engine.connect() as connection:
         return (
             connection.execute(PATIENTS).scalar_one(),
             connection.execute(COUNT).scalar_one(),
@@ -271,7 +271,7 @@ async def test_writer_waits_for_an_uncommitted_append(
 async def test_killed_writer_releases_the_lock(
     audit: AuditLog, database: Settings, factory: Callable[[], AsyncSession]
 ) -> None:
-    admin = create_sync_engine(database, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    admin = create_owner_sync_engine(database, isolation_level="AUTOCOMMIT", poolclass=NullPool)
     second_seq: list[int] = []
     try:
         async with factory() as first, factory() as second, factory() as monitor:
@@ -300,7 +300,7 @@ async def test_killed_writer_releases_the_lock(
 async def test_verify_reads_in_batches(
     audit: AuditLog,
     database: Settings,
-    sync_engine: Engine,
+    owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,7 +326,7 @@ async def test_verify_reads_in_batches(
             assert await verified(audit, session) == intact(5)
 
             # Event 3 opens the second batch; its removal is seen across the batch boundary.
-            tamper_with_audit_events(sync_engine, "DELETE FROM audit_events WHERE seq = 3")
+            tamper_with_audit_events(owner_engine, "DELETE FROM audit_events WHERE seq = 3")
             assert await verified(audit, session) == broken(4, (4, GAP))
     finally:
         await engine.dispose()
@@ -338,13 +338,13 @@ async def test_verify_reads_in_batches(
 
 
 async def test_duplicate_seq_is_detected(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     await append_all(audit, session, THREE)
 
     # Only possible after the owner drops the primary key: an exact copy of event 2.
     tamper_with_audit_events(
-        sync_engine,
+        owner_engine,
         "ALTER TABLE audit_events DROP CONSTRAINT pk_audit_events",
         "INSERT INTO audit_events SELECT * FROM audit_events WHERE seq = 2",
     )
@@ -353,17 +353,17 @@ async def test_duplicate_seq_is_detected(
 
 
 async def test_event_spliced_from_another_chain_is_detected(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # A second chain under the same key, for example a copy of the database, supplies an
     # event 2 whose own MAC is genuine but which follows a different event 1.
     await append_all(audit, session, [call_started(cid(7)), call_ended(cid(7))])
     foreign = (await stored(session))[1]
-    tamper_with_audit_events(sync_engine, "TRUNCATE audit_events")
+    tamper_with_audit_events(owner_engine, "TRUNCATE audit_events")
 
     await append_all(audit, session, THREE)
     tamper_with_audit_events(
-        sync_engine,
+        owner_engine,
         "DELETE FROM audit_events WHERE seq = 2",
         (INSERT_ROW.text, dict(zip(ROW_COLUMNS, foreign, strict=True))),
     )
@@ -426,7 +426,7 @@ EDITS = {
 async def test_edit_to_any_column_is_detected(
     audit: AuditLog,
     session: AsyncSession,
-    sync_engine: Engine,
+    owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     column: str,
 ) -> None:
@@ -435,7 +435,7 @@ async def test_edit_to_any_column_is_detected(
     assert await verified(audit, session) == intact(3)
     before = await stored(session)
 
-    tamper_with_audit_events(sync_engine, statement)
+    tamper_with_audit_events(owner_engine, statement)
 
     assert await stored(session) != before
     assert await verified(audit, session) == broken(3, *breaks)
@@ -452,20 +452,20 @@ DELETIONS = {
 async def test_deleted_event_is_detected(
     audit: AuditLog,
     session: AsyncSession,
-    sync_engine: Engine,
+    owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     case: str,
 ) -> None:
     statements, checked, breaks = DELETIONS[case]
     await append_all(audit, session, [*THREE, call_ended(cid(2))])
 
-    tamper_with_audit_events(sync_engine, *statements)
+    tamper_with_audit_events(owner_engine, *statements)
 
     assert await verified(audit, session) == broken(checked, *breaks)
 
 
 async def test_first_event_must_follow_zeros(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # Only a key holder can write this: event 1 with a genuine MAC that does not start from
     # 64 zeros. Its position is right; its link is not.
@@ -482,7 +482,9 @@ async def test_first_event_must_follow_zeros(
         prev_mac="ab" * 32,
     )
     values = {name: getattr(genesis, name) for name in ROW_COLUMNS[:-1]}
-    tamper_with_audit_events(sync_engine, (INSERT_ROW.text, {**values, "mac": audit._mac(genesis)}))
+    tamper_with_audit_events(
+        owner_engine, (INSERT_ROW.text, {**values, "mac": audit._mac(genesis)})
+    )
 
     assert await verified(audit, session) == broken(1, (1, WRONG_START))
 
@@ -519,14 +521,14 @@ REORDERINGS = {
 async def test_reordered_events_are_detected(
     audit: AuditLog,
     session: AsyncSession,
-    sync_engine: Engine,
+    owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     case: str,
 ) -> None:
     statements, checked, breaks = REORDERINGS[case]
     await append_all(audit, session, [*THREE, call_ended(cid(2))])
 
-    tamper_with_audit_events(sync_engine, *statements)
+    tamper_with_audit_events(owner_engine, *statements)
 
     assert await verified(audit, session) == broken(checked, *breaks)
 
@@ -550,14 +552,14 @@ def forged_row(seq: int, prev_mac: str) -> dict[str, Any]:
 
 
 async def test_forged_event_is_detected(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine
 ) -> None:
     await append_all(audit, session, THREE[:2])
     head_mac = (await stored(session))[-1][10]
 
     # Inserting needs no bypass. Without the key the forger can follow every other rule: the
     # next seq, the head's MAC as prev_mac, a hash of the documented input.
-    with sync_engine.begin() as connection:
+    with owner_engine.begin() as connection:
         connection.execute(INSERT_ROW, forged_row(3, head_mac))
 
     # A genuine event written afterwards chains onto the forgery; the break is still found.
@@ -590,10 +592,10 @@ def position_refusal(error: DBAPIError) -> str | None:
 
 
 async def test_database_refuses_out_of_position_insert(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine
 ) -> None:
     def insert(seq: int, prev_mac: str) -> IntegrityError:
-        with pytest.raises(IntegrityError) as excinfo, sync_engine.begin() as connection:
+        with pytest.raises(IntegrityError) as excinfo, owner_engine.begin() as connection:
             connection.execute(INSERT_ROW, forged_row(seq, prev_mac))
         return excinfo.value
 
@@ -608,23 +610,23 @@ async def test_database_refuses_out_of_position_insert(
     assert position_refusal(insert(3, ZERO_MAC)) == "prev_mac"
 
     # The next position is accepted, and genuine appends go on after it.
-    with sync_engine.begin() as connection:
+    with owner_engine.begin() as connection:
         connection.execute(INSERT_ROW, forged_row(3, head_mac))
     assert await append_all(audit, session, [call_started(cid(3))]) == [4]
 
 
 async def test_verify_reports_every_break(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # A junk row at head + 1 needs only INSERT. Genuine events follow it, and a later one is
     # edited: both breaks are found, and nothing else.
     await append_all(audit, session, THREE[:2])
     head_mac = (await stored(session))[-1][10]
-    with sync_engine.begin() as connection:
+    with owner_engine.begin() as connection:
         connection.execute(INSERT_ROW, forged_row(3, head_mac))
     assert await append_all(audit, session, [call_started(cid(3)), call_ended(cid(3))]) == [4, 5]
     tamper_with_audit_events(
-        sync_engine, "UPDATE audit_events SET outcome = 'success' WHERE seq = 5"
+        owner_engine, "UPDATE audit_events SET outcome = 'success' WHERE seq = 5"
     )
 
     assert await verified(audit, session) == broken(5, (3, MAC), (5, MAC))
@@ -645,7 +647,7 @@ async def test_verify_caps_the_list_of_breaks(
 
 
 async def test_verify_reports_unreadable_rows_and_goes_on(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # One batch: an edited row, a timestamp at infinity, one beyond the year 9999 that the
     # driver can represent, a MAC made null by the owner, a genuine row whose link to that
@@ -655,7 +657,7 @@ async def test_verify_reports_unreadable_rows_and_goes_on(
         audit, session, [*THREE, call_ended(cid(2)), call_started(cid(3)), call_ended(cid(3))]
     )
     tamper_with_audit_events(
-        sync_engine,
+        owner_engine,
         "UPDATE audit_events SET outcome = 'failure' WHERE seq = 1",
         "UPDATE audit_events SET ts = 'infinity' WHERE seq = 2",
         "UPDATE audit_events SET ts = '20000-01-01 00:00:00+00' WHERE seq = 3",
@@ -678,13 +680,13 @@ async def test_verify_reports_unreadable_rows_and_goes_on(
 
 
 async def test_verify_reports_a_gap_next_to_an_edit(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # Event 2 removed and event 3 edited: event 3 fails its MAC and its position. A row can
     # carry more than one break.
     await append_all(audit, session, [*THREE, call_ended(cid(2))])
     tamper_with_audit_events(
-        sync_engine,
+        owner_engine,
         "DELETE FROM audit_events WHERE seq = 2",
         "UPDATE audit_events SET outcome = 'failure' WHERE seq = 3",
     )
@@ -790,7 +792,7 @@ async def test_event_rolls_back_with_the_action(audit: AuditLog, session: AsyncS
 
 
 async def test_append_refuses_a_session_outside_a_transaction(
-    audit: AuditLog, database: Settings, sync_engine: Engine
+    audit: AuditLog, database: Settings, owner_engine: Engine
 ) -> None:
     # In autocommit every statement commits on its own: the lock would end at once and the
     # event could not roll back with its action. Set on the engine and on one connection.
@@ -812,7 +814,7 @@ async def test_append_refuses_a_session_outside_a_transaction(
     finally:
         await engine.dispose()
 
-    with sync_engine.connect() as connection:
+    with owner_engine.connect() as connection:
         assert connection.execute(COUNT).scalar_one() == 1
 
 
@@ -830,37 +832,37 @@ def rewrite_on_insert(assignment: str) -> tuple[str, str]:
 
 
 async def test_action_fails_when_the_stored_mac_is_rewritten(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # The MAC becomes another 64-hex value; everything else is stored as written.
-    tamper_with_audit_events(sync_engine, *rewrite_on_insert("NEW.mac := repeat('f', 64)"))
+    tamper_with_audit_events(owner_engine, *rewrite_on_insert("NEW.mac := repeat('f', 64)"))
 
     await session.execute(INSERT_PATIENT)
     with pytest.raises(RuntimeError, match="differs from what was written"):
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 
-    assert counts(sync_engine) == (0, 0)
+    assert counts(owner_engine) == (0, 0)
 
 
 async def test_action_fails_when_stored_content_is_rewritten(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # The outcome becomes another registry value; the MAC is left as append computed it.
-    tamper_with_audit_events(sync_engine, *rewrite_on_insert("NEW.outcome := 'failure'"))
+    tamper_with_audit_events(owner_engine, *rewrite_on_insert("NEW.outcome := 'failure'"))
 
     await session.execute(INSERT_PATIENT)
     with pytest.raises(RuntimeError, match="differs from what was written"):
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 
-    assert counts(sync_engine) == (0, 0)
+    assert counts(owner_engine) == (0, 0)
 
 
 async def test_action_fails_when_the_insert_is_redirected(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
-    tamper_with_audit_events(sync_engine, *REDIRECT_BY_RULE)
+    tamper_with_audit_events(owner_engine, *REDIRECT_BY_RULE)
 
     # The rule returns the row, so only the read-back can tell.
     await session.execute(INSERT_PATIENT)
@@ -868,25 +870,25 @@ async def test_action_fails_when_the_insert_is_redirected(
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 
-    assert counts(sync_engine) == (0, 0)
-    with sync_engine.connect() as connection:
+    assert counts(owner_engine) == (0, 0)
+    with owner_engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM audit_sink")).scalar_one() == 0
 
 
 async def test_action_fails_when_the_insert_is_swallowed(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, tamper_with_audit_events: Tamper
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, tamper_with_audit_events: Tamper
 ) -> None:
     # A trigger that returns NULL makes the INSERT store nothing and return nothing; the
     # RETURNING check sees it first. (A DO INSTEAD NOTHING rule needs no test of its own:
     # Postgres refuses INSERT ... RETURNING on such a table before append's checks run.)
-    tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
+    tamper_with_audit_events(owner_engine, *SWALLOW_BY_TRIGGER)
 
     await session.execute(INSERT_PATIENT)
     with pytest.raises(RuntimeError, match="returned no row"):
         await audit.append(session, call_started(), now=T0)
     await session.commit()
 
-    assert counts(sync_engine) == (0, 0)
+    assert counts(owner_engine) == (0, 0)
 
 
 # Each caller below meets an append that fails while the database transaction is still
@@ -919,7 +921,7 @@ CALLERS = {
 async def test_action_fails_when_event_cannot_be_written(
     audit: AuditLog,
     session: AsyncSession,
-    sync_engine: Engine,
+    owner_engine: Engine,
     tamper_with_audit_events: Tamper,
     caller: str,
 ) -> None:
@@ -932,10 +934,10 @@ async def test_action_fails_when_event_cannot_be_written(
                 await audit.append(session, call_started(), now=T0)
         await session.commit()
     else:
-        tamper_with_audit_events(sync_engine, *SWALLOW_BY_TRIGGER)
+        tamper_with_audit_events(owner_engine, *SWALLOW_BY_TRIGGER)
         await CALLERS[caller](audit, session)
 
-    assert counts(sync_engine) == (0, 0)
+    assert counts(owner_engine) == (0, 0)
 
 
 @dataclass(frozen=True)
@@ -962,7 +964,7 @@ def mutated(field: str, value: object) -> Event:
 
 
 async def test_append_revalidates_the_event(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine
 ) -> None:
     attempts: list[tuple[object, type[Exception]]] = [
         (LookAlike(), TypeError),
@@ -977,11 +979,11 @@ async def test_append_revalidates_the_event(
             await audit.append(session, item, now=T0)  # type: ignore[arg-type]
         await session.commit()
 
-        assert counts(sync_engine) == (0, 0), item
+        assert counts(owner_engine) == (0, 0), item
 
 
 async def test_cancelled_append_rolls_back_the_action(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine, monkeypatch: pytest.MonkeyPatch
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The caller hangs up after the head is read; the caller's own `finally` then commits.
     # The second time, the task is cancelled again while the rollback is running.
@@ -1026,7 +1028,7 @@ async def test_cancelled_append_rolls_back_the_action(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert counts(sync_engine) == (0, 0), cancel_again
+        assert counts(owner_engine) == (0, 0), cancel_again
 
 
 async def test_failed_rollback_keeps_the_original_error(
@@ -1072,7 +1074,7 @@ async def test_idle_transaction_is_ended_by_the_server(
 ) -> None:
     show = text("SHOW idle_in_transaction_session_timeout")
     engine = create_database_engine(database)
-    sync = create_sync_engine(database, poolclass=NullPool)
+    sync = create_owner_sync_engine(database, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
             assert (await connection.execute(show)).scalar_one() == "30s"
@@ -1099,7 +1101,7 @@ async def test_idle_transaction_is_ended_by_the_server(
 
 
 async def test_database_refuses_update_delete_truncate(
-    audit: AuditLog, session: AsyncSession, sync_engine: Engine
+    audit: AuditLog, session: AsyncSession, owner_engine: Engine
 ) -> None:
     await append_all(audit, session, THREE)
     before = await stored(session)
@@ -1116,7 +1118,7 @@ async def test_database_refuses_update_delete_truncate(
         " ON audit_events.seq = source.seq WHEN MATCHED THEN DELETE",
         "TRUNCATE audit_events",
     ):
-        with pytest.raises(ProgrammingError) as excinfo, sync_engine.begin() as connection:
+        with pytest.raises(ProgrammingError) as excinfo, owner_engine.begin() as connection:
             connection.execute(text(statement))
         refusal = excinfo.value.orig
         assert isinstance(refusal, errors.InsufficientPrivilege), statement
@@ -1269,12 +1271,12 @@ def valid_row(seq: int) -> dict[str, Any]:
     }
 
 
-def test_database_rejects_free_text(sync_engine: Engine) -> None:
+def test_database_rejects_free_text(owner_engine: Engine) -> None:
     # Every row is placed at the next position (all MACs zero), so the CHECKs decide.
     accepted = 0
     for column in TEXT_COLUMNS:
         for value in FREE_TEXT:
-            with pytest.raises(IntegrityError) as excinfo, sync_engine.begin() as connection:
+            with pytest.raises(IntegrityError) as excinfo, owner_engine.begin() as connection:
                 connection.execute(INSERT_ROW, {**valid_row(accepted + 1), column: value})
             refusal = excinfo.value.orig
             assert isinstance(refusal, errors.CheckViolation), (column, value)
@@ -1284,10 +1286,10 @@ def test_database_rejects_free_text(sync_engine: Engine) -> None:
 
         # The longest allowed value, every allowed character, is accepted.
         accepted += 1
-        with sync_engine.begin() as connection:
+        with owner_engine.begin() as connection:
             connection.execute(INSERT_ROW, {**valid_row(accepted), column: "Az09_-:." + "x" * 56})
 
-    with sync_engine.connect() as connection:
+    with owner_engine.connect() as connection:
         assert connection.execute(COUNT).scalar_one() == len(TEXT_COLUMNS)
 
 

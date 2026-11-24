@@ -5,14 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import VOICE_SECRETS
+from conftest import OFFLINE_DB_ENV, VOICE_SECRETS
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
-from app.db.session import create_sync_engine
+from app.db.session import create_owner_sync_engine
 from app.main import create_app
 
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
@@ -150,6 +150,8 @@ def test_missing_database_settings_are_rejected(monkeypatch: pytest.MonkeyPatch)
 
     errors = sorted((error["type"], error["loc"]) for error in excinfo.value.errors())
     assert errors == [
+        ("missing", ("app_db_password",)),
+        ("missing", ("app_db_user",)),
         ("missing", ("audit_hmac_key",)),
         ("missing", ("postgres_db",)),
         ("missing", ("postgres_host",)),
@@ -167,16 +169,18 @@ def test_database_url_is_built_from_the_parts(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("POSTGRES_USER", "clinic_app")
     monkeypatch.setenv("POSTGRES_PASSWORD", "p@ss:word/long-enough-1")
 
-    url = Settings(_env_file=None).database_url
+    monkeypatch.setenv("APP_DB_USER", "clinic_runtime")
+    monkeypatch.setenv("APP_DB_PASSWORD", "r@ntime:word/long-enough-2")
 
-    assert url.drivername == "postgresql+psycopg"
-    assert (url.host, url.port, url.database, url.username) == (
-        "db.example",
-        6543,
-        "clinic",
-        "clinic_app",
-    )
-    assert url.password == "p@ss:word/long-enough-1"
+    settings = Settings(_env_file=None)
+    owner = settings.owner_database_url
+    runtime = settings.runtime_database_url
+
+    for url in (owner, runtime):
+        assert url.drivername == "postgresql+psycopg"
+        assert (url.host, url.port, url.database) == ("db.example", 6543, "clinic")
+    assert (owner.username, owner.password) == ("clinic_app", "p@ss:word/long-enough-1")
+    assert (runtime.username, runtime.password) == ("clinic_runtime", "r@ntime:word/long-enough-2")
 
 
 def test_database_password_is_hidden(
@@ -195,6 +199,8 @@ def test_database_password_is_hidden(
             postgres_db=server_settings.postgres_db,
             postgres_user=server_settings.postgres_user,
             postgres_password=password,
+            app_db_user=server_settings.app_db_user,
+            app_db_password="-".join(["runtime", "password", "of", "this", "test"]),
             audit_hmac_key=server_settings.audit_hmac_key,
             demo_access_token=VOICE_SECRETS["DEMO_ACCESS_TOKEN"],
             turn_host=VOICE_SECRETS["TURN_HOST"],
@@ -202,7 +208,7 @@ def test_database_password_is_hidden(
         )
 
     settings = build(server_settings.postgres_port)
-    url = settings.database_url
+    url = settings.owner_database_url
 
     assert url.password == password
     for rendered in (
@@ -217,7 +223,7 @@ def test_database_password_is_hidden(
     # A refused login: neither the error nor the engine's log lines carry the password.
     caplog.set_level(logging.DEBUG)
     caplog.set_level(logging.DEBUG, logger="sqlalchemy")
-    engine = create_sync_engine(settings, poolclass=NullPool)
+    engine = create_owner_sync_engine(settings, poolclass=NullPool)
     with pytest.raises(OperationalError) as connect_error:
         engine.connect()
 
@@ -229,7 +235,7 @@ def test_database_password_is_hidden(
 
     # A working connection logs at debug level; the real password is not in those lines.
     real_password = server_settings.postgres_password.get_secret_value()
-    working = create_sync_engine(server_settings, poolclass=NullPool)
+    working = create_owner_sync_engine(server_settings, poolclass=NullPool)
     with working.connect() as connection:
         connection.execute(text("SELECT 1"))
 
@@ -285,7 +291,7 @@ def test_weak_database_password_refused_outside_dev(monkeypatch: pytest.MonkeyPa
 
         settings = Settings(_env_file=None)
 
-        assert settings.database_url.password == password
+        assert settings.owner_database_url.password == password
 
 
 @pytest.mark.usefixtures("db_env")
@@ -560,7 +566,14 @@ TEN_DISTINCT = "abcdefghij" * 4
 
 @pytest.mark.usefixtures("offline_env")
 @pytest.mark.parametrize(
-    "name", ["POSTGRES_PASSWORD", "DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET", "AUDIT_HMAC_KEY"]
+    "name",
+    [
+        "POSTGRES_PASSWORD",
+        "APP_DB_PASSWORD",
+        "DEMO_ACCESS_TOKEN",
+        "TURN_SHARED_SECRET",
+        "AUDIT_HMAC_KEY",
+    ],
 )
 def test_secrets_need_ten_distinct_characters_outside_dev(
     monkeypatch: pytest.MonkeyPatch, name: str
@@ -586,6 +599,115 @@ def test_secrets_need_ten_distinct_characters_outside_dev(
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv(name, NINE_DISTINCT)
     assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == NINE_DISTINCT
+
+
+@pytest.mark.usefixtures("offline_env")
+def test_runtime_database_identity_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    owner_user = OFFLINE_DB_ENV["POSTGRES_USER"]
+    owner_password = OFFLINE_DB_ENV["POSTGRES_PASSWORD"]
+    runtime_user = OFFLINE_DB_ENV["APP_DB_USER"]
+    runtime_password = OFFLINE_DB_ENV["APP_DB_PASSWORD"]
+    assert (runtime_user, runtime_password) != (owner_user, owner_password)
+
+    def errors_for(**values: str) -> list[tuple[str | int, ...]]:
+        for name, value in values.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+        for value in values.values():
+            if len(value) >= 4:
+                assert value not in str(excinfo.value), value
+        return [error["loc"] for error in excinfo.value.errors()]
+
+    # Both are required in every environment; an empty password is no password.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        monkeypatch.delenv("APP_DB_USER")
+        monkeypatch.delenv("APP_DB_PASSWORD")
+        with pytest.raises(ValidationError) as missing:
+            Settings(_env_file=None)
+        assert sorted((error["type"], error["loc"]) for error in missing.value.errors()) == [
+            ("missing", ("app_db_password",)),
+            ("missing", ("app_db_user",)),
+        ]
+        monkeypatch.setenv("APP_DB_USER", runtime_user)
+        with pytest.raises(ValidationError, match="must not be empty") as empty:
+            Settings(_env_file=None, app_db_password="")
+        assert [error["loc"] for error in empty.value.errors()] == [("app_db_password",)]
+        monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
+
+    # The user name: lower-case letters, digits and underscores, at most 63 (Postgres cuts
+    # longer names), not in Postgres's reserved pg_ prefix, and never the owner's name.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for refused in (
+            "Sunrise_app",
+            "sunrise-app",
+            "sunrise app",
+            'sunrise_app"',
+            "sunrise_app;",
+            "sünrise_app",
+            "pg_sunrise",
+            "a" * 64,
+            owner_user,
+        ):
+            assert errors_for(APP_DB_USER=refused) == [("app_db_user",)], (app_env, refused)
+        for accepted in ("sunrise_app", "app2", "_app", "a" * 63):
+            monkeypatch.setenv("APP_DB_USER", accepted)
+            assert Settings(_env_file=None).app_db_user == accepted
+        monkeypatch.setenv("APP_DB_USER", runtime_user)
+
+    # The password never equals the owner's, in any environment.
+    for app_env in ("dev", "demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        assert errors_for(APP_DB_PASSWORD=owner_password) == [("app_db_password",)], app_env
+    monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
+
+    # Outside dev it is as strong as the owner's: 16 characters, 10 different ones, no
+    # surrounding whitespace, not a placeholder from .env.example.
+    for app_env in ("demo", "prod"):
+        monkeypatch.setenv("APP_ENV", app_env)
+        for refused in (
+            "fifteen-chars-x",
+            NINE_DISTINCT,
+            " " + TEN_DISTINCT,
+            example_value("APP_DB_PASSWORD"),
+            example_value("POSTGRES_PASSWORD"),
+        ):
+            assert errors_for(APP_DB_PASSWORD=refused) == [("app_db_password",)], refused
+        monkeypatch.setenv("APP_DB_PASSWORD", "sixteen-chars-xx")
+        assert Settings(_env_file=None).app_db_password.get_secret_value() == "sixteen-chars-xx"
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("APP_DB_PASSWORD", "short")
+    assert Settings(_env_file=None).app_db_password.get_secret_value() == "short"
+
+    # Neither the password nor the owner's is shown by the settings or their URLs.
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("APP_DB_PASSWORD", runtime_password)
+    monkeypatch.setenv("POSTGRES_PASSWORD", "owner-password-long-enough")
+    settings = Settings(_env_file=None)
+    runtime_url = settings.runtime_database_url
+    owner_url = settings.owner_database_url
+    assert (runtime_url.username, runtime_url.password) == (runtime_user, runtime_password)
+    assert (owner_url.username, owner_url.password) == (owner_user, "owner-password-long-enough")
+    for url in (runtime_url, owner_url):
+        assert (url.drivername, url.host, url.port, url.database) == (
+            "postgresql+psycopg",
+            OFFLINE_DB_ENV["POSTGRES_HOST"],
+            5432,
+            OFFLINE_DB_ENV["POSTGRES_DB"],
+        )
+    for rendered in (
+        repr(settings),
+        str(settings),
+        repr(settings.model_dump()),
+        repr(runtime_url),
+        str(runtime_url),
+        repr(owner_url),
+        str(owner_url),
+    ):
+        assert runtime_password not in rendered
+        assert "owner-password-long-enough" not in rendered
 
 
 @pytest.mark.usefixtures("offline_env")

@@ -137,6 +137,7 @@ jobs:
           printf '%s\n' APP_ENV=prod POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 \
             POSTGRES_DB=sunrise POSTGRES_USER=sunrise \
             POSTGRES_PASSWORD=ci-compose-only-password-0001 \
+            APP_DB_USER=sunrise_app APP_DB_PASSWORD=ci-compose-only-app-password-0001 \
             TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
             DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
             AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 UNRELATED_DECOY=1 > .env
@@ -169,6 +170,74 @@ jobs:
             psql -U sunrise -d sunrise -tAc 'SELECT count(*) FROM patients')
           echo "patients: $patients"
           test "$patients" = "5"
+      - name: The app connects as the runtime role the start-up set up
+        run: |
+          set -o pipefail
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # The app's own engine, built from its own settings inside its container, over the
+          # network with the password (scram-sha-256 in the image's pg_hba.conf).
+          user=$(bounded 60 "the app's database user" $compose exec -T app python -c '
+          import asyncio
+          from sqlalchemy import text
+          from app.config import Settings
+          from app.db.session import create_database_engine
+          async def main():
+              engine = create_database_engine(Settings())
+              async with engine.connect() as connection:
+                  print(await connection.scalar(text("SELECT current_user")))
+              await engine.dispose()
+          asyncio.run(main())
+          ')
+          echo "the app connects as: $user"
+          test "$user" = "sunrise_app"
+          # superuser, create roles, create databases, log in, replication, bypass row security
+          attributes=$(bounded 30 "the runtime role's attributes" $compose exec -T db \
+            psql -U sunrise -d sunrise -tAc "SELECT rolsuper, rolcreaterole, rolcreatedb,
+              rolcanlogin, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = 'sunrise_app'")
+          echo "runtime role attributes: $attributes"
+          test "$attributes" = "f|f|f|t|f|f"
+          # As the role (over the db container's local socket): the audit log refuses a change
+          # by privilege, before its triggers.
+          code=0
+          refused=$(bounded 30 "a DELETE as the runtime role" $compose exec -T db \
+            psql -U sunrise_app -d sunrise -tAc 'DELETE FROM audit_events' 2>&1) || code=$?
+          echo "DELETE as the runtime role -> exit $code: $refused"
+          test "$code" = "1"
+          echo "$refused" | grep -q 'permission denied for table audit_events'
+      - name: A restart runs the set-up again and changes no role or privilege
+        run: |
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          snapshot() {
+            bounded 30 "the role and privilege snapshot" $compose exec -T db \
+              psql -U sunrise -d sunrise -tA \
+              -c "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin,
+                rolreplication, rolbypassrls FROM pg_roles WHERE rolname = 'sunrise_app'" \
+              -c "SELECT relname, relacl FROM pg_class
+                WHERE relnamespace = 'public'::regnamespace ORDER BY relname" \
+              -c "SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public'" \
+              -c "SELECT datacl FROM pg_database WHERE datname = 'sunrise'"
+          }
+          app=$($compose ps -q app)
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          snapshot > "$RUNNER_TEMP/privileges-before"
+          cat "$RUNNER_TEMP/privileges-before"
+          # The snapshot holds the role and its grants, so the comparison below means something.
+          grep -qx 'sunrise_app|f|f|f|t|f|f' "$RUNNER_TEMP/privileges-before"
+          grep -q '^audit_events|.*sunrise_app=ar/sunrise' "$RUNNER_TEMP/privileges-before"
+          bounded 120 "the app to restart" $compose restart app
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health again"
+          restarted=$(docker inspect --format '{{.State.StartedAt}}' "$app")
+          echo "started $started, restarted $restarted"
+          test "$restarted" != "$started"
+          snapshot > "$RUNNER_TEMP/privileges-after"
+          diff "$RUNNER_TEMP/privileges-before" "$RUNNER_TEMP/privileges-after"
+          # The set-up ran on both starts: it created the role once and found it the second time.
+          bounded 60 "the app's logs" $compose logs --no-color app > "$RUNNER_TEMP/app-logs"
+          grep runtime_role_ready "$RUNNER_TEMP/app-logs"
+          test "$(grep -c 'runtime_role_ready created=True' "$RUNNER_TEMP/app-logs")" = 1
+          test "$(grep -c 'runtime_role_ready created=False' "$RUNNER_TEMP/app-logs")" = 1
       - name: The db container holds only the database variables
         run: |
           db=$(docker compose --env-file .env -f deploy/docker-compose.yml ps -q db)
@@ -346,9 +415,22 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           for name in postgres_host postgres_db postgres_user postgres_password \
-            audit_hmac_key turn_shared_secret turn_host demo_access_token; do
+            app_db_user app_db_password audit_hmac_key turn_shared_secret turn_host \
+            demo_access_token; do
             echo "$output" | grep -q "$name"
           done
+      - name: Container whose runtime user is the owner must not start
+        run: |
+          . .github/ci-wait.sh
+          # Every other setting is valid (the Compose env file), so only this rule can stop it.
+          code=0
+          output=$(bounded_run 60 "the app container to refuse to start" ci-same-user --rm \
+            --env-file .env -e APP_DB_USER=sunrise sunrise-voice-agent:ci 2>&1) || code=$?
+          echo "$output" | tail -n 5
+          echo "exit code: $code"
+          test "$code" = "1"
+          echo "$output" | grep -q "1 validation error for Settings"
+          echo "$output" | grep -q "app_db_user must differ from postgres_user"
       - name: Compose logs
         if: always()
         run: timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml logs || true

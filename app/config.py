@@ -20,6 +20,12 @@ MIN_SECRET_LENGTH = 32
 # What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
 TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
+# The APP_DB_PASSWORD value in .env.example. It is only accepted when APP_ENV=dev.
+EXAMPLE_APP_DB_PASSWORD = "change-me-to-another-long-random-value"  # noqa: S105 (a published placeholder)
+# The runtime role's name goes into role set-up statements (app/db/roles.py), always quoted.
+# Postgres cuts names after 63 bytes and reserves the pg_ prefix.
+APP_DB_USER_NAME = re.compile(r"[a-z0-9_]{1,63}")
+RESERVED_ROLE_PREFIX = "pg_"
 # The AUDIT_HMAC_KEY value in .env.example. It is only accepted when APP_ENV=dev.
 EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a published placeholder)
 MIN_AUDIT_KEY_LENGTH = 32
@@ -63,8 +69,12 @@ class Settings(BaseSettings):
     postgres_host: str
     postgres_port: int = 5432
     postgres_db: str
+    # The owner: migrations, role set-up and the seed at start-up only.
     postgres_user: str
     postgres_password: SecretStr
+    # The runtime role the application connects as (app/db/roles.py sets it up).
+    app_db_user: str
+    app_db_password: SecretStr
 
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
@@ -126,6 +136,42 @@ class Settings(BaseSettings):
                 " and must not be the .env.example placeholder"
             )
         _check_strong_secret("postgres_password", value, info)
+        return value
+
+    @field_validator("app_db_user")
+    @classmethod
+    def runtime_user_is_a_plain_name_of_its_own(cls, value: str, info: ValidationInfo) -> str:
+        if not APP_DB_USER_NAME.fullmatch(value) or value.startswith(RESERVED_ROLE_PREFIX):
+            raise ValueError(
+                "app_db_user must be 1 to 63 lower-case letters, digits and underscores,"
+                f" not starting with {RESERVED_ROLE_PREFIX}"
+            )
+        if value == info.data.get("postgres_user"):
+            raise ValueError("app_db_user must differ from postgres_user")
+        return value
+
+    @field_validator("app_db_password")
+    @classmethod
+    def runtime_password_is_its_own_and_strong_outside_dev(
+        cls, value: SecretStr, info: ValidationInfo
+    ) -> SecretStr:
+        password = value.get_secret_value()
+        if not password:
+            raise ValueError("app_db_password must not be empty")
+        owner_password = info.data.get("postgres_password")
+        if owner_password is not None and password == owner_password.get_secret_value():
+            raise ValueError("app_db_password must differ from postgres_password")
+        if info.data.get("app_env") in (None, "dev"):
+            return value
+        if len(password) < MIN_PASSWORD_LENGTH or password in (
+            EXAMPLE_PASSWORD,
+            EXAMPLE_APP_DB_PASSWORD,
+        ):
+            raise ValueError(
+                f"outside dev app_db_password needs at least {MIN_PASSWORD_LENGTH} characters"
+                " and must not be a .env.example placeholder"
+            )
+        _check_strong_secret("app_db_password", value, info)
         return value
 
     @field_validator("audit_hmac_key")
@@ -190,14 +236,23 @@ class Settings(BaseSettings):
             _check_strong_secret("demo_access_token", value, info)
         return value
 
-    @property
-    def database_url(self) -> URL:
+    def _database_url(self, user: str, password: SecretStr) -> URL:
         """The only place a database URL is assembled. Its str() and repr() mask the password."""
         return URL.create(
             "postgresql+psycopg",
-            username=self.postgres_user,
-            password=self.postgres_password.get_secret_value(),
+            username=user,
+            password=password.get_secret_value(),
             host=self.postgres_host,
             port=self.postgres_port,
             database=self.postgres_db,
         )
+
+    @property
+    def runtime_database_url(self) -> URL:
+        """The application's connections: the runtime role."""
+        return self._database_url(self.app_db_user, self.app_db_password)
+
+    @property
+    def owner_database_url(self) -> URL:
+        """The start-up steps' connections only: the owner (see app/db/session.py)."""
+        return self._database_url(self.postgres_user, self.postgres_password)
