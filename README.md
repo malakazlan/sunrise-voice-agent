@@ -38,13 +38,20 @@ transport). There is no speech recognition, model or speech synthesis yet.
   leaves, when it has not connected within 30 seconds, or after `MAX_CALL_SECONDS`.
 - coturn runs as a Compose service built from `deploy/coturn`: one configuration file with
   allocation and bandwidth quotas, no relaying to private, loopback, link-local or unspecified
-  addresses, and its own logging switched off because it records caller addresses.
+  IPv4 addresses, and its own logging switched off because it records caller addresses.
+  Every TURN credential has its own username (`<expiry>:<random id>`), so coturn's per-user
+  quota (4 allocations, one call's worth) limits each credential; the total quota is 9 per
+  allowed call, and an allocation nobody refreshes ends within 120 seconds. The unspecified
+  IPv6 address is not denied: coturn 4.19.2 matches that rule against IPv4 peers as well and
+  then refuses every relayed call.
 
-What has been run: the test suite on Windows 10, and
-`scripts/echo_probe.py` (an aiortc client that sends a tone and checks it comes back) against
-the app in Docker Desktop on Windows, both directly and forced through coturn. On Docker
-Desktop coturn ran on the Compose network with the Docker subnet allowed as a peer, not with
-the host networking this file uses. No browser, phone or server deployment has been tried yet.
+What has been run: the test suite on Windows 10, and `scripts/echo_probe.py` (an aiortc
+client that sends a tone and checks it comes back) against the app in Docker Desktop on
+Windows, both directly and forced through coturn. The forced-relay runs used the committed
+coturn configuration with only its networking changed (`deploy/docker-compose.relay-test.yml`:
+app and coturn on 203.0.113.0/24, which coturn does not deny), no peer allowed, coturn on that
+network rather than on host networking. CI runs the same forced-relay probe. No browser, phone
+or server deployment has been tried yet.
 
 Generated slots: on every run the seed also makes sure the next 14 business days (Monday to
 Friday, strictly after today in clinic time, no holiday calendar) have slots for Dr. Patel at
@@ -63,10 +70,10 @@ A generated slot never replaces an existing slot at the same doctor and time.
 | `POSTGRES_DB`       | database name                       | none, required |
 | `POSTGRES_USER`     | user name                           | none, required |
 | `POSTGRES_PASSWORD` | password, never logged (see below)  | none, required |
-| `MAX_CONCURRENT_CALLS` | 1 to 20                          | `3`            |
+| `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
-| `TURN_SHARED_SECRET`| at least 32 characters, never logged | required unless dev |
+| `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup, and
@@ -95,9 +102,10 @@ any step stops the container. The database is not published to the host.
 `--env-file .env` is required: Compose takes every value from it and refuses to start, naming
 the variable, if `APP_ENV` or a database credential is missing. Each container receives only
 its own variables: the database its three credentials, the app its settings, coturn
-`TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn stops at start-up without
-those three, so the whole stack needs the TURN values set. coturn uses host networking, which
-needs a Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49200. The app is
+`TURN_HOST`, `TURN_SHARED_SECRET` and `MAX_CONCURRENT_CALLS`. coturn checks those three by the
+same rules as the app and stops at start-up, naming the variable, if one is missing or not
+valid, so the whole stack needs the TURN values set. coturn uses host networking, which needs a
+Linux host; it listens on 3478 (UDP and TCP) and relays on UDP 49160-49359. The app is
 published on `127.0.0.1:8000` only.
 
 ## Run locally with uv
