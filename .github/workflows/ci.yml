@@ -139,7 +139,7 @@ jobs:
             POSTGRES_PASSWORD=ci-compose-only-password-0001 \
             TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
             DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
-            UNRELATED_DECOY=1 > .env
+            AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 UNRELATED_DECOY=1 > .env
       - name: Smoke test through Compose
         run: |
           . .github/ci-wait.sh
@@ -336,17 +336,17 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           echo "$output" | grep -q "app_env"
-      - name: Container without database or voice settings must not start
+      - name: Container without database, audit or voice settings must not start
         run: |
           . .github/ci-wait.sh
           code=0
           output=$(bounded_run 60 "the app container to refuse to start" ci-no-settings --rm \
             -e APP_ENV=prod sunrise-voice-agent:ci 2>&1) || code=$?
-          echo "$output" | tail -n 12
+          echo "$output" | tail -n 15
           echo "exit code: $code"
           test "$code" = "1"
           for name in postgres_host postgres_db postgres_user postgres_password \
-            turn_shared_secret turn_host demo_access_token; do
+            audit_hmac_key turn_shared_secret turn_host demo_access_token; do
             echo "$output" | grep -q "$name"
           done
       - name: Compose logs

@@ -20,10 +20,29 @@ MIN_SECRET_LENGTH = 32
 # What coturn's entrypoint accepts too (deploy/coturn/entrypoint.sh), so both agree.
 TURN_SECRET_CHARACTERS = re.compile(r"[A-Za-z0-9._~+/=-]+")
 PLAIN_WHOLE_NUMBER = re.compile(r"[0-9]+")
+# The AUDIT_HMAC_KEY value in .env.example. It is only accepted when APP_ENV=dev.
+EXAMPLE_AUDIT_KEY = "change-me-to-a-long-random-audit-key"  # noqa: S105 (a published placeholder)
+MIN_AUDIT_KEY_LENGTH = 32
 
 
 def _outside_dev(info: ValidationInfo) -> bool:
     return info.data.get("app_env") in ("demo", "prod")
+
+
+# Every secret setting, outside dev, on top of its own length and character rules. The same
+# count is checked for TURN_SHARED_SECRET by coturn's entrypoint (deploy/coturn/entrypoint.sh).
+MIN_DISTINCT_SECRET_CHARACTERS = 10
+
+
+def _check_strong_secret(name: str, value: SecretStr, info: ValidationInfo) -> None:
+    if not _outside_dev(info):
+        return
+    secret = value.get_secret_value()
+    if secret != secret.strip() or len(set(secret)) < MIN_DISTINCT_SECRET_CHARACTERS:
+        raise ValueError(
+            f"outside dev {name} must not start or end with whitespace and needs at least"
+            f" {MIN_DISTINCT_SECRET_CHARACTERS} different characters"
+        )
 
 
 # SIMULATED_NOW: a date and a time, never a bare number or a date alone.
@@ -46,6 +65,9 @@ class Settings(BaseSettings):
     postgres_db: str
     postgres_user: str
     postgres_password: SecretStr
+
+    # The key of the audit log's hash chain (app/audit/log.py).
+    audit_hmac_key: SecretStr
 
     # A fixed clock for dev and demo. Set together with app_env=prod, startup stops.
     simulated_now: datetime | None = None
@@ -103,6 +125,25 @@ class Settings(BaseSettings):
                 f"outside dev the password needs at least {MIN_PASSWORD_LENGTH} characters"
                 " and must not be the .env.example placeholder"
             )
+        _check_strong_secret("postgres_password", value, info)
+        return value
+
+    @field_validator("audit_hmac_key")
+    @classmethod
+    def audit_key_is_set_and_strong_outside_dev(
+        cls, value: SecretStr, info: ValidationInfo
+    ) -> SecretStr:
+        key = value.get_secret_value()
+        if not key:
+            raise ValueError("audit_hmac_key must not be empty")
+        if info.data.get("app_env") == "dev":
+            return value
+        if len(key) < MIN_AUDIT_KEY_LENGTH or key == EXAMPLE_AUDIT_KEY:
+            raise ValueError(
+                f"outside dev the audit key needs at least {MIN_AUDIT_KEY_LENGTH} characters"
+                " and must not be the .env.example placeholder"
+            )
+        _check_strong_secret("audit_hmac_key", value, info)
         return value
 
     @field_validator("max_concurrent_calls", mode="before")
@@ -122,6 +163,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "turn_shared_secret may contain only letters, digits and . _ ~ + / = -"
             )
+        if value is not None:
+            _check_strong_secret("turn_shared_secret", value, info)
         return value
 
     @field_validator("turn_host")
@@ -143,6 +186,8 @@ class Settings(BaseSettings):
                 raise ValueError("demo_access_token is required unless app_env is dev")
             if info.data.get("turn_shared_secret") is not None:
                 raise ValueError("demo_access_token is required when TURN is configured")
+        else:
+            _check_strong_secret("demo_access_token", value, info)
         return value
 
     @property

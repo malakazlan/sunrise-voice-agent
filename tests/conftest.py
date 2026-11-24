@@ -17,12 +17,17 @@ from app.db.session import create_database_engine, create_session_factory, creat
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Connection values for tests that only build Settings and never connect.
+# The audit key every test uses unless it sets its own: long enough for any APP_ENV, built from
+# short pieces so that no file holds a key-shaped literal.
+TEST_AUDIT_KEY = "-".join(["test", "audit", "key"] * 4)
+
+# Required values for tests that only build Settings and never connect.
 OFFLINE_DB_ENV = {
     "POSTGRES_HOST": "db.invalid",
     "POSTGRES_DB": "sunrise_offline",
     "POSTGRES_USER": "sunrise_offline",
     "POSTGRES_PASSWORD": "offline-test-password",
+    "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
 }
 
 # Obviously fake voice settings that let a demo or prod configuration validate. Built from
@@ -81,7 +86,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def db_env(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A clean environment holding only the required database settings."""
+    """A clean environment holding only the required database settings and the audit key."""
     for key, value in OFFLINE_DB_ENV.items():
         monkeypatch.setenv(key, value)
 
@@ -111,7 +116,7 @@ def anyio_backend() -> tuple[str, dict[str, Any]]:
 @pytest.fixture(scope="session")
 def server_settings() -> Settings:
     """The database server the tests run against, taken from the POSTGRES_* variables."""
-    return Settings(_env_file=None, app_env="dev")
+    return Settings(_env_file=None, app_env="dev", audit_hmac_key=TEST_AUDIT_KEY)
 
 
 def with_database(settings: Settings, name: str) -> Settings:
@@ -150,6 +155,7 @@ def database_env(settings: Settings) -> dict[str, str]:
         "POSTGRES_DB": settings.postgres_db,
         "POSTGRES_USER": settings.postgres_user,
         "POSTGRES_PASSWORD": settings.postgres_password.get_secret_value(),
+        "AUDIT_HMAC_KEY": settings.audit_hmac_key.get_secret_value(),
     }
 
 
@@ -285,3 +291,27 @@ def close_async_driver_connection() -> Callable[[AsyncConnection], Awaitable[Non
         driver.pgconn.finish()
 
     return close
+
+
+# audit_events' triggers refuse UPDATE, DELETE and TRUNCATE, and any INSERT out of chain
+# position, for ordinary statements from every role, superusers included. Tamper tests must get
+# past them, to show that the chain catches what an owner could do: this fixture switches
+# ordinary triggers off for one transaction with session_replication_role=replica, which only a
+# superuser may set. It is not the only way past them: whoever owns the table can disable or
+# drop the triggers, or drop the table. The hygiene scan that keeps this setting out of other
+# files is a lint against accidents, not a control; the control is a runtime role that neither
+# owns the table nor is a superuser.
+@pytest.fixture
+def tamper_with_audit_events() -> Callable[..., None]:
+    """`tamper_with_audit_events(engine, *statements)`: run statements past audit_events'
+    triggers, in one transaction. A statement is SQL text, or (SQL text, bound parameters).
+    """
+
+    def tamper(engine: Engine, *statements: str | tuple[str, dict[str, Any]]) -> None:
+        with engine.begin() as connection:
+            connection.execute(text("SET LOCAL session_replication_role = replica"))
+            for statement in statements:
+                sql, parameters = (statement, {}) if isinstance(statement, str) else statement
+                connection.execute(text(sql), parameters)
+
+    return tamper

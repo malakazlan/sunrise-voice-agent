@@ -32,6 +32,7 @@ OFFLINE = Settings(
     postgres_db="sunrise_offline",
     postgres_user="sunrise_offline",
     postgres_password="offline-test-password",
+    audit_hmac_key="offline-audit-key",
 )
 
 # A synthetic patient with values that occur nowhere else, so any copy of them in an error

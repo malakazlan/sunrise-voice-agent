@@ -189,6 +189,123 @@ def test_raw_driver_connections_only_in_allowed_modules() -> None:
     assert users <= RAW_CONNECTION_ALLOWED, users - RAW_CONNECTION_ALLOWED
 
 
+# app/audit/ is the only code that writes or verifies the audit log. Everywhere else under app/
+# the model may not be named and the table's name may not appear in a string (SQL text, a
+# metadata lookup). The model's own definition and the migrations that create the table are
+# the only other places that name them. Like the trigger scan below, this is a lint against
+# accidents: a name assembled at runtime gets past it. The control is the database role.
+AUDIT_MODEL = "AuditEvent"
+AUDIT_TABLE = "audit_events"
+AUDIT_PACKAGE = "app/audit/"
+AUDIT_NAMED_IN = ("app/db/models.py", "app/db/migrations/versions/")
+
+
+def audit_table_uses(source: str) -> list[str]:
+    uses = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name) and node.id == AUDIT_MODEL:
+            uses.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr == AUDIT_MODEL:
+            uses.append(f".{node.attr}")
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] == AUDIT_MODEL:
+            uses.append(f"import {node.name}")
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and AUDIT_TABLE in node.value.lower()
+        ):
+            uses.append(repr(node.value))
+    return uses
+
+
+def test_audit_table_is_written_only_by_the_audit_module() -> None:
+    for sample in (
+        "from app.db.models import AuditEvent\n",
+        "from app.db.models import AuditEvent as Row\n",
+        "from app.db import models\ninsert(models.AuditEvent)\n",
+        "session.add(AuditEvent(seq=1))\n",
+        "text('INSERT INTO audit_events VALUES (1)')\n",
+        "text('insert into AUDIT_EVENTS values (1)')\n",
+        "Base.metadata.tables['audit_events']\n",
+    ):
+        assert audit_table_uses(sample), sample
+    assert not audit_table_uses("from app.audit.log import AuditLog, Event\n")
+
+    sources = {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in tracked_files()
+        if path.suffix == ".py" and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+    }
+    users = {name for name, source in sources.items() if audit_table_uses(source)}
+
+    assert "app/audit/log.py" in users
+    outside = {
+        name
+        for name in users
+        if not name.startswith(AUDIT_PACKAGE) and not name.startswith(AUDIT_NAMED_IN)
+    }
+    assert outside == set()
+
+
+# append refuses to run inside a nested transaction, but a savepoint written as SQL text is
+# invisible to it: `SAVEPOINT s`, append, `ROLLBACK TO SAVEPOINT s`, commit stores the action
+# without its event. So no string under app/ may hold either statement; nested transactions go
+# through SQLAlchemy, where append sees them. A lint against accidents, like the scans around it.
+RAW_SAVEPOINT = re.compile(r"\bsavepoint\b|\brollback\s+to\b", re.IGNORECASE)
+
+
+def raw_savepoint_uses(source: str) -> list[str]:
+    return [
+        repr(node.value)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and RAW_SAVEPOINT.search(node.value)
+    ]
+
+
+def test_no_raw_savepoints_under_app() -> None:
+    for sample in (
+        "await session.execute(text('SAVEPOINT s'))\n",
+        "await session.execute(text('rollback to savepoint s'))\n",
+        "connection.exec_driver_sql('Rollback  To s')\n",
+        "sql = 'RELEASE SAVEPOINT s'\n",
+    ):
+        assert raw_savepoint_uses(sample), sample
+    assert not raw_savepoint_uses("async with session.begin_nested():\n    pass\n")
+    assert not raw_savepoint_uses("await session.rollback()\n")
+
+    offenders = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in tracked_files()
+        if path.suffix == ".py"
+        and path.relative_to(REPO_ROOT).as_posix().startswith("app/")
+        and raw_savepoint_uses(path.read_text(encoding="utf-8"))
+    }
+    assert offenders == set()
+
+
+# Two ways to switch off a table's triggers by name. Only the tamper fixture in tests/conftest.py
+# may use the first; nothing may use the second. A lint against accidents, not a control: the
+# table's owner can still drop the triggers, and a string assembled at runtime is not seen. The
+# names are assembled here so that this file does not match its own scan.
+TRIGGER_BYPASS = re.compile(
+    "session_" + "replication_role" + r"|disable\s+" + "trigger", re.IGNORECASE
+)
+
+
+def test_trigger_bypass_only_in_the_tamper_fixture() -> None:
+    for sample in (
+        "SET LOCAL session_" + "replication_role = replica",
+        "set SESSION_" + "REPLICATION_ROLE to replica",
+        "ALTER TABLE audit_events DISABLE " + "TRIGGER ALL",
+        "alter table audit_events disable  " + "trigger audit_events_refuse_update",
+    ):
+        assert TRIGGER_BYPASS.search(sample), sample
+
+    assert set(files_matching(TRIGGER_BYPASS)) == {"tests/conftest.py"}
+
+
 # app/domain/ decides office hours and identity from its arguments alone: no database, no
 # network, no settings or other files. Everything it may import is listed; anything else fails.
 DOMAIN_PACKAGE = "app.domain"

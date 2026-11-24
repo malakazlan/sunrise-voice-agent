@@ -9,8 +9,8 @@ All data used by this project is synthetic. No real customer or personal data is
 - `GET /health` returns `{"status": "ok"}`. It is a liveness check only.
 - Configuration through environment variables or an optional `.env` file, validated at startup.
 - Interactive API docs (`/docs`, `/redoc`, `/openapi.json`) are served only when `APP_ENV=dev`.
-- A Postgres database with four tables (`patients`, `medications`, `appointments`,
-  `available_slots`), created by an Alembic migration.
+- A Postgres database with four clinic tables (`patients`, `medications`, `appointments`,
+  `available_slots`) and the audit log (`audit_events`), created by Alembic migrations.
 - A seed (`python -m app.db.seed`) that loads the synthetic patients and slots from
   `app/db/seed_data.json`, so running it again is safe:
   - A patient that is missing is inserted together with that patient's medications and
@@ -53,6 +53,65 @@ All data used by this project is synthetic. No real customer or personal data is
     never the first letter. A spoken name split in two (`met formin`) is joined when the
     listed name is one word and every spoken word has at least three letters and no digit.
     Zero or two matches is no match. Filler words (`my albuterol`) are not removed.
+
+- An audit log, `app/audit/log.py`, the only code that writes or verifies the
+  `audit_events` table (nothing calls it yet; later slices add their events):
+  - `AuditLog(key).append(session, event, now=...)` adds an event inside the caller's
+    transaction and does not commit, so the event and the action it records commit or roll
+    back together. Any failure, a cancelled task included, rolls back the caller's whole
+    transaction. After its INSERT, `append` reads its row back and compares every column
+    with what it wrote, so an INSERT that stores nothing, stores the row somewhere else, or
+    stores it changed counts as a failure.
+    Appends take a transaction-scoped advisory lock and wait for it at most 5 seconds (that
+    timeout stays in force for the rest of the caller's transaction), so callers append
+    last, just before they commit, at the top level of their transaction: an append in a
+    nested transaction, or on a session in autocommit mode, is refused. `now` must carry a time
+    zone. Callers use the default isolation level, READ COMMITTED; under REPEATABLE READ or
+    SERIALIZABLE an append that meets another writer fails on the primary key (it fails
+    closed).
+  - Every database connection the app opens is ended by the server after 30 seconds idle
+    inside a transaction, so an abandoned transaction cannot hold the lock for long.
+  - An event holds only registry codes (action, resource type, outcome, reason) and
+    identifiers of a declared shape: a call id is a version-4 UUID in hex (its version and
+    variant checked), a patient id is `P` and 3 to 6 digits, an appointment, medication or
+    slot id is its row number (up to 8 digits), and the actor is `agent` or `admin:` and a
+    user name of letters and underscores. The database's own CHECKs are the outer bound: at
+    most 64 letters, digits, `_`, `-`, `:` and `.`, no spaces.
+  - Each event carries `prev_mac` and `mac`: HMAC-SHA256 under `AUDIT_HMAC_KEY` over the
+    previous MAC and the event's canonical form, which is documented in the module.
+    `AuditLog(key).verify(session)` walks the whole chain in batches. Its result's
+    `checked` is the number of events it read, good or broken; `breaks` lists every break
+    (the first 100, and `truncated` says whether there were more): an edited event, a removed or
+    duplicated one, a reordering, a forged event, the wrong key, or a stored value it cannot
+    read. A row's content (its MAC) and its position (its seq) are both checked, so one row
+    can carry two breaks, for example a gap and a MAC mismatch next to a removed row. After a
+    break it goes on from that row's stored MAC, so later tampering is still found, and one
+    edit can show twice: changing only a row's stored MAC breaks that row and the link of the
+    row after it. It never raises because of what is stored. A row whose seq is null (only
+    possible once the owner drops the primary key) is reported as unreadable; it sorts last,
+    so no row comes after it to be checked against it.
+  - Limits of the chain: removing the newest events is not visible from the chain alone;
+    that needs the head kept outside the database. Anyone who can INSERT can add a row at
+    the next position without the key; `verify` reports it as one break and checks the
+    genuine events after it. The MAC does not bind a chain to one database, so every
+    database gets its own `AUDIT_HMAC_KEY`: a chain copied from another database under the
+    same key is not detected.
+  - Limits of the identifier shapes: they say what an identifier looks like, not what it
+    means. A patient id, a row id and the digits inside a call id can coincide with other
+    numbers, such as part of a date, a phone number or an SSN, and an admin user name can be
+    a person's name. The control for `call_id` is where it comes from: the server generates
+    it and never takes one from the caller or the model.
+  - What the database enforces: triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on
+    `audit_events`, and any `INSERT` out of chain position, for ordinary statements from
+    every role, superusers included. Whoever owns the table, or a superuser, can still
+    disable or drop the triggers or drop the table; the chain still shows any edit made that
+    way. The repo's scans that keep writes to the table in `app/audit/`, the trigger switch in
+    the test fixture, and raw `SAVEPOINT` or `ROLLBACK TO` text out of `app/` are lints
+    against accidents, not controls: the savepoint scan reads literal strings only, so it does
+    not see an SQL comment between `ROLLBACK` and `TO`, `ROLLBACK WORK TO` or
+    `ROLLBACK TRANSACTION TO`, or text assembled at runtime. The control is the runtime
+    database role in the next change: the app will connect as a role that neither owns the
+    table nor is a superuser.
 
 ### Voice echo call
 
@@ -104,6 +163,7 @@ A generated slot never replaces an existing slot at the same doctor and time.
 | `POSTGRES_DB`       | database name                       | none, required |
 | `POSTGRES_USER`     | user name                           | none, required |
 | `POSTGRES_PASSWORD` | password, never logged (see below)  | none, required |
+| `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
@@ -117,6 +177,17 @@ database credentials.
 
 Unless `APP_ENV=dev`, `POSTGRES_PASSWORD` must be at least 16 characters and must not be the
 placeholder from `.env.example`; startup stops otherwise.
+
+Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `DEMO_ACCESS_TOKEN`,
+`TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`) must also not start or end with whitespace and must
+contain at least 10 different characters, on top of its own rules. coturn's entrypoint
+refuses a `TURN_SHARED_SECRET` with fewer than 10 different characters too; it has no notion
+of environment, so it applies the rule in dev as well.
+
+`AUDIT_HMAC_KEY` must be set and not empty in every environment. Unless `APP_ENV=dev` it must
+be at least 32 characters and must not be the placeholder from `.env.example`. Keep it outside
+the database: whoever holds it can write events that verify. Changing it makes the existing
+log fail verification.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -185,5 +256,6 @@ uv run python scripts/echo_probe.py --url http://127.0.0.1:8000 --calls 2
 
 The tests need a running database server and read its address from the `POSTGRES_*`
 environment variables (not from `.env`), for example after exporting the values from your
-`.env`. The user must be allowed to create databases: each test gets its own database,
-migrated with Alembic, and drops it afterwards.
+`.env`. The user must be a superuser: each test gets its own database, migrated with Alembic,
+and drops it afterwards, and the audit tamper tests switch the audit table's triggers off for
+one transaction to show that the chain catches edits. The tests use their own audit key.

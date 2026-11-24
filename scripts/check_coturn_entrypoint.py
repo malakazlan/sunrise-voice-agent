@@ -29,9 +29,11 @@ COTURN_DIR = REPO_ROOT / "deploy" / "coturn"
 CONFIG = "/tmp/turnserver.conf"  # noqa: S108 (the path inside the coturn container)
 # Seconds one container run may take; each finishes in about one second.
 RUN_TIMEOUT = 30
+# Valid by both sides' rules (32 characters or more, at least 10 different), so that each case
+# changes one variable only.
 VALID = {
     "TURN_HOST": "turn.example.test",
-    "TURN_SHARED_SECRET": "a" * 32,
+    "TURN_SHARED_SECRET": "abcdefghij" * 4,
     "MAX_CONCURRENT_CALLS": "3",
 }
 # Run in the container: write the stub where the container user can run it, put it first on

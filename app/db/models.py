@@ -1,18 +1,24 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     CHAR,
+    BigInteger,
     CheckConstraint,
+    Connection,
     DateTime,
     ForeignKey,
     MetaData,
     Numeric,
+    Table,
     Text,
     UniqueConstraint,
+    event,
     false,
     func,
     literal_column,
+    text,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -112,3 +118,96 @@ class Appointment(Base):
     reason_short: Mapped[str | None]
     status: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+# Every text column of an audit event except the MACs: identifiers and registry codes only.
+# Letters, digits, _ - : and ., 1 to 64 of them; no space, so never a sentence.
+AUDIT_TEXT_PATTERN = "[A-Za-z0-9_:.-]{1,64}"
+
+
+def _audit_text(column: str) -> CheckConstraint:
+    return CheckConstraint(f"{column} ~ '^{AUDIT_TEXT_PATTERN}$'", name=column)
+
+
+class AuditEvent(Base):
+    """One event of the audit log. Written and verified only by app/audit/log.py."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = tuple(
+        _audit_text(column)
+        for column in (
+            "call_id",
+            "actor",
+            "action",
+            "resource_type",
+            "resource_id",
+            "outcome",
+            "reason",
+        )
+    )
+
+    # No default and no sequence: the app assigns previous + 1 under the chain's lock.
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    ts: Mapped[datetime]
+    call_id: Mapped[str | None]
+    actor: Mapped[str]
+    action: Mapped[str]
+    resource_type: Mapped[str]
+    resource_id: Mapped[str | None]
+    outcome: Mapped[str]
+    reason: Mapped[str | None]
+    prev_mac: Mapped[str] = mapped_column(CHAR(64))
+    mac: Mapped[str] = mapped_column(CHAR(64))
+
+
+# audit_events is append-only for every role, the owner and superusers included: a statement
+# that would update, delete or truncate is refused before it touches a row, even when it
+# matches none. The migrations create the same functions and triggers.
+AUDIT_PROTECTION = (
+    "CREATE FUNCTION audit_events_refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+    "BEGIN\n"
+    "  RAISE EXCEPTION 'audit_events is append-only'\n"
+    "    USING ERRCODE = 'insufficient_privilege', TABLE = TG_TABLE_NAME;\n"
+    "END\n"
+    "$$",
+    "CREATE TRIGGER audit_events_refuse_update BEFORE UPDATE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    "CREATE TRIGGER audit_events_refuse_delete BEFORE DELETE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    "CREATE TRIGGER audit_events_refuse_truncate BEFORE TRUNCATE"
+    " ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_refuse_change()",
+    *(
+        # The database itself keeps the chain in position: a row is accepted only at seq
+        # head + 1 (1 on an empty table) after the head's MAC (64 zeros on an empty table),
+        # as far as the inserting statement can see the head. Two inserts at the same
+        # position can both pass this check when neither sees the other's uncommitted row;
+        # the primary key on seq then refuses the second once the first commits. append
+        # serialises its own writes with the chain's advisory lock, so they never meet here.
+        "CREATE FUNCTION audit_events_check_position() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+        "DECLARE\n"
+        "  head_seq bigint;\n"
+        "  head_mac char(64);\n"
+        "BEGIN\n"
+        "  SELECT seq, mac INTO head_seq, head_mac FROM audit_events ORDER BY seq DESC LIMIT 1;\n"
+        "  IF NEW.seq IS DISTINCT FROM coalesce(head_seq, 0) + 1 THEN\n"
+        "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+        "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME, COLUMN = 'seq';\n"
+        "  END IF;\n"
+        "  IF NEW.prev_mac IS DISTINCT FROM coalesce(head_mac, repeat('0', 64)) THEN\n"
+        "    RAISE EXCEPTION 'audit_events row out of position' USING\n"
+        "      ERRCODE = 'integrity_constraint_violation', TABLE = TG_TABLE_NAME,\n"
+        "      COLUMN = 'prev_mac';\n"
+        "  END IF;\n"
+        "  RETURN NEW;\n"
+        "END\n"
+        "$$",
+        "CREATE TRIGGER audit_events_check_position BEFORE INSERT"
+        " ON audit_events FOR EACH ROW EXECUTE FUNCTION audit_events_check_position()",
+    ),
+)
+
+
+@event.listens_for(AuditEvent.__table__, "after_create")
+def _protect_audit_events(target: Table, connection: Connection, **kw: Any) -> None:
+    for statement in AUDIT_PROTECTION:
+        connection.execute(text(statement))
