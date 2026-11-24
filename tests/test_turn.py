@@ -31,7 +31,7 @@ from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry
 from app.agent.tools import register_tools
 from app.agent.turn import CALL_CONNECTED, CallAgent, drain_guard_audits, start_call
-from app.audit.log import CHAIN_LOCK, AuditLog
+from app.audit.log import CHAIN_LOCK, AuditLog, Reason
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
@@ -63,6 +63,7 @@ EMERGENCY = (
     " nearest emergency room right away."
 )
 FALLBACK = "I'm sorry, I can't help with that. I can take a message for our staff instead."
+TRANSFER = "I'm transferring you to our staff now. Please hold."
 ADVICE_REFUSAL = "I'm not able to give medical advice. I can send a message to your doctor instead."
 
 CLAIM_TURN = "Hi, this is Sarah Johnson, J O H N S O N, born March 14, 1985."
@@ -604,7 +605,12 @@ REASONS = {
     ],
 )
 async def test_model_failures_fall_back(
-    deps: Deps, registry: Registry, caplog: pytest.LogCaptureFixture, first: str, second: str
+    deps: Deps,
+    registry: Registry,
+    owner_engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    first: str,
+    second: str,
 ) -> None:
     caplog.set_level(logging.INFO)
     model = ScriptedModel(*FAILURES[first]())
@@ -625,19 +631,16 @@ async def test_model_failures_fall_back(
     model.then(*FAILURES[second]())
     twice = await agent.handle("Hello?")
 
-    assert twice.lines == (FALLBACK,)
+    # The second failure raises the hand-off, and with the office open it acts: code hands the
+    # call to the staff (hand_off_to_staff), its transfer line in place of the fallback, and the
+    # call ends with it.
+    assert twice.lines == (TRANSFER,)
     assert twice.hand_off is True
-
-    # The call goes on, and the conversation is still one the API takes.
-    model.then(says("I'm here."))
-    after = await agent.handle("Are you there?")
-    assert after.lines == ("I'm here.",)
-    assert after.hand_off is True
-    assert_well_formed(model.requests[-1].messages)
-    fallbacks = [
-        m for m in model.requests[-1].messages if m == {"role": "assistant", "content": FALLBACK}
-    ]
-    assert len(fallbacks) == 2
+    assert agent.state.phase is Phase.HANDOFF
+    assert agent.ending is Reason.TRANSFERRED
+    assert ("transfer_requested", "call", agent.state.call_id, "success", "other") in (
+        rows_with_reasons(owner_engine)
+    )
     call_id = agent.state.call_id
     assert [
         r.getMessage() for r in caplog.records if r.getMessage().startswith("model_fallback")
@@ -811,13 +814,12 @@ async def test_two_blocks_hand_off(
         says("Our staff can help with that."),
         says("You should skip your next dose."),
         says("That's nothing to worry about."),
-        says("I can take a message."),
     )
     agent = await agent_for(model, deps, registry)
 
     turns = [
         await agent.handle(caller)
-        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?", "Okay.")
+        for caller in ("I feel sick.", "What now?", "Can I skip it?", "Is that bad?")
     ]
 
     assert [(turn.lines, turn.withheld, turn.hand_off) for turn in turns] == [
@@ -825,11 +827,12 @@ async def test_two_blocks_hand_off(
         # An allowed reply in between: the count starts again.
         (("Our staff can help with that.",), None, False),
         ((ADVICE_REFUSAL,), "medical_advice", False),
-        # Two blocks in a row.
-        ((ADVICE_REFUSAL,), "medical_advice", True),
-        # The hand-off, once asked for, stays asked for.
-        (("I can take a message.",), None, True),
+        # Two blocks in a row: with the office open the call is handed to the staff, the
+        # transfer line in place of the block's, and it ends with it.
+        ((TRANSFER,), "medical_advice", True),
     ]
+    assert agent.state.phase is Phase.HANDOFF
+    assert agent.ending is Reason.TRANSFERRED
     call_id = agent.state.call_id
     assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("guard_")] == [
         f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
@@ -837,10 +840,49 @@ async def test_two_blocks_hand_off(
         f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
     ]
     await drain_guard_audits()
-    assert (
-        rows_with_reasons(owner_engine)
-        == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
+    events = rows_with_reasons(owner_engine)
+    assert [e for e in events if e[0] == "guard_block"] == [
+        ("guard_block", "call", call_id, "refused", "medical_advice")
+    ] * 3
+    assert [e for e in events if e[0] == "transfer_requested"] == [
+        ("transfer_requested", "call", call_id, "success", "other")
+    ]
+
+
+@pytest.mark.parametrize("signal", ["model_failures", "guard_blocks"])
+async def test_the_hand_off_with_the_office_closed(
+    offline_deps: Deps, registry: Registry, signal: str
+) -> None:
+    # No one to transfer to: the turn that raises the hand-off offers the caller a message
+    # (the fallback line), once; the call goes on in intake, and later turns are as before.
+    closed = Deps(
+        sessions=offline_deps.sessions,
+        audit=offline_deps.audit,
+        now=lambda: EVENING,
+        claim_keys=offline_deps.claim_keys,
     )
+    state = move(
+        new_call(call_id=new_call_id(), started_at=EVENING, office_open=False), Phase.INTAKE
+    )
+    advice = "You should skip your next dose."
+    steps: list[Step] = (
+        [api_error, api_error, api_error]
+        if signal == "model_failures"
+        else [says(advice), says(advice), says(advice)]
+    )
+    agent = CallAgent(state, closed, ScriptedModel(*steps), registry)
+
+    turns = [await agent.handle(caller) for caller in ("Hello.", "Hello?", "Are you there?")]
+
+    usual = FALLBACK if signal == "model_failures" else ADVICE_REFUSAL
+    assert [(turn.lines, turn.hand_off) for turn in turns] == [
+        ((usual,), False),
+        ((FALLBACK,), True),
+        ((usual,), True),
+    ]
+    assert agent.state.phase is Phase.INTAKE
+    assert agent.ending is None
+    await drain_guard_audits()
 
 
 QUESTION = "Should I stop taking my Lisinopril because of the headaches?"

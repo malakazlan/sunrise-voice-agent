@@ -24,7 +24,13 @@ FIRST_TOKEN_SECONDS, a reply not finished within REPLY_SECONDS after it, a reply
 plain answer or a tool request, one tool round too many, or a reply whose first sentence is
 over the output guard's length bound: the fixed fallback line, and the call goes on.
 MAX_MODEL_FAILURES of them in one call raise the hand-off signal, as does a tool outcome that
-asks for one.
+asks for one (`call_tool` has acted on that one already).
+
+The hand-off acts once, on the failure or the block that raises it, by the code-only path a
+failing tool's hand-off takes (`hand_off`, app/agent/tools.py): with the office open the call is
+handed to the staff, whose transfer line is said in place of the turn's own, and the call, now
+in handoff, ends; with it closed the caller is offered a message (the fallback line) and the
+call goes on.
 
 A plain answer goes through the output guard (app/guard/output.py) a sentence at a time before
 it is returned: what passes is said; a blocked sentence is replaced by its rule's scripted line
@@ -80,7 +86,7 @@ from app.agent.tool_registry import (
     ToolDescription,
     ToolOutcome,
 )
-from app.agent.tools import call_tool, submit_claim
+from app.agent.tools import call_tool, hand_off, offers_a_message, submit_claim
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.guard.input import GuardAction, guard_input
 from app.guard.output import GuardedReply, OutputRule, guard_reply
@@ -386,14 +392,14 @@ class CallAgent:
                     guarded = guard_reply([reply.text], self._state, read_back=tuple(read_back))
                     if not guarded.said and guarded.block is None:
                         raise _ModelFailedError("reply_too_long")
-                    self._say_guarded(guarded)
+                    await self._say_guarded(guarded)
                     withheld = None if guarded.block is None else guarded.block.rule
                     break
                 raise _ModelFailedError(
                     "refusal" if reply.stop_reason == "refusal" else "stop_reason"
                 )
         except _ModelFailedError as failure:
-            self._fall_back(failure.reason)
+            await self._fall_back(failure.reason)
         first = round((marks[0] - started) * 1000) if marks else None
         last = round((marks[-1] - started) * 1000) if marks else None
         timings = TurnTimings(first_token_ms=first, last_token_ms=last, tool_rounds=rounds)
@@ -408,15 +414,17 @@ class CallAgent:
         self._filler_said = True
         self.say(ScriptId.FILLER)
 
-    def _say_guarded(self, guarded: GuardedReply) -> None:
+    async def _say_guarded(self, guarded: GuardedReply) -> None:
         """The sentences that passed, as one line, and the block's scripted line, each added to
-        the conversation as it is released. The blocked text is not kept."""
+        the conversation as it is released; when the block raises the hand-off, what the
+        hand-off says instead. The blocked text is not kept."""
         if guarded.said:
             self._release(" ".join(guarded.said), None)
         if guarded.block is None:
             self._blocks = 0
             return
         self._blocks += 1
+        raises = self._blocks >= MAX_GUARD_BLOCKS and not self._hand_off
         if self._blocks >= MAX_GUARD_BLOCKS:
             self._hand_off = True
         logger.warning(
@@ -427,6 +435,8 @@ class CallAgent:
             self._hand_off,
         )
         self._audit_block(guarded.block.rule)
+        if raises and await self._hands_off():
+            return
         self.say(guarded.block.script)
 
     def _audit_block(self, rule: OutputRule) -> None:
@@ -550,8 +560,11 @@ class CallAgent:
         self._messages.append({"role": "user", "content": results})
         return scripted
 
-    def _fall_back(self, reason: str) -> str:
+    async def _fall_back(self, reason: str) -> None:
+        """The fallback line; when this failure raises the hand-off, what the hand-off says
+        instead."""
         self._failures += 1
+        raises = self._failures >= MAX_MODEL_FAILURES and not self._hand_off
         if self._failures >= MAX_MODEL_FAILURES:
             self._hand_off = True
         logger.warning(
@@ -561,7 +574,25 @@ class CallAgent:
             self._failures,
             self._hand_off,
         )
-        return self.say(ScriptId.FALLBACK)
+        if raises and await self._hands_off():
+            return
+        self.say(ScriptId.FALLBACK)
+
+    async def _hands_off(self) -> bool:
+        """The hand-off acting, once, on the outcome that raised it. With the office open the
+        call goes to the staff the way a failing tool's does (`hand_off` of app/agent/tools.py):
+        its line is said and the call is in handoff, which ends it. With it closed, the caller
+        is offered a message instead: the fallback line. False when there is neither, and the
+        turn's own line is said."""
+        handed = await hand_off(self._state, self._deps)
+        if handed is not None:
+            self._state, outcome = handed
+            self._line_for(outcome)
+            return True
+        if offers_a_message(self._state):
+            self.say(ScriptId.FALLBACK)
+            return True
+        return False
 
 
 async def drain_guard_audits(timeout: float = AUDIT_WAIT_SECONDS) -> None:

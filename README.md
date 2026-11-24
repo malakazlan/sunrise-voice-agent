@@ -315,9 +315,12 @@ Limits of this slice:
 
 - The model's text reaches the caller and the page through the output guard (see "Output
   guard" below). All data is synthetic.
-- The hand-off signal (two model failures or two blocked replies) is shown on the page and
-  nothing acts on it; a tool outcome that reaches the limit of failures or refusals does hand
-  the call to the staff. The guard's flags (an attempt to override the instructions, a request
+- The hand-off (two model failures in a call, two blocked replies in a row, or a tool outcome
+  that reaches the limit of failures or refusals) acts once, on the outcome that raises it,
+  by one code path (`hand_off` in `app/agent/tools.py`): with the office open the transfer line
+  is said in place of the turn's own and the call ends with `transferred`; with it closed the
+  caller is offered a message (the fallback line) and the call goes on. The page shows that it
+  was raised. The guard's flags (an attempt to override the instructions, a request
   about someone else) are not passed to the model.
 - One call's conversation is kept in memory only, for the call's life.
 - The verified line, said by code, puts the caller's first name in the conversation the model
@@ -918,7 +921,6 @@ you stopped speaking`) and logged as `turn_first_audio`. It includes `VAD_STOP_S
 Limits of this slice:
 
 - Not measured here: the first-audio time on a real call; it is the founder's live call.
-- The hand-off signal still does nothing (see above).
 - The conversation keeps what was heard as far as ElevenLabs reports it: its word timestamps
   run slightly ahead of or behind the audio the caller hears, so a word either side of the cut
   may be counted wrongly.
