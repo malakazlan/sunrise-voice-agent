@@ -147,14 +147,46 @@ def test_migration_matches_models(
         "ck_verification_attempts_claim_key",
         "CHECK ((claim_key ~ '^[0-9a-f]{64}$'::text))",
     ) in migrated_constraints
-    # A call asks for the same thing once, and leaves the same message once.
+    # A call asks for the same thing once, and leaves the same message once: the same text, and
+    # for a call back the same name and number too (a doctor's message has neither, and two
+    # missing values count as the same).
     assert {
         ("requests", "uq_requests_call_id_type_summary", "UNIQUE (call_id, type, summary)"),
-        ("messages", "uq_messages_call_id_kind_body", "UNIQUE (call_id, kind, body)"),
+        (
+            "messages",
+            "uq_messages_call_id_kind_body_name_callback_number",
+            "UNIQUE NULLS NOT DISTINCT (call_id, kind, body, name, callback_number)",
+        ),
+    } <= migrated_constraints
+
+    # The kinds of request and message, and whether a message was left after hours.
+    assert {
+        (
+            "requests",
+            "ck_requests_type",
+            "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text,"
+            " 'callback'::text, 'transfer'::text])))",
+        ),
+        (
+            "messages",
+            "ck_messages_kind",
+            "CHECK ((kind = ANY (ARRAY['doctor_message'::text, 'callback'::text])))",
+        ),
     } <= migrated_constraints
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 64
+    assert len(migrated_columns) == 65
+    assert (
+        "messages",
+        "after_hours",
+        "boolean",
+        None,
+        None,
+        None,
+        "NO",
+        "false",
+        "NO",
+    ) in migrated_columns
     assert migrated_columns == column_definitions(from_models)
     assert ("patients", "id", "text", None, None, None, "NO", None, "NO") in migrated_columns
     # seq has no default: the app assigns it under the lock, never a sequence.
@@ -255,6 +287,28 @@ def test_booking_requests_step_down_and_up(
     assert request_type_rule(empty_database) == without
     assert run_alembic(empty_database, "upgrade", "9a4f2c71d0e8").returncode == 0
     assert request_type_rule(empty_database) == with_booking
+
+
+def test_callback_and_transfer_requests_step_down_to_booking(
+    empty_database: StartupSettings, run_alembic: Alembic
+) -> None:
+    # The call endings' types come after booking's, and stepping back leaves booking's.
+    every_type = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text,"
+        " 'callback'::text, 'transfer'::text])))"
+    )
+    with_booking = (
+        "CHECK ((type = ANY (ARRAY['refill'::text, 'doctor_message'::text, 'booking'::text])))"
+    )
+    assert run_alembic(empty_database, "upgrade", "head").returncode == 0
+    assert request_type_rule(empty_database) == every_type
+
+    step_down = run_alembic(empty_database, "downgrade", "9a4f2c71d0e8")
+
+    assert step_down.returncode == 0, step_down.stderr
+    assert request_type_rule(empty_database) == with_booking
+    assert run_alembic(empty_database, "upgrade", "head").returncode == 0
+    assert request_type_rule(empty_database) == every_type
 
 
 def test_migration_without_database_settings_names_them(tmp_path: Path) -> None:

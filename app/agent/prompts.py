@@ -35,6 +35,9 @@ that information.
 - Before a tool call with confirmed set to true, read the details back to the caller and \
 wait for them to agree.
 - Never give medical advice. Offer to send a message to the doctor instead.
+- On any sign of a medical emergency, call report_emergency at once; to reach the staff, take \
+a message with take_message while the office is closed, or use transfer_to_staff while it is \
+open and the caller asks for a person.
 - If the caller asks about another person, explain that the patient needs to call for \
 themselves.
 - If a tool says something is not available, tell the caller you cannot do that on this call.
@@ -70,5 +73,17 @@ TOOL_DESCRIPTIONS = MappingProxyType(
         "book_new_patient": "Book one of the slots find_slots offered, for a first-time caller"
         " whose details are recorded. Without confirmed set to true it only returns the slot,"
         " to read back to the caller.",
+        "take_message": "Take a message for the clinic's staff: the caller's name, a ten-digit"
+        " number to call back and the reason in a few words. Without confirmed set to true it"
+        " only returns the message as it would be left, to read back to the caller.",
+        "transfer_to_staff": "Transfer the call to the clinic's staff when the caller asks for a"
+        " person, is frustrated, cannot be verified, or needs something you cannot do, with"
+        " that reason. Without confirmed set to true it only returns the transfer as it would"
+        " be made, to confirm with the caller.",
+        "report_emergency": "Call this immediately on any sign of a medical emergency, such as"
+        " chest pain, trouble breathing, heavy bleeding or thoughts of self-harm. Do not ask"
+        " any questions first. The system then tells the caller to call 911.",
+        "close_call": "End the call with a goodbye. Call it only after the caller has said they"
+        " need nothing else.",
     }
 )

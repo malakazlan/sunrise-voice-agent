@@ -13,7 +13,7 @@ from conftest import REPO_ROOT
 from test_mask import ADVERSARIAL, DIGIT_ADVERSARIAL, LINEAR_BOUND_SECONDS, MEASURE_TIMEOUT_SECONDS
 from test_repo_hygiene import forbidden_uses, imported_modules
 
-from app.agent.scripts import SCRIPTS, ScriptId
+from app.agent.scripts import SCRIPTS, ScriptId, placeholders
 from app.agent.state import CallState, IdentityClaim, Phase, SsnStep, apply, move, new_call, verify
 from app.agent.tool_registry import FAILED_MESSAGE, REFUSED_MESSAGE
 from app.db.seed import load_seed_data
@@ -568,6 +568,11 @@ BOOKING_ANSWERS = [
     "I have your email as A N N dot E X at example dot com.",
     "I have your phone number as 555-410-2233.",
     "That time was just taken. Would you like another one?",
+    # The endings tools' (app/agent/endings.py): a callback message read back, a transfer.
+    "I'll leave a message for Ana Diaz to be called back at 555-410-2233 about a billing"
+    " question. Is that right?",
+    "Your message has been recorded.",
+    "Would you like me to transfer you to our staff?",
 ]
 
 
@@ -579,8 +584,13 @@ def seed_states() -> dict[str, CallState]:
 
 
 def every_line_said_to_the_model(first_name: str) -> list[str]:
-    lines = [SCRIPTS[script].text for script in ScriptId if script is not ScriptId.VERIFIED]
-    lines.append(SCRIPTS[ScriptId.VERIFIED].text.format(first_name=first_name))
+    """Every scripted line, with its values as code fills them, and the tools' fixed texts."""
+    values = {"first_name": first_name, "name": "Ana Diaz", "part_of_day": "night"}
+    lines = [
+        SCRIPTS[script].text.format(**{key: values[key] for key in placeholders(script)})
+        for script in ScriptId
+    ]
+    assert len(lines) == 15
     return [*lines, REFUSED_MESSAGE, FAILED_MESSAGE]
 
 

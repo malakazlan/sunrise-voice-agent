@@ -5,13 +5,27 @@ and seals it, after which nothing more can be registered. The application calls 
 the structural tests call it too, so every tool registered here is bound by the gate's rules.
 
 `submit_identity` is code-only: its grant stays in this module, and `submit_claim` is the one
-way code calls it.
+way code calls it. So is `hand_off_to_staff`, which `call_tool` runs when an outcome asks for a
+hand-off.
 """
 
 from app.agent.booking import BOOKING_TOOLS
+from app.agent.endings import (
+    ENDING_TOOLS,
+    EVERY_CALLER,
+    HAND_OFF_REASONS,
+    REPORT_EMERGENCY,
+    TAKE_MESSAGE,
+    TOOL_PHASES,
+    emergency,
+    hand_off_to_staff,
+)
+from app.agent.scripts import ScriptId
 from app.agent.serving import SERVING_TOOLS
 from app.agent.state import Caller, CallState, Phase, drop_claim
 from app.agent.tool_registry import (
+    MAX_TOOL_ERRORS,
+    MAX_TOOL_REFUSALS,
     REGISTRY,
     Deps,
     DobKind,
@@ -21,11 +35,13 @@ from app.agent.tool_registry import (
     Status,
     Tool,
     ToolOutcome,
+    is_available,
 )
 from app.agent.verification import VerifyIdentityArguments, submit_identity, verify_identity
-from app.audit.log import Action, Outcome, ResourceType
+from app.audit.log import Action, Outcome, Reason, ResourceType
 
 _SUBMIT_GRANT = Grant()
+_HAND_OFF_GRANT = Grant()
 
 # Whoever is in intake: nobody known yet, a claim pending, or verification locked.
 INTAKE_CALLERS = frozenset({Caller.UNIDENTIFIED, Caller.CLAIMANT, Caller.LOCKED})
@@ -37,13 +53,14 @@ VERIFY_IDENTITY = Tool(
     model_callable=True,
     phi=False,
     phases=frozenset({Phase.INTAKE}),
-    office_open_only=True,
+    closed_phases=frozenset(),
     writes=False,
     may_verify=False,
     takes_date_of_birth=DobKind.IDENTITY_CLAIM,
     callers=INTAKE_CALLERS,
     audit_action=Action.IDENTITY_CLAIMED,
     outcome_actions={Action.IDENTITY_LOCKED: Outcome.REFUSED},
+    audit_reasons=frozenset(),
     resource_type=ResourceType.TOOL,
 )
 
@@ -54,7 +71,7 @@ SUBMIT_IDENTITY = Tool(
     model_callable=False,
     phi=False,
     phases=frozenset({Phase.INTAKE}),
-    office_open_only=True,
+    closed_phases=frozenset(),
     writes=True,
     may_verify=True,
     takes_date_of_birth=None,
@@ -64,7 +81,26 @@ SUBMIT_IDENTITY = Tool(
         Action.IDENTITY_REFUSED: Outcome.REFUSED,
         Action.IDENTITY_LOCKED: Outcome.REFUSED,
     },
+    audit_reasons=frozenset(),
     resource_type=ResourceType.PATIENT,
+)
+
+HAND_OFF_TO_STAFF = Tool(
+    name="hand_off_to_staff",
+    arguments=NoArguments,
+    handler=hand_off_to_staff,
+    model_callable=False,
+    phi=False,
+    phases=TOOL_PHASES,
+    closed_phases=frozenset(),
+    writes=True,
+    may_verify=False,
+    takes_date_of_birth=None,
+    callers=EVERY_CALLER,
+    audit_action=Action.TRANSFER_REQUESTED,
+    outcome_actions={},
+    audit_reasons=HAND_OFF_REASONS,
+    resource_type=ResourceType.CALL,
 )
 
 
@@ -73,10 +109,47 @@ def register_tools() -> Registry:
     if not REGISTRY.sealed:
         REGISTRY.register(VERIFY_IDENTITY)
         REGISTRY.register(SUBMIT_IDENTITY, grant=_SUBMIT_GRANT)
-        for tool in (*SERVING_TOOLS, *BOOKING_TOOLS):
+        for tool in (*SERVING_TOOLS, *BOOKING_TOOLS, *ENDING_TOOLS):
             REGISTRY.register(tool)
+        REGISTRY.register(HAND_OFF_TO_STAFF, grant=_HAND_OFF_GRANT)
         REGISTRY.seal()
     return REGISTRY
+
+
+def _reaches_the_limit(before: CallState, after: CallState) -> bool:
+    """Whether this tool call's failure or refusal is the one that reaches its limit."""
+    return (
+        after.tool_errors >= MAX_TOOL_ERRORS > before.tool_errors
+        or after.tool_refusals >= MAX_TOOL_REFUSALS > before.tool_refusals
+    )
+
+
+async def call_tool(
+    state: CallState, name: object, raw_args: object, deps: Deps
+) -> tuple[CallState, ToolOutcome]:
+    """The model's tool call, and what code does about its outcome.
+
+    A report of an emergency comes first, whatever its arguments: wherever the tool is offered
+    it moves the call to emergency and gives the 911 line before any database work, without a
+    tool transaction, counting nothing and never handing off. Elsewhere it is refused like any
+    tool. The outcome that reaches the limit of failures or refusals hands the call to the staff
+    while the office is open, and offers a closed office's caller the message instead, once; a
+    call already on its way out is left to go."""
+    if name == REPORT_EMERGENCY.name and is_available(REPORT_EMERGENCY, state):
+        after, script = await emergency(state, Reason.MODEL, deps)
+        return after, ToolOutcome(
+            status=Status.DONE, message=None, data={}, hand_off=False, script=script
+        )
+    after, outcome = await REGISTRY.dispatch(state, name, raw_args, deps)
+    if not _reaches_the_limit(state, after):
+        return after, outcome
+    if is_available(HAND_OFF_TO_STAFF, after):
+        return await REGISTRY.dispatch(
+            after, HAND_OFF_TO_STAFF.name, {}, deps, grant=_HAND_OFF_GRANT
+        )
+    if is_available(TAKE_MESSAGE, after):
+        return after, outcome.model_copy(update={"script": ScriptId.FALLBACK})
+    return after, outcome
 
 
 async def submit_claim(state: CallState, deps: Deps) -> tuple[CallState, ToolOutcome]:

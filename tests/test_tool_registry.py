@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.agent import tool_registry
 from app.agent.claims import ClaimKeys
+from app.agent.scripts import ScriptId
 from app.agent.state import (
     Caller,
     CallState,
@@ -31,6 +32,7 @@ from app.agent.state import (
     NewPatientDetails,
     Phase,
     Verify,
+    count_tool_error,
     move,
     new_call,
     verify,
@@ -53,7 +55,7 @@ from app.agent.tool_registry import (
     is_available,
 )
 from app.agent.tools import register_tools
-from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
+from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.config import StartupSettings
 from app.db.session import create_database_engine, create_session_factory
 from app.voice.calls import CallRegistry
@@ -138,8 +140,9 @@ def recording(
 
 
 def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
-    """A valid declaration: callable by the model, no patient data, every phase, no write,
-    audited as tool_called."""
+    """A valid declaration: callable by the model, no patient data, every phase, the same with
+    the office open or closed unless its closed phases are given, no write, audited as
+    tool_called."""
     values: dict[str, Any] = {
         "name": name,
         "arguments": NoArguments,
@@ -147,22 +150,28 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "model_callable": True,
         "phi": False,
         "phases": frozenset(Phase),
-        "office_open_only": False,
         "writes": False,
         "may_verify": False,
         "takes_date_of_birth": None,
         "callers": frozenset(Caller),
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
+        "audit_reasons": frozenset(),
         "resource_type": ResourceType.TOOL,
     }
     values.update(overrides)
+    values.setdefault("closed_phases", values["phases"])
     return Tool(**values)
 
 
 def phi_tool(name: str, handler: Handler) -> Tool:
     return declared(
-        name, handler, phi=True, phases=frozenset(PHI_PHASES), resource_type=ResourceType.PATIENT
+        name,
+        handler,
+        phi=True,
+        phases=frozenset(PHI_PHASES),
+        closed_phases=frozenset(),
+        resource_type=ResourceType.PATIENT,
     )
 
 
@@ -312,7 +321,10 @@ async def test_office_open_only_tools_need_the_office_open(
     desk: Calls = []
     registry = registry_of(
         declared(
-            "transfer_desk", recording(desk), phases=frozenset(LIVE_PHASES), office_open_only=True
+            "transfer_desk",
+            recording(desk),
+            phases=frozenset(LIVE_PHASES),
+            closed_phases=frozenset(),
         )
     )
     for state in every_combination(LIVE_PHASES):
@@ -327,6 +339,34 @@ async def test_office_open_only_tools_need_the_office_open(
     assert desk == []
     assert (await registry.dispatch(intake(), "transfer_desk", {}, deps))[1].status is Status.DONE
     assert len(desk) == 1
+
+
+async def test_closed_office_has_phases_of_its_own(deps: Deps, owner_engine: Engine) -> None:
+    # A tool declared for serving with the office open and for intake with it closed.
+    notes: Calls = []
+    registry = registry_of(
+        declared(
+            "leave_note",
+            recording(notes),
+            phases=frozenset({SERVING}),
+            closed_phases=frozenset({INTAKE}),
+        )
+    )
+    offered_in = {
+        (state.phase, state.office_open)
+        for state in every_combination()
+        if names(registry, state) == ["leave_note"]
+    }
+    assert offered_in == {(SERVING, True), (INTAKE, False)}
+    for state in (intake(), forced(SERVING, verified=False, office_open=False)):
+        assert await registry.dispatch(state, "leave_note", {}, deps) == (
+            after_refusal(state),
+            REFUSED,
+        )
+    assert notes == []
+    for state in (intake(office_open=False), verified_serving()):
+        assert (await registry.dispatch(state, "leave_note", {}, deps))[1].status is Status.DONE
+    assert len(notes) == 2
 
 
 async def test_no_tools_in_terminal_phases(deps: Deps, owner_engine: Engine) -> None:
@@ -658,13 +698,14 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "model_callable": True,
         "phi": True,
         "phases": frozenset(PHI_PHASES),
-        "office_open_only": True,
+        "closed_phases": frozenset(),
         "writes": False,
         "may_verify": False,
         "takes_date_of_birth": None,
         "callers": frozenset(Caller),
         "audit_action": Action.TOOL_CALLED,
         "outcome_actions": {},
+        "audit_reasons": frozenset(),
         "resource_type": ResourceType.PATIENT,
     }
     values.update(overrides)
@@ -796,7 +837,7 @@ def test_registration_rules() -> None:
                 "phases",
                 "writes",
                 "audit_action",
-                "office_open_only",
+                "closed_phases",
                 "may_verify",
                 "resource_type",
                 "arguments",
@@ -806,8 +847,11 @@ def test_registration_rules() -> None:
                 "takes_date_of_birth",
                 "callers",
                 "outcome_actions",
+                "audit_reasons",
             )
         ],
+        ("declare", Tool.model_construct(**valid(audit_reasons={Reason.OTHER}))),
+        ("declare", Tool.model_construct(**valid(audit_reasons=frozenset({"other"})))),
         ("declare", Tool.model_construct(**valid(callers=frozenset()))),
         ("declare", Tool.model_construct(**valid(callers={Caller.PATIENT}))),
         ("declare", Tool.model_construct(**valid(takes_date_of_birth="identity_claim"))),
@@ -850,6 +894,13 @@ def test_registration_rules() -> None:
             ("phi", Tool(**valid(phases=frozenset({SERVING, phase}))))
             for phase in (INTAKE, *NO_TOOL_PHASES)
         ],
+        # A phi tool runs only while the office is open.
+        *[
+            ("phi", Tool(**valid(closed_phases=frozenset(phases))))
+            for phases in ({SERVING}, {BOOKING}, {INTAKE}, set(Phase))
+        ],
+        ("declare", Tool.model_construct(**valid(closed_phases={INTAKE}))),
+        ("declare", Tool.model_construct(**valid(closed_phases=frozenset({"intake"})))),
         # A writing tool's arguments carry `confirmed: bool = False`.
         ("confirmed", Tool(**valid(writes=True))),
         *[
@@ -916,6 +967,11 @@ def test_registration_rules() -> None:
             for phases in ({INTAKE, SERVING}, {SERVING}, {INTAKE, GREETING}, set(Phase))
         ],
         ("verif", Tool(**VERIFIER)),
+        # And it runs only while the office is open.
+        (
+            "verif",
+            Tool(**{**VERIFIER, "model_callable": False, "closed_phases": frozenset({INTAKE})}),
+        ),
         # The tool that takes an identity claim: not a patient-data tool, intake only, for an
         # unidentified caller, office open only, callable by the model, and it may not verify.
         *[
@@ -924,10 +980,10 @@ def test_registration_rules() -> None:
                 {"phi": True},
                 {"phases": frozenset({INTAKE, SERVING})},
                 {"phases": frozenset({SERVING})},
+                {"closed_phases": frozenset({INTAKE})},
                 {"callers": frozenset(Caller)},
                 {"callers": NEW_PATIENTS},
                 {"callers": frozenset({Caller.UNIDENTIFIED})},
-                {"office_open_only": False},
                 {"model_callable": False},
                 {"may_verify": True},
             )
@@ -943,7 +999,7 @@ def test_registration_rules() -> None:
                 {"callers": frozenset(Caller)},
                 {"callers": frozenset({Caller.UNIDENTIFIED})},
                 {"callers": frozenset({Caller.NEW_PATIENT})},
-                {"office_open_only": False},
+                {"closed_phases": frozenset({BOOKING})},
                 {"model_callable": False},
                 {"may_verify": True},
             )
@@ -1143,7 +1199,7 @@ def gate_violations(registry: Registry) -> list[str]:
                 problems.append(f"date of birth: {where}")
             if state.phase in NO_TOOL_PHASES:
                 problems.append(f"no tools: {where}")
-            if state.phase not in item.phases:
+            if state.phase not in item.phases | item.closed_phases:
                 problems.append(f"undeclared phase: {where}")
             if item.phi and not (
                 state.verified
@@ -1154,8 +1210,10 @@ def gate_violations(registry: Registry) -> list[str]:
                 problems.append(f"phi: {where}")
             if item.may_verify and (item.phi or state.phase is not INTAKE):
                 problems.append(f"verifier: {where}")
-            if item.office_open_only and not state.office_open:
+            if not state.office_open and state.phase not in item.closed_phases:
                 problems.append(f"office closed: {where}")
+            if state.office_open and state.phase not in item.phases:
+                problems.append(f"office open: {where}")
     return problems
 
 
@@ -1182,6 +1240,7 @@ def test_application_registry_obeys_the_gate() -> None:
                     noop,
                     phi=True,
                     phases=frozenset({SERVING, phase}),
+                    closed_phases=frozenset(),
                     resource_type=ResourceType.PATIENT,
                 )
             )
@@ -1191,11 +1250,15 @@ def test_application_registry_obeys_the_gate() -> None:
     tools = [
         phi_tool("read_chart", noop),
         declared("office_info", noop),
-        declared("transfer_desk", noop, phases=frozenset({INTAKE}), office_open_only=True),
+        declared("transfer_desk", noop, phases=frozenset({INTAKE}), closed_phases=frozenset()),
+        declared(
+            "leave_note", noop, phases=frozenset({SERVING}), closed_phases=frozenset({INTAKE})
+        ),
         declared(
             "check_identity",
             noop,
             phases=frozenset({INTAKE}),
+            closed_phases=frozenset(),
             may_verify=True,
             model_callable=False,
         ),
@@ -1218,6 +1281,7 @@ def test_application_registry_obeys_the_gate() -> None:
         "undeclared phase",
         "phi",
         "office closed",
+        "office open",
         "verifier",
         "code only",
         "caller",
@@ -1400,6 +1464,7 @@ async def test_only_the_verifying_tool_can_verify(deps: Deps, owner_engine: Engi
             claims_identity,
             arguments=Member,
             phases=frozenset({INTAKE}),
+            closed_phases=frozenset(),
             may_verify=True,
             model_callable=False,
         ),
@@ -1697,6 +1762,63 @@ async def test_events_carry_only_declared_actions(deps: Deps, owner_engine: Engi
         ("tool_failed", "tool", "undeclared", "failure", call),
         ("tool_failed", "tool", "reserved", "failure", call),
     ]
+
+
+async def test_scripts_and_reasons_keep_to_their_declarations(
+    deps: Deps, owner_engine: Engine
+) -> None:
+    # A line's values are exactly its placeholders, each at most 80 characters of plain text;
+    # an event's reason is one its tool declares. Anything else fails the call.
+    verified = ScriptId.VERIFIED
+    after_hours = ScriptId.AFTER_HOURS_CLOSE
+    results: list[tuple[ToolResult, bool]] = [
+        (ToolResult(), True),
+        (ToolResult(script=ScriptId.GOODBYE), True),
+        (ToolResult(script=verified, script_values={"first_name": "s" * 80}), True),
+        (ToolResult(script=after_hours, script_values={"name": "Ana", "part_of_day": "day"}), True),
+        (ToolResult(audit_reason=Reason.OTHER), True),
+        (ToolResult(script=verified), False),
+        (ToolResult(script=verified, script_values={"name": "Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "S", "last_name": "J"}), False),
+        (ToolResult(script=after_hours, script_values={"name": "Ana"}), False),
+        (ToolResult(script_values={"first_name": "Sarah"}), False),
+        (ToolResult(script=ScriptId.GOODBYE, script_values={"first_name": "Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "s" * 81}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa​rah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "‮Sarah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa\nrah"}), False),
+        (ToolResult(script=verified, script_values={"first_name": "Sa\x85rah"}), False),
+        (ToolResult(audit_reason=Reason.GUARD), False),
+    ]
+    registry = Registry()
+    names_of = []
+    for index, (result, _done) in enumerate(results):
+        name = "case_" + "abcdefghijklmnopqrstuvwxyz"[index]
+        registry.register(
+            declared(name, recording([], result), audit_reasons=frozenset({Reason.OTHER}))
+        )
+        names_of.append(name)
+    # A tool that declares no reason attaches none.
+    registry.register(declared("no_reason", recording([], ToolResult(audit_reason=Reason.OTHER))))
+    state = intake()
+    for name, (result, done) in zip(names_of, results, strict=True):
+        after, outcome = await registry.dispatch(state, name, {}, deps)
+        if done:
+            assert (after, outcome.status) == (state, Status.DONE), name
+            assert outcome.script_values == result.script_values
+        else:
+            assert (after, outcome) == (count_tool_error(state), FAILED), name
+    after, outcome = await registry.dispatch(state, "no_reason", {}, deps)
+    assert (after, outcome) == (count_tool_error(state), FAILED)
+
+    reasons = text("SELECT resource_id, action, reason FROM audit_events ORDER BY seq")
+    with owner_engine.connect() as connection:
+        written = [tuple(row) for row in connection.execute(reasons)]
+    expected = [
+        (name, "tool_called" if done else "tool_failed", "other" if name == "case_e" else None)
+        for name, (_result, done) in zip(names_of, results, strict=True)
+    ]
+    assert written == [*expected, ("no_reason", "tool_failed", None)]
 
 
 class NestedDob(BaseModel):

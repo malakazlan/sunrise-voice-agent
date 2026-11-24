@@ -7,6 +7,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, date, datetime
 from typing import Any, cast
@@ -19,6 +20,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agent.claims import ClaimKeys
+from app.agent.endings import drain_call_events
 from app.agent.model import (
     ModelReply,
     ModelRequest,
@@ -26,14 +28,15 @@ from app.agent.model import (
     anthropic_model,
 )
 from app.agent.prompts import SYSTEM_PROMPT, TOOL_DESCRIPTIONS
-from app.agent.state import IdentityClaim, Phase, claim, move, new_call
+from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry
 from app.agent.tools import register_tools
-from app.agent.turn import CALL_CONNECTED, CallAgent, start_call
-from app.audit.log import AuditLog
+from app.agent.turn import CALL_CONNECTED, CallAgent, drain_guard_audits, start_call
+from app.audit.log import CHAIN_LOCK, AuditLog
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
+from app.main import create_app
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -71,7 +74,13 @@ APPOINTMENT_REPLY = f"Your next appointment is {SARAH_APPOINTMENT}."
 FIRST_PAIR, SECOND_PAIR = "33", "44"
 DIGITS_IN_WORDS = "three three four four"
 
-INTAKE_TOOLS = ["verify_identity", "start_new_patient"]
+INTAKE_TOOLS = [
+    "verify_identity",
+    "start_new_patient",
+    "transfer_to_staff",
+    "report_emergency",
+    "close_call",
+]
 SERVING_TOOLS = [
     "get_next_appointment",
     "request_refill",
@@ -80,7 +89,13 @@ SERVING_TOOLS = [
     "send_message_to_doctor",
     "find_slots",
     "book_appointment",
+    "take_message",
+    "transfer_to_staff",
+    "report_emergency",
+    "close_call",
 ]
+# With the office closed: the message, the emergency line and the goodbye, nothing else.
+CLOSED_TOOLS = ["take_message", "report_emergency", "close_call"]
 
 EVENTS = text("SELECT action, resource_type, resource_id, outcome FROM audit_events ORDER BY seq")
 EVENTS_WITH_REASONS = text(
@@ -245,12 +260,22 @@ async def offline_deps() -> AsyncIterator[Deps]:
     try:
         yield deps_on(engine)
     finally:
+        # A call event a turn started writing (an emergency) has ended before the engine goes.
+        await drain_call_events()
         await engine.dispose()
 
 
 def rows(engine: Engine) -> list[tuple[Any, ...]]:
     with engine.connect() as connection:
         return [tuple(row) for row in connection.execute(EVENTS)]
+
+
+EVENT_REASONS = text("SELECT action, call_id, reason FROM audit_events ORDER BY seq")
+
+
+def reasons(engine: Engine) -> list[tuple[Any, ...]]:
+    with engine.connect() as connection:
+        return [tuple(row) for row in connection.execute(EVENT_REASONS)]
 
 
 def new_call_id() -> str:
@@ -437,7 +462,9 @@ async def test_model_gets_only_the_gated_tools(
     ]
 
 
-async def test_a_closed_office_offers_no_tools(offline_deps: Deps, registry: Registry) -> None:
+async def test_a_closed_office_offers_only_the_message_flow(
+    offline_deps: Deps, registry: Registry
+) -> None:
     closed = Deps(
         sessions=offline_deps.sessions,
         audit=offline_deps.audit,
@@ -451,7 +478,7 @@ async def test_a_closed_office_offers_no_tools(offline_deps: Deps, registry: Reg
 
     assert opening == CLOSED
     assert agent.state.office_open is False
-    assert [tool_names(request) for request in model.requests] == [[]]
+    assert [tool_names(request) for request in model.requests] == [CLOSED_TOOLS]
 
 
 # --- R4 ---------------------------------------------------------------------------------
@@ -475,6 +502,42 @@ async def test_emergency_skips_the_model(
     assert agent.state.phase is Phase.EMERGENCY
     assert agent.state.expecting_ssn4 is False
     assert model.requests == []
+
+
+async def test_guard_emergency_is_written_in_the_background(
+    deps: Deps, registry: Registry, runtime: AsyncEngine, owner_engine: Engine
+) -> None:
+    agent = agent_for(ScriptedModel(), deps, registry)
+    # The audit chain's lock is held elsewhere: the line does not wait for it.
+    async with create_session_factory(runtime)() as holder:
+        await holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
+        result = await agent.handle("I think I'm having a heart attack")
+        assert result.lines == (EMERGENCY,)
+        assert agent.state.phase is Phase.EMERGENCY
+        assert reasons(owner_engine) == []
+        await holder.rollback()
+    await drain_call_events()
+    assert reasons(owner_engine) == [("emergency_detected", agent.state.call_id, "guard")]
+
+
+@pytest.mark.parametrize("arguments", [{"confirmed": True}, {"reason": "chest pain"}, None, []])
+async def test_reported_emergency_ends_the_turn(
+    deps: Deps, registry: Registry, owner_engine: Engine, arguments: object
+) -> None:
+    # Whatever the model sends with it, the report gives the 911 line and the model is not asked
+    # again in that turn.
+    model = ScriptedModel(calls(("report_emergency", arguments)))
+    agent = agent_for(model, deps, registry)
+
+    result = await agent.handle("My husband collapsed and isn't waking up")
+
+    assert result.lines == (EMERGENCY,)
+    assert result.hand_off is False
+    assert agent.state.phase is Phase.EMERGENCY
+    assert agent.state.tool_refusals == 0
+    assert len(model.requests) == 1
+    await drain_call_events()
+    assert reasons(owner_engine) == [("emergency_detected", agent.state.call_id, "model")]
 
 
 # --- R5 ---------------------------------------------------------------------------------
@@ -578,7 +641,14 @@ async def test_model_failures_fall_back(
 ) -> None:
     caplog.set_level(logging.INFO)
     model = ScriptedModel(*FAILURES[first]())
-    agent = agent_for(model, deps, registry, first_token_seconds=0.05, reply_seconds=0.05)
+    # A verified caller, so the tool rounds run rather than being refused: the fifth refusal
+    # in a call hands it to the staff (app/agent/tools.py) before the model fails twice.
+    state = verify(
+        move(new_call(call_id=new_call_id(), started_at=T0, office_open=True), Phase.INTAKE),
+        patient_id="P001",
+        first_name="Sarah",
+    )
+    agent = CallAgent(state, deps, model, registry, first_token_seconds=0.05, reply_seconds=0.05)
 
     once = await agent.handle("Can you help me?")
 
@@ -646,7 +716,8 @@ async def test_turn_logs_carry_no_text(
     await agent.handle("marker-caller-words one")
     await agent.handle("marker-caller-words two")
 
-    logged = caplog.text
+    # Without the time each line may start with, whose milliseconds can read as any number.
+    logged = re.sub(r"(?m)^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", "", caplog.text)
     assert "model_fallback" in logged
     assert "tool_called" in logged
     for secret in (
@@ -740,7 +811,7 @@ async def test_blocked_text_goes_nowhere(
     assert result.hand_off is False
 
     await agent.handle("No, thanks.")
-    await agent.finish_audits()
+    await drain_guard_audits()
     # The conversation has what was said, never the blocked text or what came after it.
     sent = everything_sent(model)
     for blocked in (marker, "stop taking", "Then call us back"):
@@ -798,7 +869,7 @@ async def test_two_blocks_hand_off(
         f"guard_block call_id={call_id} rule=medical_advice blocks=1 hand_off=False",
         f"guard_block call_id={call_id} rule=medical_advice blocks=2 hand_off=True",
     ]
-    await agent.finish_audits()
+    await drain_guard_audits()
     assert (
         rows_with_reasons(owner_engine)
         == [("guard_block", "call", call_id, "refused", "medical_advice")] * 3
@@ -830,7 +901,26 @@ async def test_a_message_read_back_is_said(deps: Deps, registry: Registry) -> No
     # In a later turn, with no read-back from a tool, the same words are the model's own.
     second = await agent.handle("Sorry, what was that?")
     assert (second.lines, second.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
-    await agent.finish_audits()
+    await drain_guard_audits()
+
+
+async def test_a_callback_reason_read_back_is_said(deps: Deps, registry: Registry) -> None:
+    model = ScriptedModel()
+    agent = agent_for(model, deps, registry)
+    await verified(agent, model)
+    arguments = {
+        "name": "Sarah Johnson",
+        "callback_number": "555-410-2233",
+        "reason_short": QUESTION,
+    }
+    read_back = f"I'll leave a message for a callback about: {QUESTION} Is that right?"
+    model.then(calls(("take_message", arguments)), says(read_back))
+
+    said = await agent.handle("Can someone call me back about my Lisinopril?")
+
+    # take_message returned the caller's reason to be read back: it is said.
+    assert tool_results(model.requests[-1])[0]["content"]["data"]["reason_short"] == QUESTION
+    assert (said.lines, said.withheld) == ((read_back,), None)
 
 
 async def test_a_first_sentence_over_the_bound_falls_back(
@@ -870,6 +960,46 @@ class Hanging:
         return None
 
 
+class Slow:
+    """Sessions that take a moment, then cannot be had; `ended` says the attempt is over."""
+
+    def __init__(self) -> None:
+        self.ended = False
+
+    def __call__(self) -> "Slow":
+        return self
+
+    async def __aenter__(self) -> AsyncSession:
+        await asyncio.sleep(0.2)
+        self.ended = True
+        raise ConnectionRefusedError("the database is down")
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def test_shutdown_waits_for_guard_audits(registry: Registry) -> None:
+    sessions = Slow()
+    deps = Deps(
+        sessions=cast("async_sessionmaker[AsyncSession]", sessions),
+        audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
+        now=lambda: T0,
+        claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+    )
+    state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
+    app = create_app(offline_settings())
+
+    # The loop stays up after the app's shutdown, so only the shutdown can have waited.
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            model = ScriptedModel(says("It's probably just a cold."))
+            await CallAgent(state, deps, model, registry).handle("I feel sick.")
+            assert sessions.ended is False
+        assert sessions.ended is True
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize("sessions", [Unreachable, Hanging], ids=["failed", "cancelled"])
 async def test_guard_audit_failures_are_logged(
     registry: Registry, caplog: pytest.LogCaptureFixture, sessions: type[Unreachable | Hanging]
@@ -889,7 +1019,7 @@ async def test_guard_audit_failures_are_logged(
     assert (result.lines, result.withheld) == ((ADVICE_REFUSAL,), "medical_advice")
 
     # At the end of the call: a write that cannot finish in time is cancelled, and logged.
-    await agent.finish_audits(timeout=0.05)
+    await drain_guard_audits(timeout=0.05)
     expected = {
         Unreachable: "guard_audit_failed call_id={} rule=medical_advice"
         " error=ConnectionRefusedError",

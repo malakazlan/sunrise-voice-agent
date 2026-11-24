@@ -36,7 +36,6 @@ from app.agent.serving import (
     DAYS,
     NEEDS_CONFIRMATION,
     Weekday,
-    plain_text,
     spoken_date,
     spoken_time,
     stored_text,
@@ -51,6 +50,7 @@ from app.db.models import SCHEDULED, Appointment, AvailableSlot, Patient, Reques
 from app.domain.clinic import CLINIC_TZ, Doctor
 from app.domain.matching import MAX_NAME_LENGTH, name_key
 from app.guard.mask import mask_ssns
+from app.guard.text import plain_text
 
 BOOKING = "booking"
 BOOKED = "booked"
@@ -485,13 +485,14 @@ BOOKING_TOOLS = (
         model_callable=True,
         phi=False,
         phases=frozenset({Phase.INTAKE}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=False,
         may_verify=False,
         takes_date_of_birth=None,
         callers=frozenset({Caller.UNIDENTIFIED}),
         audit_action=Action.NEW_PATIENT_STARTED,
         outcome_actions={},
+        audit_reasons=frozenset(),
         resource_type=ResourceType.TOOL,
     ),
     Tool(
@@ -501,13 +502,14 @@ BOOKING_TOOLS = (
         model_callable=True,
         phi=False,
         phases=frozenset({Phase.BOOKING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=False,
         may_verify=False,
         takes_date_of_birth=DobKind.NEW_PATIENT_DETAILS,
         callers=frozenset({Caller.NEW_PATIENT, Caller.NEW_PATIENT_WITH_DETAILS}),
         audit_action=Action.NEW_PATIENT_DETAILS_COLLECTED,
         outcome_actions={},
+        audit_reasons=frozenset(),
         resource_type=ResourceType.TOOL,
     ),
     Tool(
@@ -517,13 +519,14 @@ BOOKING_TOOLS = (
         model_callable=True,
         phi=False,
         phases=frozenset({Phase.SERVING, Phase.BOOKING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=False,
         may_verify=False,
         takes_date_of_birth=None,
         callers=frozenset({Caller.PATIENT, Caller.NEW_PATIENT_WITH_DETAILS}),
         audit_action=Action.SLOTS_OFFERED,
         outcome_actions={},
+        audit_reasons=frozenset(),
         resource_type=ResourceType.TOOL,
     ),
     Tool(
@@ -533,13 +536,14 @@ BOOKING_TOOLS = (
         model_callable=True,
         phi=True,
         phases=frozenset({Phase.SERVING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=True,
         may_verify=False,
         takes_date_of_birth=None,
         callers=frozenset({Caller.PATIENT}),
         audit_action=Action.APPOINTMENT_BOOKED,
         outcome_actions={**_PREVIEW_OR_TAKEN, Action.BOOKING_REPEATED: Outcome.SUCCESS},
+        audit_reasons=frozenset(),
         resource_type=ResourceType.PATIENT,
     ),
     Tool(
@@ -549,13 +553,14 @@ BOOKING_TOOLS = (
         model_callable=True,
         phi=False,
         phases=frozenset({Phase.BOOKING}),
-        office_open_only=True,
+        closed_phases=frozenset(),
         writes=True,
         may_verify=False,
         takes_date_of_birth=None,
         callers=frozenset({Caller.NEW_PATIENT_WITH_DETAILS}),
         audit_action=Action.NEW_PATIENT_BOOKED,
         outcome_actions=_PREVIEW_OR_TAKEN,
+        audit_reasons=frozenset(),
         resource_type=ResourceType.APPOINTMENT,
     ),
 )

@@ -5,28 +5,32 @@
 says the greeting or the closed line and moves the call to intake. `CallAgent.handle` then
 takes each turn through the input guard (app/guard/input.py):
 
-- emergency: the emergency line, the call moves to emergency, and the model is not asked;
+- emergency: `emergency` (app/agent/endings.py) moves the call to emergency and gives the
+  emergency line at once, its event written in the background; the model is not asked;
 - swallow: the model sees nothing of the turn; if the guard says submit, code runs
   submit_claim and its line is the reply;
 - pass: a submit the guard asks for runs first; then one model turn with the guard's text.
 
 A model turn sends the system prompt, the conversation so far and the tools `tools_for` allows
-in the state right now. Every tool call goes through `dispatch`, and its outcome goes back to
-the model, unless it carries a scripted line: that line is the reply, word for word, and the
-model is told it was said. A turn has at most MAX_TOOL_ROUNDS tool rounds. A refusal, any
-failed request, no first token within FIRST_TOKEN_SECONDS, a reply not finished within
-REPLY_SECONDS after it, a reply that is not a plain answer or a tool request, one tool round
-too many, or a reply whose first sentence is over the output guard's length bound: the fixed
-fallback line, and the call goes on. MAX_MODEL_FAILURES of them in one call raise the hand-off
-signal, as does an outcome of dispatch that asks for one.
+in the state right now. Every tool call goes through `call_tool` (app/agent/tools.py): a report
+of an emergency takes the emergency's one way, whatever its arguments; any other call goes to
+`dispatch`, and the outcome that reaches the limit of failures or refusals hands the call off.
+The outcome goes back to the model, unless it carries a scripted line: that line, with its
+values, is the reply, word for word, and the model is told it was said. A turn has at most
+MAX_TOOL_ROUNDS tool rounds. A refusal, any failed request, no first token within
+FIRST_TOKEN_SECONDS, a reply not finished within REPLY_SECONDS after it, a reply that is not a
+plain answer or a tool request, one tool round too many, or a reply whose first sentence is
+over the output guard's length bound: the fixed fallback line, and the call goes on.
+MAX_MODEL_FAILURES of them in one call raise the hand-off signal, as does a tool outcome that
+asks for one.
 
 A plain answer goes through the output guard (app/guard/output.py) a sentence at a time before
 it is returned: what passes is said; a blocked sentence is replaced by its rule's scripted line
 and the rest of the reply is dropped. The blocked text goes nowhere: not into the conversation,
 not to a log, not to the audit log, whose `guard_block` event has the rule's name as its reason.
 That event is written in a task of its own after the reply, so the reply never waits on the
-database; a failure to write it is logged and the block stands. At the end of the call
-`finish_audits` waits for those writes a bounded time, and a write cut off is logged.
+database; a failure to write it is logged and the block stands. `drain_guard_audits`, at
+shutdown, waits for those writes a bounded time, and a write cut off is logged.
 MAX_GUARD_BLOCKS blocked replies in a row raise the hand-off signal; a model reply said in full
 starts the count again. A message a tool returned this turn for the caller to confirm is the
 caller's own text: the guard does not take it for the model's advice or promise when the reply
@@ -44,18 +48,26 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.agent.endings import emergency
 from app.agent.model import Model, ModelReply, ModelRequest, ToolCall
 from app.agent.prompts import SYSTEM_PROMPT, TOOL_DESCRIPTIONS
-from app.agent.scripts import SCRIPTS, ScriptId
+from app.agent.scripts import SCRIPTS, ScriptId, placeholders
 from app.agent.serving import NEEDS_CONFIRMATION
 from app.agent.state import CallState, Phase, apply, move, new_call
-from app.agent.tool_registry import Deps, Registry, Status, ToolDescription, ToolOutcome
-from app.agent.tools import submit_claim
+from app.agent.tool_registry import (
+    REGISTRY,
+    Deps,
+    Registry,
+    Status,
+    ToolDescription,
+    ToolOutcome,
+)
+from app.agent.tools import call_tool, submit_claim
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.domain.office_hours import is_open
 from app.guard.input import GuardAction, guard_input
@@ -68,8 +80,13 @@ REPLY_SECONDS = 20.0
 MAX_TOOL_ROUNDS = 4
 MAX_MODEL_FAILURES = 2
 MAX_GUARD_BLOCKS = 2
-# How long the end of a call waits for guard_block events still being written.
+# How long `drain_guard_audits` waits for guard_block events still being written.
 AUDIT_WAIT_SECONDS = 10.0
+# The caller's own words a tool returns for confirmation, to be read back: a message to the
+# doctor (send_message_to_doctor) and the reason for a callback (take_message).
+READ_BACK_FIELDS = ("message", "reason_short")
+# The guard_block events still being written, every call's, held so that they run to the end.
+_GUARD_AUDITS: set[asyncio.Task[None]] = set()
 
 # The reason a guard_block event records for each rule of the output guard.
 BLOCK_REASONS = {
@@ -150,6 +167,10 @@ class CallAgent:
         reply_seconds: float = REPLY_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # The tools are offered from the registry they run on: the application's, which
+        # call_tool runs them through.
+        if registry is not REGISTRY:
+            raise ValueError("a call's tools are the application registry's")
         self._state = state
         self._deps = deps
         self._model = model
@@ -162,26 +183,24 @@ class CallAgent:
         self._blocks = 0
         self._hand_off = False
         self._lock = asyncio.Lock()
-        # The guard_block events still being written, held so that they run to the end.
-        self._audits: set[asyncio.Task[None]] = set()
 
     @property
     def state(self) -> CallState:
         return self._state
 
-    def say(self, script: ScriptId) -> str:
-        """A scripted line, added to the conversation as the model's own."""
-        line = SCRIPTS[script].text
-        if script is ScriptId.VERIFIED:
-            if self._state.patient_first_name is None:
-                raise ValueError("the verified line needs a verified caller")
-            line = line.format(first_name=self._state.patient_first_name)
+    def say(self, script: ScriptId, values: Mapping[str, str] | None = None) -> str:
+        """A scripted line, with exactly the values its placeholders name, added to the
+        conversation as the model's own."""
+        given = {} if values is None else dict(values)
+        if set(given) != placeholders(script):
+            raise ValueError("a line is said with exactly the values it names")
+        line = SCRIPTS[script].text.format(**given) if given else SCRIPTS[script].text
         self._messages.append({"role": "assistant", "content": line})
         return line
 
     def _line_for(self, outcome: ToolOutcome) -> str:
         if outcome.script is not None:
-            return self.say(outcome.script)
+            return self.say(outcome.script, outcome.script_values)
         if outcome.message is not None:
             self._messages.append({"role": "assistant", "content": outcome.message})
             return outcome.message
@@ -191,27 +210,20 @@ class CallAgent:
         async with self._lock:
             return await self._handle(transcript)
 
-    async def finish_audits(self, timeout: float = AUDIT_WAIT_SECONDS) -> None:
-        """For the end of the call: wait up to `timeout` seconds for the guard_block events
-        still being written; one still running then is cancelled, and logged as cancelled."""
-        if not self._audits:
-            return
-        _done, late = await asyncio.wait(set(self._audits), timeout=timeout)
-        for task in late:
-            task.cancel()
-        await asyncio.gather(*late, return_exceptions=True)
-
     async def _handle(self, transcript: str) -> TurnResult:
         started = self._clock()
         decision = guard_input(transcript, self._state)
-        if decision.change is not None:
-            self._state = apply(self._state, decision.change)
         lines: list[str] = []
         timings = TurnTimings(first_token_ms=None, last_token_ms=None, tool_rounds=0)
 
         if decision.action is GuardAction.EMERGENCY:
-            lines.append(self.say(ScriptId.EMERGENCY))
+            # The emergency's one way: the move and the line first, its event in the background.
+            self._state, script = await emergency(self._state, Reason.GUARD, self._deps)
+            lines.append(self.say(script))
             return self._turn(decision.action, None, lines, timings)
+
+        if decision.change is not None:
+            self._state = apply(self._state, decision.change)
 
         if decision.submit:
             self._state, outcome = await submit_claim(self._state, self._deps)
@@ -263,9 +275,9 @@ class CallAgent:
                         raise _ModelFailedError("tool_rounds")
                     rounds += 1
                     self._messages.append({"role": "assistant", "content": reply.content})
-                    script = await self._run_tools(reply.tool_calls, read_back)
-                    if script is not None:
-                        said = [self.say(script)]
+                    scripted = await self._run_tools(reply.tool_calls, read_back)
+                    if scripted is not None:
+                        said = [self._line_for(scripted)]
                         break
                     continue
                 if reply.stop_reason == "end_turn" and reply.text.strip() and not reply.tool_calls:
@@ -314,8 +326,8 @@ class CallAgent:
         """The block's guard_block event, written in a task of its own so that the reply does
         not wait for it."""
         task = asyncio.create_task(self._write_block(self._state.call_id, rule, self._deps.now()))
-        self._audits.add(task)
-        task.add_done_callback(self._audits.discard)
+        _GUARD_AUDITS.add(task)
+        task.add_done_callback(_GUARD_AUDITS.discard)
 
     async def _write_block(self, call_id: str, rule: OutputRule, now: datetime) -> None:
         try:
@@ -388,27 +400,33 @@ class CallAgent:
                 replying.cancel()
                 await asyncio.gather(replying, return_exceptions=True)
 
-    async def _run_tools(self, tool_calls: list[ToolCall], read_back: list[str]) -> ScriptId | None:
-        """Each tool through dispatch, one at a time, with its result for the model. The first
-        outcome that carries a scripted line ends the turn; tools asked for after it do not
-        run. A message an outcome returns for the caller to confirm is added to `read_back`."""
+    async def _run_tools(
+        self, tool_calls: list[ToolCall], read_back: list[str]
+    ) -> ToolOutcome | None:
+        """Each tool through `call_tool`, one at a time, with its result for the model. The
+        first outcome that carries a scripted line ends the turn and is returned; tools asked
+        for after it do not run. A message an outcome returns for the caller to confirm is
+        added to `read_back`."""
         results: list[dict[str, Any]] = []
-        script: ScriptId | None = None
+        scripted: ToolOutcome | None = None
         for call in tool_calls:
-            if script is not None:
+            if scripted is not None:
                 results.append(_result(call, NOT_RUN, error=True))
                 continue
-            self._state, outcome = await self._registry.dispatch(
+            self._state, outcome = await call_tool(
                 self._state, call.name, call.arguments, self._deps
             )
             self._hand_off = self._hand_off or outcome.hand_off
             if outcome.script is not None:
-                script = outcome.script
+                scripted = outcome
                 results.append(_result(call, SAID_BY_THE_SYSTEM, error=False))
                 continue
-            confirming = outcome.data.get("message")
-            if outcome.data.get("status") == NEEDS_CONFIRMATION and isinstance(confirming, str):
-                read_back.append(confirming)
+            if outcome.data.get("status") == NEEDS_CONFIRMATION:
+                read_back += [
+                    text
+                    for key in READ_BACK_FIELDS
+                    if isinstance(text := outcome.data.get(key), str)
+                ]
             content = {
                 "status": outcome.status.value,
                 "message": outcome.message,
@@ -416,7 +434,7 @@ class CallAgent:
             }
             results.append(_result(call, content, error=outcome.status is not Status.DONE))
         self._messages.append({"role": "user", "content": results})
-        return script
+        return scripted
 
     def _fall_back(self, reason: str) -> str:
         self._failures += 1
@@ -430,6 +448,18 @@ class CallAgent:
             self._hand_off,
         )
         return self.say(ScriptId.FALLBACK)
+
+
+async def drain_guard_audits(timeout: float = AUDIT_WAIT_SECONDS) -> None:
+    """For shutdown and tests: wait up to `timeout` seconds for the guard_block events still
+    being written, every call's; one still running then is cancelled, and logged as
+    cancelled."""
+    if not _GUARD_AUDITS:
+        return
+    _done, late = await asyncio.wait(set(_GUARD_AUDITS), timeout=timeout)
+    for task in late:
+        task.cancel()
+    await asyncio.gather(*late, return_exceptions=True)
 
 
 def start_call(

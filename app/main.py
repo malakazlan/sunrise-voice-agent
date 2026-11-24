@@ -9,9 +9,11 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.claims import ClaimKeys
+from app.agent.endings import drain_call_events
 from app.agent.model import anthropic_model
 from app.agent.tool_registry import Deps
 from app.agent.tools import register_tools
+from app.agent.turn import drain_guard_audits
 from app.api.admin import PREFIX as ADMIN_PREFIX
 from app.api.admin import build_admin_app
 from app.api.offer import OpenCall, build_router
@@ -59,6 +61,10 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
         await calls.close()
+        # The call events and guard blocks still being written (each bounded) end before the
+        # engine goes.
+        await drain_call_events()
+        await drain_guard_audits()
         if model is not None:
             await model.close()
         await engine.dispose()

@@ -1,4 +1,9 @@
-from app.agent.scripts import SCRIPTS, ScriptId
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
+
+from app.agent.scripts import SCRIPTS, ScriptId, placeholders
+from app.domain.office_hours import part_of_day
 
 # Every scripted line, written by hand from the spec: id, text, whether it may be interrupted.
 LINES = [
@@ -41,6 +46,15 @@ LINES = [
         " nearest emergency room right away.",
         False,
     ),
+    ("transfer", "I'm transferring you to our staff now. Please hold.", True),
+    ("goodbye", "Thank you for calling Sunrise Family Clinic. Goodbye.", True),
+    (
+        "after_hours_close",
+        "Thank you, {name}. Your message has been recorded, and our team will get back to you on"
+        " the next business day. If this is an emergency, please hang up and call 911. Have a"
+        " good {part_of_day}.",
+        True,
+    ),
     (
         "fallback",
         "I'm sorry, I can't help with that. I can take a message for our staff instead.",
@@ -64,6 +78,30 @@ LINES = [
     ),
 ]
 
+# The part of the day the after-hours line wishes the caller, written by hand: `day` from 5 AM
+# up to 5 PM clinic time, `night` otherwise, in winter (UTC-5) and summer (UTC-4) alike.
+PARTS_OF_DAY = [
+    # Tuesday 24 November 2026, in clinic time: 16:59:59.999999 and 17:00.
+    (datetime(2026, 11, 24, 21, 59, 59, 999999, tzinfo=UTC), "day"),
+    (datetime(2026, 11, 24, 22, 0, tzinfo=UTC), "night"),
+    (datetime(2026, 11, 25, 4, 30, tzinfo=UTC), "night"),
+    # 02:00, 04:59:59.999999, 05:00 and 07:00 on Wednesday.
+    (datetime(2026, 11, 25, 7, 0, tzinfo=UTC), "night"),
+    (datetime(2026, 11, 25, 9, 59, 59, 999999, tzinfo=UTC), "night"),
+    (datetime(2026, 11, 25, 10, 0, tzinfo=UTC), "day"),
+    (datetime(2026, 11, 25, 12, 0, tzinfo=UTC), "day"),
+    # 16:59 on Wednesday.
+    (datetime(2026, 11, 25, 21, 59, tzinfo=UTC), "day"),
+    # Saturday 28 November, 10:00 and 18:00.
+    (datetime(2026, 11, 28, 15, 0, tzinfo=UTC), "day"),
+    (datetime(2026, 11, 28, 23, 0, tzinfo=UTC), "night"),
+    # Saturday 4 July: 16:59 and 17:00 in clinic time are 20:59 and 21:00 UTC.
+    (datetime(2026, 7, 4, 20, 59, tzinfo=UTC), "day"),
+    (datetime(2026, 7, 4, 21, 0, tzinfo=UTC), "night"),
+    # 14:30 in a zone eight hours behind UTC is 17:30 in clinic time.
+    (datetime(2026, 11, 24, 14, 30, tzinfo=timezone(timedelta(hours=-8))), "night"),
+]
+
 
 def test_lines_are_exact() -> None:
     assert [script.value for script in ScriptId] == [line[0] for line in LINES]
@@ -72,3 +110,39 @@ def test_lines_are_exact() -> None:
     ] == LINES
     # The table cannot be changed while the application runs.
     assert type(SCRIPTS).__name__ == "mappingproxy"
+
+
+def test_lines_name_their_values() -> None:
+    assert {script.value: placeholders(script) for script in ScriptId} == {
+        "greeting": frozenset(),
+        "closed": frozenset(),
+        "ssn_ask": frozenset(),
+        "ssn_too_long": frozenset(),
+        "verified": frozenset({"first_name"}),
+        "verify_fail": frozenset(),
+        "verify_locked": frozenset(),
+        "emergency": frozenset(),
+        "transfer": frozenset(),
+        "goodbye": frozenset(),
+        "after_hours_close": frozenset({"name", "part_of_day"}),
+        "fallback": frozenset(),
+        "booking_instructions": frozenset(),
+        "advice_refusal": frozenset(),
+        "refill_no_promise": frozenset(),
+    }
+
+
+def test_after_hours_line_follows_clinic_time() -> None:
+    assert [(at, part_of_day(at)) for at, _ in PARTS_OF_DAY] == PARTS_OF_DAY
+    with pytest.raises(ValueError, match="timezone"):
+        part_of_day(datetime(2026, 11, 24, 18, 0))
+
+    # The line as code speaks it, with its two values filled in.
+    line = SCRIPTS[ScriptId.AFTER_HOURS_CLOSE].text.format(
+        name="Ana Diaz", part_of_day=part_of_day(datetime(2026, 11, 25, 1, 0, tzinfo=UTC))
+    )
+    assert line == (
+        "Thank you, Ana Diaz. Your message has been recorded, and our team will get back to you"
+        " on the next business day. If this is an emergency, please hang up and call 911. Have a"
+        " good night."
+    )
