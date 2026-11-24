@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from loguru import logger as pipecat_logger
 
+from app.agent.tools import register_tools
 from app.api.offer import OpenCall, build_router
 from app.config import LogLevel, Settings
 from app.voice.calls import CallRegistry
@@ -37,6 +38,7 @@ def create_app(settings: Settings | None = None, open_call: OpenCall | None = No
         settings = Settings()
 
     configure_logging(settings.log_level)
+    register_tools()
 
     if open_call is None:
         open_call = partial(open_echo_call, settings)

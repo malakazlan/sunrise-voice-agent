@@ -1,14 +1,20 @@
 """What the agent knows about one call, and the only ways it may change.
 
-A state is immutable. Each transition is a function that checks the move against the current
-state and returns a new state, or raises IllegalTransitionError. The identity fields (`verified`,
-`patient_id`, `patient_first_name`) are set only by `verify`, the intake -> serving move, and
-only while the office is open; a call starts without them and no other transition touches
-them. Errors name fields and phases, never values.
+A call starts with `new_call`. A state is immutable. Each transition is a function that checks
+the move against the current state and returns a new state, or raises IllegalTransitionError.
+The identity fields (`verified`, `patient_id`, `patient_first_name`) are set only by `verify`,
+the intake -> serving move, and only while the office is open; no other transition touches
+them. Every state, however it is made, is validated for consistency: verified goes with a
+patient id and a first name, an open office and a phase a verified caller can be in. Errors
+name fields and phases, never values.
+
+These rules protect against the model and the caller. Code that deliberately bypasses
+validation (`model_construct`, `object.__setattr__`) can still forge a state.
 """
 
+from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -24,6 +30,13 @@ class Phase(StrEnum):
     HANDOFF = "handoff"
     CLOSING = "closing"
     ENDED = "ended"
+
+
+# The phases a verified caller can be in: serving, where verify puts them, and every phase
+# reachable from there.
+VERIFIED_PHASES = frozenset(
+    {Phase.SERVING, Phase.BOOKING, Phase.EMERGENCY, Phase.HANDOFF, Phase.CLOSING, Phase.ENDED}
+)
 
 
 class IllegalTransitionError(ValueError):
@@ -50,6 +63,7 @@ class CallState(BaseModel):
     patient_first_name: str | None = Field(default=None, repr=False)
     is_new_patient: bool = False
     tool_errors: int = Field(default=0, ge=0)
+    tool_refusals: int = Field(default=0, ge=0)
 
     @field_validator("call_id")
     @classmethod
@@ -59,18 +73,43 @@ class CallState(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _starts_unverified(self) -> Self:
-        if self.verified or self.patient_id is not None or self.patient_first_name is not None:
-            raise ValueError("a call starts unverified; only verify sets the patient")
+    def _consistent(self) -> Self:
+        identified = (self.patient_id is not None, self.patient_first_name is not None)
+        if identified != (self.verified, self.verified):
+            raise ValueError("patient_id and patient_first_name are set exactly when verified")
+        if self.verified:
+            if not self.office_open:
+                raise ValueError("a caller is verified only while the office is open")
+            if self.phase not in VERIFIED_PHASES:
+                raise ValueError(f"a verified caller is not in {self.phase.value}")
+            if self.patient_id is None or not PATIENT_ID.fullmatch(self.patient_id):
+                raise ValueError("patient_id does not have the declared shape of a patient id")
         return self
 
 
-# The moves `move` makes, from each phase. intake -> serving is not here: it is `verify`.
+def new_call(*, call_id: str, started_at: datetime, office_open: bool) -> CallState:
+    """A call's first state: greeting, unverified, nothing counted."""
+    return CallState(call_id=call_id, started_at=started_at, office_open=office_open)
+
+
+def _next(state: CallState, **changes: Any) -> CallState:
+    """The state with `changes`, validated like any other."""
+    return CallState.model_validate({**state.model_dump(), **changes})
+
+
+# The moves `move` makes, from each phase. intake -> serving is not here: it is `verify`. The
+# caller can hang up at any time, so every phase but ended moves to ended.
 _MOVES: dict[Phase, frozenset[Phase]] = {
-    Phase.GREETING: frozenset({Phase.INTAKE, Phase.EMERGENCY}),
-    Phase.INTAKE: frozenset({Phase.BOOKING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY}),
-    Phase.SERVING: frozenset({Phase.BOOKING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY}),
-    Phase.BOOKING: frozenset({Phase.SERVING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY}),
+    Phase.GREETING: frozenset({Phase.INTAKE, Phase.EMERGENCY, Phase.ENDED}),
+    Phase.INTAKE: frozenset(
+        {Phase.BOOKING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY, Phase.ENDED}
+    ),
+    Phase.SERVING: frozenset(
+        {Phase.BOOKING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY, Phase.ENDED}
+    ),
+    Phase.BOOKING: frozenset(
+        {Phase.SERVING, Phase.CLOSING, Phase.HANDOFF, Phase.EMERGENCY, Phase.ENDED}
+    ),
     Phase.EMERGENCY: frozenset({Phase.EMERGENCY, Phase.ENDED}),
     Phase.HANDOFF: frozenset({Phase.EMERGENCY, Phase.ENDED}),
     Phase.CLOSING: frozenset({Phase.EMERGENCY, Phase.ENDED}),
@@ -92,8 +131,8 @@ def move(state: CallState, to: Phase) -> CallState:
     if to is Phase.SERVING and not state.verified:
         raise _refuse(state, to, "refused for a caller who is not verified")
     if state.phase is Phase.INTAKE and to is Phase.BOOKING:
-        return state.model_copy(update={"phase": to, "is_new_patient": True})
-    return state.model_copy(update={"phase": to})
+        return _next(state, phase=to, is_new_patient=True)
+    return _next(state, phase=to)
 
 
 def verify(state: CallState, *, patient_id: str, first_name: str) -> CallState:
@@ -107,18 +146,23 @@ def verify(state: CallState, *, patient_id: str, first_name: str) -> CallState:
         raise ValueError("patient_id does not have the declared shape of a patient id")
     if not isinstance(first_name, str) or not first_name.strip():
         raise ValueError("first_name must not be empty")
-    return state.model_copy(
-        update={
-            "phase": Phase.SERVING,
-            "verified": True,
-            "patient_id": patient_id,
-            "patient_first_name": first_name,
-        }
+    return _next(
+        state,
+        phase=Phase.SERVING,
+        verified=True,
+        patient_id=patient_id,
+        patient_first_name=first_name,
     )
 
 
+# The counters change nothing the consistency rules look at, so counting never fails: dispatch
+# counts on whatever state it is given and always returns a result.
 def count_tool_error(state: CallState) -> CallState:
     return state.model_copy(update={"tool_errors": state.tool_errors + 1})
+
+
+def count_refusal(state: CallState) -> CallState:
+    return state.model_copy(update={"tool_refusals": state.tool_refusals + 1})
 
 
 class Move(BaseModel):
@@ -130,7 +174,7 @@ class Move(BaseModel):
 
 
 class Verify(BaseModel):
-    """A handler's request for `verify`."""
+    """A handler's request for `verify`. Only the tool declared to verify may make it."""
 
     model_config = _FROZEN
 

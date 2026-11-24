@@ -1,13 +1,15 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 import anyio
 import pytest
-from conftest import TEST_AUDIT_KEY
+from conftest import TEST_AUDIT_KEY, import_application_modules
 from pydantic import (
+    AliasChoices,
+    AliasPath,
     BaseModel,
     ConfigDict,
     Field,
@@ -19,7 +21,8 @@ from pydantic import (
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from app.agent.state import CallState, Move, Phase, move, verify
+from app.agent import tool_registry
+from app.agent.state import CallState, Move, Phase, Verify, move, new_call, verify
 from app.agent.tool_registry import (
     REGISTRY,
     DeclarationError,
@@ -33,6 +36,7 @@ from app.agent.tool_registry import (
     ToolResult,
     check_declaration,
 )
+from app.agent.tools import register_tools
 from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, ResourceType
 from app.config import StartupSettings
 from app.db.session import create_database_engine, create_session_factory
@@ -124,6 +128,7 @@ def declared(name: str, handler: Handler, **overrides: Any) -> Tool:
         "phases": frozenset(Phase),
         "office_open_only": False,
         "writes": False,
+        "may_verify": False,
         "audit_action": Action.TOOL_CALLED,
         "resource_type": ResourceType.TOOL,
     }
@@ -151,7 +156,7 @@ def new_call_id() -> str:
 
 
 def start(office_open: bool = True) -> CallState:
-    return CallState(call_id=new_call_id(), started_at=T0, office_open=office_open)
+    return new_call(call_id=new_call_id(), started_at=T0, office_open=office_open)
 
 
 def intake(office_open: bool = True) -> CallState:
@@ -193,6 +198,16 @@ def patients(owner_engine: Engine) -> list[str]:
         return [row.id for row in connection.execute(PATIENT_IDS)]
 
 
+def after_refusal(state: CallState) -> CallState:
+    """The state a refusal leaves: one more refusal counted, nothing else changed."""
+    return state.model_copy(update={"tool_refusals": state.tool_refusals + 1})
+
+
+def called_event(state: CallState, name: str) -> tuple[Any, ...]:
+    """A tool's own event, for a tool whose resource type is `tool`: the id is its name."""
+    return ("tool_called", "tool", name, "success", state.call_id)
+
+
 def refused_event(state: CallState, name: str | None) -> tuple[Any, ...]:
     return ("tool_refused", "tool", name, "refused", state.call_id)
 
@@ -221,12 +236,16 @@ async def test_no_phi_tools_before_verification(deps: Deps, owner_engine: Engine
     )
 
     unverified = [state for state in every_combination() if not state.verified]
-    # And the unverified states a call reaches: intake and a new patient's booking.
-    unverified += [intake(), move(intake(), BOOKING)]
+    # And the unverified states a call reaches: intake and a new patient's booking. And a
+    # state with the verified flag forced on but no patient id: the gate wants both.
+    flag_only = forced(SERVING, verified=True, office_open=True).model_copy(
+        update={"patient_id": None}
+    )
+    unverified += [intake(), move(intake(), BOOKING), flag_only]
     for state in unverified:
         assert "read_chart" not in names(registry, state), state.phase
         after, outcome = await registry.dispatch(state, "read_chart", {}, deps)
-        assert (after, outcome) == (state, REFUSED)
+        assert (after, outcome) == (after_refusal(state), REFUSED)
     assert chart == []
     assert events(owner_engine) == [refused_event(state, "read_chart") for state in unverified]
 
@@ -247,7 +266,10 @@ async def test_no_phi_tools_when_closed(deps: Deps, owner_engine: Engine) -> Non
         state = forced(phase, verified=True, office_open=False)
         assert state.verified is True
         assert names(registry, state) == [], phase
-        assert await registry.dispatch(state, "read_chart", {}, deps) == (state, REFUSED)
+        assert await registry.dispatch(state, "read_chart", {}, deps) == (
+            after_refusal(state),
+            REFUSED,
+        )
     assert chart == []
     assert len(events(owner_engine)) == len(Phase)
 
@@ -272,7 +294,10 @@ async def test_office_open_only_tools_need_the_office_open(
             assert names(registry, state) == ["transfer_desk"]
         else:
             assert names(registry, state) == []
-            assert await registry.dispatch(state, "transfer_desk", {}, deps) == (state, REFUSED)
+            assert await registry.dispatch(state, "transfer_desk", {}, deps) == (
+                after_refusal(state),
+                REFUSED,
+            )
     assert desk == []
     assert (await registry.dispatch(intake(), "transfer_desk", {}, deps))[1].status is Status.DONE
     assert len(desk) == 1
@@ -288,7 +313,7 @@ async def test_no_tools_in_terminal_phases(deps: Deps, owner_engine: Engine) -> 
     for state in states:
         assert registry.tools_for(state) == [], state.phase
         for name in ("office_info", "read_chart"):
-            assert await registry.dispatch(state, name, {}, deps) == (state, REFUSED)
+            assert await registry.dispatch(state, name, {}, deps) == (after_refusal(state), REFUSED)
     assert (info, chart) == ([], [])
     assert len(events(owner_engine)) == 2 * len(states)
 
@@ -325,7 +350,10 @@ async def test_dispatch_refuses_outside_the_gate(deps: Deps, owner_engine: Engin
         (intake(), "read_chart", {}),
     ]
     for state, name, arguments in outside:
-        assert await registry.dispatch(state, name, arguments, deps) == (state, REFUSED)
+        assert await registry.dispatch(state, name, arguments, deps) == (
+            after_refusal(state),
+            REFUSED,
+        )
     # Neither the handler nor even the argument model ran.
     assert (desk, chart, parsed) == ([], [], [])
     assert events(owner_engine) == [refused_event(state, name) for state, name, _ in outside]
@@ -344,7 +372,7 @@ async def test_dispatch_refuses_unknown_tool(
     info: Calls = []
     registry = registry_of(declared("office_info", recording(info)))
     state = intake()
-    unknown = [
+    unknown: list[object] = [
         "no_such_tool",
         "Office_Info",
         "office_info ",
@@ -352,14 +380,20 @@ async def test_dispatch_refuses_unknown_tool(
         "-".join(["1" * 3, "2" * 2, "3" * 4]),
         "x" * 100,
         "",
+        # Not text at all.
+        5,
+        None,
+        ["office_info"],
+        {"name": "office_info"},
+        b"office_info",
     ]
     for name in unknown:
-        assert await registry.dispatch(state, name, {}, deps) == (state, REFUSED)
+        assert await registry.dispatch(state, name, {}, deps) == (after_refusal(state), REFUSED)
     assert info == []
     # The model's text is not a tool name, so the events do not record it.
     assert events(owner_engine) == [refused_event(state, None)] * len(unknown)
     for name in unknown:
-        if name:
+        if isinstance(name, str) and name:
             assert name not in caplog.text
 
 
@@ -383,7 +417,7 @@ async def test_dispatch_refuses_bad_arguments(
     ]
     for arguments in bad:
         after, outcome = await registry.dispatch(state, "look_up", arguments, deps)
-        assert (after, outcome) == (state, REFUSED)
+        assert (after, outcome) == (after_refusal(state), REFUSED)
         assert MARKER not in outcome.model_dump_json()
     assert calls == []
     assert MARKER not in caplog.text
@@ -422,7 +456,7 @@ def inserting(
             locks_seen.append((await session.execute(OWN_ADVISORY_LOCKS)).scalar_one())
         if then is not None:
             await then(session)
-        return ToolResult(resource_id=patient_id) if result is None else result
+        return ToolResult() if result is None else result
 
     return handler
 
@@ -434,7 +468,6 @@ def writing_tool(handler: Handler) -> Tool:
         arguments=Note,
         phases=frozenset(LIVE_PHASES),
         writes=True,
-        resource_type=ResourceType.PATIENT,
     )
 
 
@@ -455,7 +488,7 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
     assert outcome.status is Status.DONE
     assert locks_seen == [0]
     assert patients(owner_engine) == ["P901"]
-    assert events(owner_engine) == [("tool_called", "patient", "P901", "success", state.call_id)]
+    assert events(owner_engine) == [called_event(state, "save_note")]
 
     failing: list[tuple[str, Handler, Deps]] = [
         ("P902", inserting("P902", then=raise_error), deps),
@@ -471,7 +504,7 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
         # A handler may not commit on its own.
         ("P904", inserting("P904", then=lambda session: session.commit()), deps),
         # A transition that is illegal from the current state.
-        ("P905", inserting("P905", result=ToolResult(transition=Move(to=ENDED))), deps),
+        ("P905", inserting("P905", result=ToolResult(transition=Move(to=GREETING))), deps),
     ]
     for patient_id, handler, these_deps in failing:
         registry = registry_of(writing_tool(handler))
@@ -481,7 +514,7 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
     # Nothing of the failed calls committed: neither the row nor a success event.
     assert patients(owner_engine) == ["P901"]
     assert events(owner_engine) == [
-        ("tool_called", "patient", "P901", "success", state.call_id),
+        called_event(state, "save_note"),
         *[failed_event(state, "save_note")] * len(failing),
     ]
 
@@ -494,14 +527,13 @@ async def test_every_dispatch_is_audited(deps: Deps, owner_engine: Engine) -> No
     registry = registry_of(
         declared("look_up", recording(unused), arguments=Topic),
         declared("breaks", recording(unused, fail=RuntimeError("broken"))),
-        declared("bad_move", recording(unused, ToolResult(transition=Move(to=ENDED)))),
+        declared("bad_move", recording(unused, ToolResult(transition=Move(to=GREETING)))),
         declared("bad_result", not_a_result),
         phi_tool("read_chart", recording(unused)),
     )
     state = intake()
-    i = state.call_id
     dispatches: list[tuple[str, object, Status, tuple[Any, ...]]] = [
-        ("look_up", {"topic": "hours"}, Status.DONE, ("tool_called", "tool", None, "success", i)),
+        ("look_up", {"topic": "hours"}, Status.DONE, called_event(state, "look_up")),
         ("no_such_tool", {}, Status.REFUSED, refused_event(state, None)),
         ("read_chart", {}, Status.REFUSED, refused_event(state, "read_chart")),
         ("look_up", {}, Status.REFUSED, refused_event(state, "look_up")),
@@ -530,7 +562,7 @@ async def test_failures_are_generic(
         declared("look_up", recording(unused), arguments=Topic),
         declared("breaks", recording(unused, fail=RuntimeError(MARKER))),
         declared("breaks_too", recording(unused, fail=ValueError(f"no row for {MARKER}"))),
-        declared("bad_move", recording(unused, ToolResult(transition=Move(to=ENDED)))),
+        declared("bad_move", recording(unused, ToolResult(transition=Move(to=GREETING)))),
         phi_tool("read_chart", recording(unused)),
     )
     state = intake()
@@ -594,6 +626,7 @@ def valid(**overrides: Any) -> dict[str, Any]:
         "phases": frozenset(PHI_PHASES),
         "office_open_only": True,
         "writes": False,
+        "may_verify": False,
         "audit_action": Action.TOOL_CALLED,
         "resource_type": ResourceType.PATIENT,
     }
@@ -635,6 +668,40 @@ class Ignoring(BaseModel):
     topic: str
 
 
+class ValidationAliased(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    who: str = Field(validation_alias="patient_id")
+
+
+class ChoiceAliased(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    when: str = Field(validation_alias=AliasChoices("date", "dob"))
+
+
+class PathAliased(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(validation_alias=AliasPath("record", "ssn"))
+
+
+class Loose(BaseModel):
+    code: str
+
+
+class HoldsLoose(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inner: Loose
+
+
+class HoldsLooseList(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inners: list[Loose] | None = None
+
+
 class Allowing(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -654,6 +721,7 @@ def test_registration_rules() -> None:
                 "writes",
                 "audit_action",
                 "office_open_only",
+                "may_verify",
                 "resource_type",
                 "arguments",
                 "handler",
@@ -688,6 +756,9 @@ def test_registration_rules() -> None:
         ],
         ("names a patient", Tool(**valid(arguments=Aliased))),
         ("names a patient", Tool(**valid(arguments=Nested))),
+        ("names a patient", Tool(**valid(arguments=ValidationAliased))),
+        ("names a patient", Tool(**valid(arguments=ChoiceAliased))),
+        ("names a patient", Tool(**valid(arguments=PathAliased))),
         # A phi tool lists only serving and booking.
         *[
             ("phi", Tool(**valid(phases=frozenset({SERVING, phase}))))
@@ -709,6 +780,38 @@ def test_registration_rules() -> None:
         # Argument models forbid unknown fields.
         ("extra", Tool(**valid(arguments=Ignoring))),
         ("extra", Tool(**valid(arguments=Allowing))),
+        # And so do the models nested in them.
+        ("extra", Tool(**valid(arguments=HoldsLoose))),
+        ("extra", Tool(**valid(arguments=HoldsLooseList))),
+        # No field takes free keys or anything at all.
+        *[
+            ("free", Tool(**valid(arguments=arguments_with(details=(annotation, ...)))))
+            for annotation in (
+                dict[str, str],
+                Mapping[str, int],
+                list[dict[str, str]],
+                dict[str, str] | None,
+                Any,
+                object,
+                list[Any],
+            )
+        ],
+        # The actions dispatch writes itself are not a tool's to declare.
+        *[
+            ("reserved", Tool(**valid(audit_action=action)))
+            for action in (
+                Action.TOOL_REFUSED,
+                Action.TOOL_FAILED,
+                Action.CALL_STARTED,
+                Action.CALL_ENDED,
+            )
+        ],
+        # A tool that may verify the caller: not a patient-data tool, and in intake only.
+        ("verif", Tool(**valid(may_verify=True))),
+        *[
+            ("verif", Tool(**valid(may_verify=True, phi=False, phases=frozenset(phases))))
+            for phases in ({INTAKE, SERVING}, {SERVING}, {INTAKE, GREETING}, set(Phase))
+        ],
         # The name is the tool's audit id: lower-case letters and underscores, 2 to 40.
         *[
             ("name", Tool.model_construct(**valid(name=name)))
@@ -736,6 +839,13 @@ def test_registration_rules() -> None:
     registry.register(Tool(**valid(name="office_info", phi=False, phases=frozenset(Phase))))
     assert [item.name for item in registry.tools] == ["read_chart", "office_info"]
 
+    # One tool at most may verify the caller.
+    verifier = valid(may_verify=True, phi=False, phases=frozenset({INTAKE}))
+    registry.register(Tool(**{**verifier, "name": "check_identity"}))
+    with pytest.raises(DeclarationError, match="verif"):
+        registry.register(Tool(**{**verifier, "name": "check_identity_again"}))
+    assert [item.name for item in registry.tools if item.may_verify] == ["check_identity"]
+
 
 def gate_violations(registry: Registry) -> list[str]:
     """Every way the registry's tools break a declaration or the gate, over every phase,
@@ -747,7 +857,10 @@ def gate_violations(registry: Registry) -> list[str]:
         except DeclarationError as error:
             problems.append(f"{item.name}: {error}")
     by_name = {item.name: item for item in registry.tools}
-    for state in every_combination():
+    states = every_combination()
+    # The verified flag without a patient id, for each phase and office state.
+    states += [state.model_copy(update={"patient_id": None}) for state in states if state.verified]
+    for state in states:
         for description in registry.tools_for(state):
             item = by_name[description.name]
             where = (
@@ -758,16 +871,27 @@ def gate_violations(registry: Registry) -> list[str]:
             if state.phase not in item.phases:
                 problems.append(f"undeclared phase: {where}")
             if item.phi and not (
-                state.verified and state.office_open and state.phase in PHI_PHASES
+                state.verified
+                and state.patient_id is not None
+                and state.office_open
+                and state.phase in PHI_PHASES
             ):
                 problems.append(f"phi: {where}")
+            if item.may_verify and (item.phi or state.phase is not INTAKE):
+                problems.append(f"verifier: {where}")
             if item.office_open_only and not state.office_open:
                 problems.append(f"office closed: {where}")
     return problems
 
 
 def test_application_registry_obeys_the_gate() -> None:
+    # Every tool the application has: registered through the one entry point, wherever its
+    # module is, once every module of the application is imported.
+    import_application_modules()
+    assert register_tools() is REGISTRY
+    assert REGISTRY.sealed
     assert gate_violations(REGISTRY) == []
+    assert len([item for item in REGISTRY.tools if item.may_verify]) <= 1
 
     # The gate offers a tool only in its declared phases, and a patient-data tool cannot be
     # declared for any phase but serving and booking: so no registry, whatever it holds, can
@@ -790,6 +914,7 @@ def test_application_registry_obeys_the_gate() -> None:
         phi_tool("read_chart", noop),
         declared("office_info", noop),
         declared("transfer_desk", noop, phases=frozenset({INTAKE}), office_open_only=True),
+        declared("check_identity", noop, phases=frozenset({INTAKE}), may_verify=True),
     ]
     assert gate_violations(registry_of(*tools)) == []
 
@@ -801,7 +926,7 @@ def test_application_registry_obeys_the_gate() -> None:
     for item in tools:
         ungated.register(item)
     kinds = {problem.split(":")[0] for problem in gate_violations(ungated)}
-    assert kinds == {"no tools", "undeclared phase", "phi", "office closed"}
+    assert kinds == {"no tools", "undeclared phase", "phi", "office closed", "verifier"}
 
 
 # --- Neighbours -----------------------------------------------------------------------------
@@ -839,7 +964,7 @@ async def test_handler_gets_the_patient_from_the_state(deps: Deps) -> None:
     assert [(call[0].patient_id, call[1]) for call in chart] == [("P042", NoArguments())]
     # The model cannot name another patient: unknown fields are refused.
     assert await registry.dispatch(state, "read_chart", {"patient_id": "P001"}, deps) == (
-        state,
+        after_refusal(state),
         REFUSED,
     )
     assert len(chart) == 1
@@ -855,7 +980,7 @@ async def test_emergency_mid_call_leaves_no_tools(deps: Deps) -> None:
     assert (state.phase, outcome.status) == (EMERGENCY, Status.DONE)
     assert registry.tools_for(state) == []
     for name in ("raise_alarm", "read_chart"):
-        assert await registry.dispatch(state, name, {}, deps) == (state, REFUSED)
+        assert await registry.dispatch(state, name, {}, deps) == (after_refusal(state), REFUSED)
     assert len(calls) == 1
 
     # Raised by the caller's side between tool calls, the same.
@@ -944,3 +1069,223 @@ async def test_database_down_fails_generically(
         assert (state.tool_errors, outcome.hand_off) == (2, True)
     finally:
         await engine.dispose()
+
+
+# --- Rework: verification, the transaction, sealing, audit ids, bounds ----------------------
+
+
+class Member(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    member_number: str
+
+
+async def test_only_the_verifying_tool_can_verify(deps: Deps, owner_engine: Engine) -> None:
+    async def claims_identity(
+        session: AsyncSession, state: CallState, arguments: Any
+    ) -> ToolResult:
+        return ToolResult(transition=Verify(patient_id=arguments.member_number, first_name="Ann"))
+
+    registry = registry_of(
+        declared("look_up_member", claims_identity, arguments=Member, phases=frozenset({INTAKE})),
+        declared(
+            "check_identity",
+            claims_identity,
+            arguments=Member,
+            phases=frozenset({INTAKE}),
+            may_verify=True,
+        ),
+        phi_tool("read_chart", noop),
+    )
+    state = intake()
+
+    # Any other tool asking to verify fails, and the caller stays unverified.
+    after, outcome = await registry.dispatch(
+        state, "look_up_member", {"member_number": "P002"}, deps
+    )
+    assert outcome == FAILED
+    assert (after.verified, after.patient_id, after.phase, after.tool_errors) == (
+        False,
+        None,
+        INTAKE,
+        1,
+    )
+    assert "read_chart" not in names(registry, after)
+
+    # The one tool declared to verify does.
+    after, outcome = await registry.dispatch(
+        state, "check_identity", {"member_number": "P002"}, deps
+    )
+    assert outcome.status is Status.DONE
+    assert (after.verified, after.patient_id, after.phase) == (True, "P002", SERVING)
+    assert "read_chart" in names(registry, after)
+    assert events(owner_engine) == [
+        failed_event(state, "look_up_member"),
+        called_event(state, "check_identity"),
+    ]
+
+
+async def commit_through_the_connection(session: AsyncSession) -> None:
+    await (await session.connection()).commit()
+
+
+async def roll_back_raw(session: AsyncSession) -> None:
+    await session.execute(text("ROLLBACK"))
+
+
+async def roll_back_and_write_again(session: AsyncSession) -> None:
+    await session.rollback()
+    await session.execute(INSERT_PATIENT, {"id": "P999"})
+
+
+async def test_handler_cannot_leave_its_transaction(
+    deps: Deps, runtime: AsyncEngine, owner_engine: Engine
+) -> None:
+    state = intake()
+
+    def then_fail(
+        step: Callable[[AsyncSession], Awaitable[None]],
+    ) -> Callable[[AsyncSession], Awaitable[None]]:
+        async def both(session: AsyncSession) -> None:
+            await step(session)
+            raise RuntimeError("the handler failed after ending its transaction")
+
+        return both
+
+    cases: list[tuple[str, Callable[[AsyncSession], Awaitable[None]]]] = [
+        # It commits through the connection, then fails, or returns success.
+        ("P911", then_fail(commit_through_the_connection)),
+        ("P912", commit_through_the_connection),
+        # It rolls back (raw, or through the session and writes again) and returns success.
+        ("P913", roll_back_raw),
+        ("P914", roll_back_and_write_again),
+    ]
+    for patient_id, step in cases:
+        registry = registry_of(writing_tool(inserting(patient_id, then=step)))
+        after, outcome = await registry.dispatch(state, "save_note", NOTE, deps)
+        assert (after.tool_errors, outcome) == (1, FAILED), patient_id
+    assert patients(owner_engine) == []
+    assert events(owner_engine) == [failed_event(state, "save_note")] * len(cases)
+
+    # The same commit through the connection while the audit chain's lock is held elsewhere:
+    # neither its row nor any event.
+    registry = registry_of(writing_tool(inserting("P915", then=commit_through_the_connection)))
+    async with create_session_factory(runtime)() as holder:
+        await holder.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": CHAIN_LOCK})
+        after, outcome = await registry.dispatch(state, "save_note", NOTE, deps)
+        await holder.rollback()
+    assert (after.tool_errors, outcome) == (1, FAILED)
+    assert patients(owner_engine) == []
+    assert len(events(owner_engine)) == len(cases)
+
+
+def test_the_application_registry_is_sealed() -> None:
+    import_application_modules()
+    assert register_tools() is REGISTRY
+    assert register_tools() is REGISTRY
+    with pytest.raises(DeclarationError, match="sealed"):
+        REGISTRY.register(declared("late_tool", noop))
+    assert "late_tool" not in [item.name for item in REGISTRY.tools]
+
+    # A registry of its own is sealed the same way.
+    registry = registry_of(declared("office_info", noop))
+    registry.seal()
+    with pytest.raises(DeclarationError, match="sealed"):
+        registry.register(declared("look_up", noop, arguments=Topic))
+    assert [item.name for item in registry.tools] == ["office_info"]
+
+
+async def test_tool_calls_are_audited_with_their_ids(deps: Deps, owner_engine: Engine) -> None:
+    registry = registry_of(
+        declared("office_info", noop),
+        phi_tool("read_chart", noop),
+        declared(
+            "book_slot",
+            recording([], ToolResult(resource_id="42")),
+            resource_type=ResourceType.APPOINTMENT,
+        ),
+        # A handler does not name the record of a tool or patient event.
+        declared("names_itself", recording([], ToolResult(resource_id="names_itself"))),
+        phi_tool("names_a_patient", recording([], ToolResult(resource_id="P002"))),
+    )
+    serving = verify(intake(), patient_id="P042", first_name="Ann")
+    for name, status in (
+        ("office_info", Status.DONE),
+        ("read_chart", Status.DONE),
+        ("book_slot", Status.DONE),
+        ("names_itself", Status.FAILED),
+        ("names_a_patient", Status.FAILED),
+    ):
+        _after, outcome = await registry.dispatch(serving, name, {}, deps)
+        assert outcome.status is status, name
+    call = serving.call_id
+    assert events(owner_engine) == [
+        ("tool_called", "tool", "office_info", "success", call),
+        ("tool_called", "patient", "P042", "success", call),
+        ("tool_called", "appointment", "42", "success", call),
+        ("tool_failed", "tool", "names_itself", "failure", call),
+        ("tool_failed", "tool", "names_a_patient", "failure", call),
+    ]
+
+
+async def never_returns(session: AsyncSession, state: CallState, arguments: Any) -> ToolResult:
+    await anyio.sleep_forever()
+    raise AssertionError("unreachable")
+
+
+async def test_dispatch_has_a_deadline(
+    deps: Deps, owner_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert tool_registry.DISPATCH_DEADLINE_SECONDS == 10
+    monkeypatch.setattr(tool_registry, "DISPATCH_DEADLINE_SECONDS", 0.5)
+    registry = registry_of(declared("stalls", never_returns))
+    state = intake()
+    with anyio.fail_after(10):
+        after, outcome = await registry.dispatch(state, "stalls", {}, deps)
+    assert (after.tool_errors, outcome) == (1, FAILED)
+    assert events(owner_engine) == [failed_event(state, "stalls")]
+
+
+async def test_oversized_arguments_are_refused(deps: Deps, owner_engine: Engine) -> None:
+    parsed: list[int] = []
+
+    class Counted(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        topic: str
+
+        @model_validator(mode="before")
+        @classmethod
+        def record(cls, data: object) -> object:
+            parsed.append(1)
+            return data
+
+    registry = registry_of(declared("look_up", noop, arguments=Counted))
+    state = intake()
+    # {"topic": "..."} serialized is the value's length plus 13 bytes.
+    at_limit = {"topic": "x" * (16 * 1024 - 13)}
+    over_limit = {"topic": "x" * (16 * 1024 - 12)}
+    assert (await registry.dispatch(state, "look_up", at_limit, deps))[1].status is Status.DONE
+    assert parsed == [1]
+    assert await registry.dispatch(state, "look_up", over_limit, deps) == (
+        after_refusal(state),
+        REFUSED,
+    )
+    # Arguments that are not JSON at all are refused the same way.
+    assert await registry.dispatch(state, "look_up", {"topic": {1, 2}}, deps) == (
+        after_refusal(state),
+        REFUSED,
+    )
+    assert parsed == [1]
+
+
+async def test_five_refusals_hand_off(deps: Deps) -> None:
+    registry = registry_of(declared("look_up", noop, arguments=Topic))
+    state = intake()
+    for count in range(1, 6):
+        state, outcome = await registry.dispatch(state, "no_such_tool", {}, deps)
+        assert (state.tool_refusals, state.tool_errors) == (count, 0)
+        assert outcome == REFUSED.model_copy(update={"hand_off": count >= 5}), count
+    # Every outcome after that says so too, a success included.
+    state, outcome = await registry.dispatch(state, "look_up", {"topic": "hours"}, deps)
+    assert (outcome.status, outcome.hand_off) == (Status.DONE, True)

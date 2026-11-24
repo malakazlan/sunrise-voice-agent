@@ -2,7 +2,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from app.agent.state import (
     CallState,
@@ -11,8 +11,10 @@ from app.agent.state import (
     Phase,
     Verify,
     apply,
+    count_refusal,
     count_tool_error,
     move,
+    new_call,
     verify,
 )
 from app.voice.calls import CallRegistry
@@ -37,7 +39,7 @@ def new_call_id() -> str:
 
 
 def start(office_open: bool = True) -> CallState:
-    return CallState(call_id=new_call_id(), started_at=T0, office_open=office_open)
+    return new_call(call_id=new_call_id(), started_at=T0, office_open=office_open)
 
 
 def verified_serving() -> CallState:
@@ -90,12 +92,13 @@ def test_phases_are_the_documented_ones() -> None:
 #   v  only through the verification transition, and only while the office is open
 #   a  only for a verified caller (a new patient's booking never reaches serving)
 #   .  refused
+# The caller can hang up at any time: every phase but ended moves to ended.
 MATRIX = """
             greeting intake serving booking emergency handoff closing ended
-greeting       .       x      .       .        x        .       .      .
-intake         .       .      v       x        x        o       x      .
-serving        .       .      .       x        x        o       x      .
-booking        .       .      a       .        x        o       x      .
+greeting       .       x      .       .        x        .       .      x
+intake         .       .      v       x        x        o       x      x
+serving        .       .      .       x        x        o       x      x
+booking        .       .      a       .        x        o       x      x
 emergency      .       .      .       .        x        .       .      x
 handoff        .       .      .       .        x        .       .      x
 closing        .       .      .       .        x        .       .      x
@@ -139,8 +142,8 @@ def test_illegal_moves_are_refused() -> None:
 
     # A refusal names the phases, and the state it was asked of is unchanged.
     intake = move(start(), INTAKE)
-    with pytest.raises(IllegalTransitionError, match="intake -> ended"):
-        move(intake, ENDED)
+    with pytest.raises(IllegalTransitionError, match="intake -> greeting"):
+        move(intake, GREETING)
     assert intake.phase is INTAKE
 
     # Every phase, and both kinds of booking, were tried.
@@ -186,6 +189,7 @@ def every_reachable_state(office_open: bool) -> set[CallState]:
         *[lambda state, target=target: move(state, target) for target in Phase],
         lambda state: verify(state, patient_id="P001", first_name="Sarah"),
         count_tool_error,
+        count_refusal,
     ]
     seen = {start(office_open)}
     frontier = list(seen)
@@ -196,8 +200,8 @@ def every_reachable_state(office_open: bool) -> set[CallState]:
                 after = step(state)
             except IllegalTransitionError:
                 continue
-            # Tool errors grow without bound; two are enough to reach every combination.
-            if after.tool_errors <= 2 and after not in seen:
+            # The counters grow without bound; two are enough to reach every combination.
+            if after.tool_errors <= 2 and after.tool_refusals <= 2 and after not in seen:
                 seen.add(after)
                 frontier.append(after)
     return seen
@@ -225,6 +229,9 @@ def test_verified_only_through_the_transition() -> None:
             counted = count_tool_error(state)
             assert (counted.verified, counted.patient_id) == (state.verified, state.patient_id)
             assert counted.tool_errors == state.tool_errors + 1
+            refused = count_refusal(state)
+            assert (refused.verified, refused.patient_id) == (state.verified, state.patient_id)
+            assert refused.tool_refusals == state.tool_refusals + 1
             # A verified state comes only from intake, with the office open.
             if state.verified:
                 assert office_open
@@ -256,16 +263,28 @@ def test_verified_only_through_the_transition() -> None:
         with pytest.raises(ValueError, match="first_name"):
             verify(intake, patient_id="P001", first_name=first_name)
 
-    # A call starts unverified: the constructor takes no verification.
+    # A state is checked for consistency whenever it is validated: verified goes with a patient
+    # id and a first name, an open office and a phase a verified caller can be in.
+    verified = {"verified": True, "patient_id": "P001", "patient_first_name": "Sarah"}
+    base = {"call_id": new_call_id(), "started_at": T0, "office_open": True}
     for given in (
         {"verified": True},
         {"patient_id": "P001"},
         {"patient_first_name": "Sarah"},
-        {"verified": True, "patient_id": "P001", "patient_first_name": "Sarah"},
+        {"verified": True, "patient_id": "P001"},
+        {"verified": True, "patient_first_name": "Sarah"},
+        {**verified, "phase": SERVING, "office_open": False},
+        {**verified, "phase": GREETING},
+        {**verified, "phase": INTAKE},
+        {**verified, "phase": SERVING, "patient_id": "p001"},
+        {"phase": SERVING, "tool_refusals": -1},
     ):
-        with pytest.raises(ValidationError) as refused:
-            CallState(call_id=new_call_id(), started_at=T0, office_open=True, **given)
-        assert "Sarah" not in str(refused.value)
+        with pytest.raises(ValidationError) as invalid:
+            CallState.model_validate({**base, **given})
+        assert "Sarah" not in str(invalid.value)
+    for phase in (SERVING, BOOKING, EMERGENCY, HANDOFF, CLOSING, ENDED):
+        state = CallState.model_validate({**base, **verified, "phase": phase})
+        assert (state.verified, state.patient_id) == (True, "P001")
 
     # The first name never shows in the state's text form.
     assert "Sarah" not in repr(verified_serving())
@@ -294,10 +313,43 @@ def test_emergency_from_any_live_phase() -> None:
                 assert move(state, EMERGENCY).phase is EMERGENCY
 
 
+def test_a_new_call_starts_at_the_beginning() -> None:
+    state = new_call(call_id=new_call_id(), started_at=T0, office_open=True)
+    assert (state.phase, state.verified, state.patient_id, state.patient_first_name) == (
+        GREETING,
+        False,
+        None,
+        None,
+    )
+    assert (state.verify_attempts, state.verify_locked, state.tool_errors) == (0, False, 0)
+    assert (state.tool_refusals, state.is_new_patient, state.started_at) == (0, False, T0)
+    assert new_call(call_id=new_call_id(), started_at=T0, office_open=False).office_open is False
+
+
+def test_a_verified_state_validates_again() -> None:
+    state = verified_serving()
+    assert CallState.model_validate(state.model_dump()) == state
+
+    class Holder(BaseModel):
+        state: CallState
+
+    assert Holder.model_validate({"state": state.model_dump()}).state == state
+    for phase in (BOOKING, EMERGENCY, HANDOFF, CLOSING, ENDED):
+        after = move(state, phase)
+        assert CallState.model_validate(after.model_dump()) == after
+
+
+def test_transitions_refuse_an_inconsistent_state() -> None:
+    # A state forged past validation (verified with the office closed) is not carried on by any
+    # transition: the next state is validated and refused.
+    forged = verified_serving().model_copy(update={"office_open": False})
+    for target in (BOOKING, CLOSING, EMERGENCY, ENDED):
+        with pytest.raises(ValidationError):
+            move(forged, target)
+
+
 def test_a_call_state_checks_what_it_is_given() -> None:
     call_id = new_call_id()
-    assert start().phase is GREETING
-    assert (start().verify_attempts, start().verify_locked, start().tool_errors) == (0, False, 0)
     for bad_id in (call_id.upper(), f"{call_id[:12]}1{call_id[13:]}", "call-1", ""):
         with pytest.raises(ValidationError):
             CallState(call_id=bad_id, started_at=T0, office_open=True)

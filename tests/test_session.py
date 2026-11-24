@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.pool import NullPool
 
 from app.config import StartupSettings
+from app.db import session as session_module
 from app.db.session import (
     create_database_engine,
     create_owner_engine,
@@ -276,6 +277,32 @@ async def test_every_engine_gives_up_on_a_server_that_does_not_answer(
     failure = failures[0]
     assert isinstance(failure, OperationalError)
     assert isinstance(failure.orig, errors.ConnectionTimeout)
+
+
+async def test_runtime_sessions_have_a_statement_timeout(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The application's sessions: 5 seconds. The start-up engines keep their own limits.
+    assert session_module.RUNTIME_STATEMENT_TIMEOUT_MS == 5_000
+    engine = create_database_engine(database)
+    try:
+        async with engine.connect() as connection:
+            limit = await connection.scalar(text("SELECT current_setting('statement_timeout')"))
+    finally:
+        await engine.dispose()
+    assert limit == "5s"
+
+    # A statement that runs past it ends, here a sleep under a shorter limit.
+    monkeypatch.setattr(session_module, "RUNTIME_STATEMENT_TIMEOUT_MS", 500)
+    engine = create_database_engine(database)
+    try:
+        with anyio.fail_after(GIVE_UP_WITHIN_SECONDS):
+            with pytest.raises(OperationalError) as excinfo:
+                async with engine.connect() as connection:
+                    await connection.execute(text("SELECT pg_sleep(30)"))
+        assert isinstance(excinfo.value.orig, errors.QueryCanceled)
+    finally:
+        await engine.dispose()
 
 
 class RefusesValues(TypeDecorator[str]):
