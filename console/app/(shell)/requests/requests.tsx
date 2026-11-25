@@ -48,6 +48,31 @@ function Summary({ request }: { request: QueueItem }) {
   );
 }
 
+// What staff can do with a request, written once for the stacked rows and the table. Both writes
+// come with the next release; until then they are shown, disabled, with the note that says so.
+function RequestActions({
+  request,
+  describedBy,
+  className,
+}: {
+  request: QueueItem;
+  describedBy: string;
+  className: string;
+}) {
+  return (
+    <div className={className}>
+      <Button variant="outline" size="sm" disabled aria-describedby={describedBy}>
+        Mark handled
+      </Button>
+      {request.type === "callback" ? (
+        <Button variant="ghost" size="sm" disabled aria-describedby={describedBy}>
+          Show callback details
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 export function RequestsView() {
   const { time_zone: zone } = useClinic();
   const [filter, setFilter] = useState<Filter>("all");
@@ -95,16 +120,7 @@ export function RequestsView() {
                 <span className="text-muted-foreground">· call</span>
                 <CallLink callId={request.call_id} />
               </p>
-              <div className="flex flex-wrap gap-2">
-                <Button variant="outline" size="sm" disabled aria-describedby={laterId}>
-                  Mark handled
-                </Button>
-                {request.type === "callback" ? (
-                  <Button variant="ghost" size="sm" disabled aria-describedby={laterId}>
-                    Show callback details
-                  </Button>
-                ) : null}
-              </div>
+              <RequestActions request={request} describedBy={laterId} className="flex flex-wrap gap-2" />
             </li>
           ))}
         </ul>
@@ -148,16 +164,11 @@ export function RequestsView() {
                     <CallLink callId={request.call_id} />
                   </TableCell>
                   <TableCell className="pr-5 align-top">
-                    <div className="flex flex-col items-end gap-1.5">
-                      <Button variant="outline" size="sm" disabled aria-describedby={laterId}>
-                        Mark handled
-                      </Button>
-                      {request.type === "callback" ? (
-                        <Button variant="ghost" size="sm" disabled aria-describedby={laterId}>
-                          Show callback details
-                        </Button>
-                      ) : null}
-                    </div>
+                    <RequestActions
+                      request={request}
+                      describedBy={laterId}
+                      className="flex flex-col items-end gap-1.5"
+                    />
                   </TableCell>
                 </TableRow>
               );

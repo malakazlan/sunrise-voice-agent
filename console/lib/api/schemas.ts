@@ -15,7 +15,11 @@ const MASKED_CALLBACK = /^\*\*\*-\*\*\*-(?:[0-9]{4}|\*{4})$/;
 const instant = z.iso.datetime({ offset: true });
 const count = z.number().int().nonnegative();
 const milliseconds = count.nullable();
+// A call id the console builds a path or a key from: exactly the API's shape.
 const callId = z.string().regex(CALL_ID);
+// A call id that is only shown or linked: one odd value must not blank a whole page, so any short
+// text is accepted, and one without the shape is shown as text, not as a link (CallLink).
+const shownCallId = z.string().min(1).max(64);
 
 export const PHASES = [
   "greeting",
@@ -97,7 +101,7 @@ export const callsSchema = z.object({ calls: z.array(callSchema) });
 export const auditEventSchema = z.object({
   seq: count,
   ts: instant,
-  call_id: z.string().nullable(),
+  call_id: shownCallId.nullable(),
   actor: z.string(),
   action: z.string(),
   resource_type: z.string(),
@@ -142,7 +146,7 @@ export const turnsSchema = z.object({ turns: z.array(turnSchema) });
 export const queueItemSchema = z.object({
   id: count,
   created_at: instant,
-  call_id: callId,
+  call_id: shownCallId,
   type: z.enum(REQUEST_TYPES),
   summary: z.string(),
   patient_id: z.string().nullable(),
@@ -160,7 +164,7 @@ export const appointmentSchema = z.object({
   new_patient: z.boolean(),
   reason: z.string().nullable(),
   status: z.string(),
-  booked_by_call: callId.nullable(),
+  booked_by_call: shownCallId.nullable(),
 });
 export const appointmentsSchema = z.object({ appointments: z.array(appointmentSchema) });
 
@@ -206,7 +210,8 @@ export const metricsSchema = z.object({
 export const verificationSchema = z.object({
   ok: z.boolean(),
   checked: count,
-  breaks: z.array(z.object({ seq: count, kind: z.string() })),
+  // A break's position, when the check could tell it.
+  breaks: z.array(z.object({ seq: count.nullable(), kind: z.string() })),
   truncated: z.boolean(),
 });
 

@@ -51,8 +51,13 @@ export function EmptyState({
 }
 
 function explain(error: unknown): { title: string; body: string } {
-  const kind = error instanceof ApiError ? error.kind : "network";
-  switch (kind) {
+  if (!(error instanceof ApiError)) {
+    return {
+      title: "This page could not be shown",
+      body: "Something went wrong while showing it. Nothing was saved or changed.",
+    };
+  }
+  switch (error.kind) {
     case "invalid_answer":
       return {
         title: "This page could not be shown",

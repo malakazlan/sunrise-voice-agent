@@ -148,7 +148,6 @@ function SignedInBar() {
   const session = useSession();
   const signOut = useSignOut();
   const router = useRouter();
-  const [failed, setFailed] = useState(false);
   if (session.data === undefined) {
     return (
       <div className="flex flex-1 items-center justify-end gap-3">
@@ -173,11 +172,6 @@ function SignedInBar() {
         </span>
       </div>
       <div className="flex items-center gap-3 text-sm">
-        {failed ? (
-          <span role="alert" className="text-destructive">
-            Sign out failed. Try again.
-          </span>
-        ) : null}
         <span className="hidden items-center gap-1.5 text-muted-foreground md:inline-flex">
           <UserRound className="size-4" aria-hidden />
           Signed in as <span className="font-medium text-foreground">{user}</span>
@@ -187,10 +181,8 @@ function SignedInBar() {
           className="text-primary"
           disabled={signOut.isPending}
           onClick={() =>
-            signOut.mutate(undefined, {
-              onSuccess: () => router.replace("/login"),
-              onError: () => setFailed(true),
-            })
+            // The API ends the session whatever it answers: every outcome ends at sign-in.
+            signOut.mutate(undefined, { onSettled: () => router.replace("/login") })
           }
         >
           <LogOut aria-hidden />

@@ -143,6 +143,36 @@ describe("the fetch wrapper", () => {
     expect(error.kind).toBe("timeout");
   });
 
+  it("gives up on time even when the caller's own signal never aborts", async () => {
+    const { client } = setUp(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = vi.mocked(fetch).mock.calls[0][1]?.signal;
+          signal?.addEventListener("abort", () => reject(signal.reason));
+        }),
+    );
+    const neverAborts = new AbortController().signal;
+
+    const error = await failure(client.get("/calls", answer, undefined, { signal: neverAborts }));
+
+    expect(error.kind).toBe("timeout");
+  }, 2_000);
+
+  it("waits longer for a read given a longer timeout", async () => {
+    const { client } = setUp(
+      () =>
+        new Promise<Response>((resolve, reject) => {
+          const signal = vi.mocked(fetch).mock.calls[0][1]?.signal;
+          signal?.addEventListener("abort", () => reject(signal.reason));
+          setTimeout(() => resolve(json({ calls: [] })), 150);
+        }),
+    );
+
+    await expect(client.get("/calls", answer, undefined, { timeoutMs: 1_000 })).resolves.toEqual({
+      calls: [],
+    });
+  });
+
   it("refuses an answer that is not JSON", async () => {
     const { client } = setUp(
       async () => new Response("<html></html>", { headers: { "Content-Type": "text/html" } }),

@@ -1,12 +1,13 @@
 import { liveCallListSchema, type LiveCall } from "@/lib/api/schemas";
 
 // The one place the console opens a stream: the admin API's live calls stream, at most one per
-// tab. The API sends `calls` (the list, when it changed), `renew` (the stream's time is up: open
-// a new one), `paused` (a read failed; the API retries) and `signed_out` (the session ended).
-// A lost connection is closed here rather than left to the browser's own retry, and retried on
-// a growing delay, so that a refused stream is not hammered.
+// tab. The API sends `calls` (the list, when it changed, and always after a `paused`), `renew`
+// (the stream's time is up: open a new one), `paused` (a read failed; the API retries),
+// `replaced` (another tab of the same session opened a stream: this one stops for good) and
+// `signed_out` (the session ended). A lost connection is closed here rather than left to the
+// browser's own retry, and retried on a growing delay, so that a refused stream is not hammered.
 
-export type LiveStreamState = "connecting" | "live" | "paused" | "retrying" | "invalid";
+export type LiveStreamState = "connecting" | "live" | "paused" | "retrying" | "invalid" | "replaced";
 
 export interface LiveStreamHandlers {
   onCalls: (calls: LiveCall[]) => void;
@@ -60,6 +61,10 @@ export function openLiveStream(url: string, handlers: LiveStreamHandlers): () =>
     });
     opened.addEventListener("paused", () => {
       handlers.onState("paused");
+    });
+    opened.addEventListener("replaced", () => {
+      close();
+      handlers.onState("replaced");
     });
     opened.addEventListener("signed_out", () => {
       close();

@@ -66,8 +66,14 @@ build time and there is no `NEXT_PUBLIC_*` value. Telemetry is off (`NEXT_TELEME
 - **Masked values stay masked.** Masks are shown as the API wrote them (set in a grey chip),
   never filled in or reformatted.
 - **Bounded reads.** Nothing polls. Live calls come from the API's stream, one per tab, closed
-  while the tab is hidden and on leaving the page, and retried on a growing delay after a lost
-  connection. Every request has a timeout.
+  while the tab is hidden and on leaving the page, and retried after a lost connection on a
+  growing delay (2 s, 4 s, 8 s … at most 30 s). When another tab of the same session opens the
+  stream, this one stops and offers "Use here". Every request has a timeout: 10 s, and 120 s for
+  the audit chain check.
+- **The API's session rules.** A session is honoured only on a request that carries the
+  console's `Origin`, which every request from the console does (`mode: "cors"`). Nothing in the
+  console reads the session cookie or depends on its name. Sign-out always ends at the sign-in
+  page, whatever the API answers.
 - **Security headers on every response** (`proxy.ts`, Next.js's name for middleware): a
   Content-Security-Policy with a fresh nonce per request (`default-src 'self'`; scripts and
   styles by nonce; `connect-src` the console and the admin API only; `frame-ancestors 'none'`;
@@ -77,18 +83,22 @@ build time and there is no `NEXT_PUBLIC_*` value. Telemetry is off (`NEXT_TELEME
 - **Times** are the clinic's, in the time zone the API names, said once in the top bar.
 - **Light theme only.** Status is never shown by colour alone; every control is at least 44 px
   tall on touch screens; motion is off when the system asks for reduced motion.
+- **Current browsers only** (the last two versions of Chrome, Edge, Firefox and Safari). The
+  console uses `AbortSignal.any` and `AbortSignal.timeout`.
 
 ## Tests
 
-| Test                                   | What it holds                                                                                  |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `lib/api/client.test.ts`               | credentials, timeout, JSON only, the anti-forgery header, 401 to sign-in, the limiter's answer |
-| `tests/no-stray-fetch.test.ts`         | no file but the fetch wrapper calls `fetch`; none but the stream client uses `EventSource`     |
-| `tests/no-browser-storage.test.ts`     | no browser storage, cookie or console use in app code                                          |
-| `lib/api/schemas.test.ts`              | an answer of the wrong shape is refused and ends in the error state                            |
-| `tests/fixtures-not-shipped.test.ts`   | nothing of the fixture layer is in the build                                                   |
-| `tests/no-remote-origins.test.ts`      | the browser's files load nothing from another origin                                           |
-| `app/(shell)/metrics/metrics.test.tsx` | a figure the API left out reads "Not enough calls yet", never a number                         |
-| `lib/api/stream.test.ts`               | one stream per tab, renew, paused, signed out, closed on unmount                               |
+| Test                                   | What it holds                                                                                                             |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `lib/api/client.test.ts`               | credentials, timeout, JSON only, the anti-forgery header, 401 to sign-in, the limiter's answer                            |
+| `app/providers.test.tsx`               | a 401 anywhere sends the user to `/login`                                                                                 |
+| `tests/no-stray-fetch.test.ts`         | from each file's syntax tree: no file but the fetch wrapper names `fetch`; none but the stream client names `EventSource` |
+| `tests/no-browser-storage.test.ts`     | from each file's syntax tree: no browser storage, cookie, `console` or `dangerouslySetInnerHTML`, under any alias         |
+| `lib/api/schemas.test.ts`              | an answer of the wrong shape is refused and ends in the error state                                                       |
+| `tests/fixtures-not-shipped.test.ts`   | nothing of the fixture layer is in the build                                                                              |
+| `tests/no-remote-origins.test.ts`      | the browser's files load nothing from another origin                                                                      |
+| `app/(shell)/metrics/metrics.test.tsx` | a figure the API left out reads "Not enough calls yet", never a number                                                    |
+| `lib/api/stream.test.ts`               | one stream per tab, renew, paused, replaced, signed out, the retry delays, closed when hidden and on unmount              |
 
-The CI `docker` job builds the image and checks `/health`, the headers and the nonce.
+The CI `docker` job builds the image and checks `/health`, every header, and the whole
+Content-Security-Policy against the expected one with the nonce replaced by a placeholder.

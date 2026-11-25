@@ -1,5 +1,10 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiClient } from "@/lib/api/client";
+import { ApiProvider, useLiveCalls } from "@/lib/api/hooks";
 import { openLiveStream, type LiveStreamHandlers } from "@/lib/api/stream";
 
 const URL_ = "https://admin.clinic.test/admin/api/calls/live/stream";
@@ -120,6 +125,9 @@ describe("the live calls stream", () => {
     expect(seen.onState).toHaveBeenLastCalledWith("paused");
     expect(seen.onCalls).toHaveBeenCalledTimes(1);
     expect(open()).toHaveLength(1);
+
+    open()[0].emit("calls", JSON.stringify([CALL]));
+    expect(seen.onState).toHaveBeenLastCalledWith("live");
   });
 
   it("closes and sends the user to sign-in when the session ends", () => {
@@ -165,5 +173,144 @@ describe("the live calls stream", () => {
     expect(seen.onConnectionLost).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(2_000);
     expect(open()).toHaveLength(1);
+  });
+});
+
+describe("the live calls stream does not hammer the API", () => {
+  let close: (() => void) | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeEventSource.made = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+  });
+
+  afterEach(() => {
+    close?.();
+    close = undefined;
+    vi.useRealTimers();
+  });
+
+  it("waits 2 s before the first retry, then 4, 8 and 16, and never more than 30 s", () => {
+    close = openLiveStream(URL_, handlers());
+
+    for (const delay of [2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
+      const before = opened().length;
+      open()[0].emit("error");
+      vi.advanceTimersByTime(delay - 1);
+      expect(opened(), `nothing new before ${delay} ms`).toHaveLength(before);
+      vi.advanceTimersByTime(1);
+      expect(opened(), `a new stream at ${delay} ms`).toHaveLength(before + 1);
+    }
+  });
+
+  it("the wait starts again at 2 s once calls arrive", () => {
+    close = openLiveStream(URL_, handlers());
+    open()[0].emit("error");
+    vi.advanceTimersByTime(2_000);
+    open()[0].emit("error");
+    vi.advanceTimersByTime(4_000);
+
+    open()[0].emit("calls", JSON.stringify([CALL]));
+    open()[0].emit("error");
+    vi.advanceTimersByTime(2_000);
+
+    expect(open()).toHaveLength(1);
+  });
+
+  it("stops for good when another tab takes the stream over", () => {
+    const seen = handlers();
+    close = openLiveStream(URL_, seen);
+
+    open()[0].emit("replaced", "{}");
+    vi.advanceTimersByTime(60_000);
+
+    expect(seen.onState).toHaveBeenLastCalledWith("replaced");
+    expect(open()).toHaveLength(0);
+    expect(opened()).toHaveLength(1);
+  });
+});
+
+describe("the live calls page's stream", () => {
+  let visibility: DocumentVisibilityState = "visible";
+
+  const setVisibility = (state: DocumentVisibilityState) => {
+    visibility = state;
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  };
+
+  function renderLive() {
+    const client = new ApiClient({ origin: "https://admin.clinic.test", onUnauthorized: vi.fn() });
+    const queries = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        QueryClientProvider,
+        { client: queries },
+        createElement(ApiProvider, { client }, children),
+      );
+    const onSignedOut = vi.fn();
+    return renderHook(() => useLiveCalls(onSignedOut), { wrapper });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeEventSource.made = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+    visibility = "visible";
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("closes the stream while the tab is hidden and opens exactly one when it is shown", () => {
+    const { unmount } = renderLive();
+    expect(open()).toHaveLength(1);
+
+    setVisibility("hidden");
+    expect(open()).toHaveLength(0);
+
+    setVisibility("visible");
+    setVisibility("visible");
+    expect(open()).toHaveLength(1);
+    expect(opened()).toHaveLength(2);
+    unmount();
+  });
+
+  it("closes on unmount and does not come back", () => {
+    const { unmount } = renderLive();
+    act(() => open()[0].emit("error"));
+
+    unmount();
+    act(() => vi.advanceTimersByTime(60_000));
+
+    expect(open()).toHaveLength(0);
+    expect(opened()).toHaveLength(1);
+  });
+
+  it("closes an open stream on unmount", () => {
+    const { unmount } = renderLive();
+    expect(open()).toHaveLength(1);
+
+    unmount();
+
+    expect(open()).toHaveLength(0);
+  });
+
+  it("after a takeover stays closed when the tab is shown again, until Use here", () => {
+    const { result, unmount } = renderLive();
+
+    act(() => open()[0].emit("replaced", "{}"));
+    setVisibility("hidden");
+    setVisibility("visible");
+    expect(result.current.state).toBe("replaced");
+    expect(open()).toHaveLength(0);
+
+    act(() => result.current.useHere());
+    expect(open()).toHaveLength(1);
+    unmount();
   });
 });

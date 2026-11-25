@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setNonce } from "get-nonce";
 import { useRouter } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { ApiClient, ApiError } from "@/lib/api/client";
 import { ApiProvider } from "@/lib/api/hooks";
@@ -22,9 +22,11 @@ export function Providers({
   children: ReactNode;
 }) {
   const router = useRouter();
-  // The scroll lock of the menu sheet and the select adds a <style>; with this request's nonce the
-  // CSP lets it apply instead of blocking it.
-  useState(() => setNonce(nonce));
+  // The scroll lock of the menu sheet and the select's viewport add a <style>; with this request's
+  // nonce the CSP lets it apply. Set in the browser only, before either can open.
+  useEffect(() => {
+    setNonce(nonce);
+  }, [nonce]);
   const [queryClient] = useState(
     () =>
       new QueryClient({

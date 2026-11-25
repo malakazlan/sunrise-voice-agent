@@ -48,6 +48,27 @@ describe("the answers' schemas", () => {
     expect(verificationSchema.safeParse(fixtures.VERIFICATION).success).toBe(true);
   });
 
+  it("keep a page whose shown-only ids are odd, and a break whose position is not known", () => {
+    const odd = "legacy-call-7";
+    expect(queueSchema.safeParse({ requests: [{ ...fixtures.QUEUE[0], call_id: odd }] }).success).toBe(true);
+    expect(
+      appointmentsSchema.safeParse({ appointments: [{ ...fixtures.APPOINTMENTS[0], booked_by_call: odd }] })
+        .success,
+    ).toBe(true);
+    expect(
+      verificationSchema.safeParse({
+        ok: false,
+        checked: 10,
+        breaks: [{ seq: null, kind: "missing" }],
+        truncated: true,
+      }).success,
+    ).toBe(true);
+    // Still bounded: not an essay where an id should be.
+    expect(
+      queueSchema.safeParse({ requests: [{ ...fixtures.QUEUE[0], call_id: "x".repeat(65) }] }).success,
+    ).toBe(false);
+  });
+
   it("refuse an answer of the wrong shape", () => {
     const call = fixtures.CALLS[0];
     const refused: [string, { safeParse(value: unknown): { success: boolean } }, unknown][] = [
@@ -95,7 +116,7 @@ describe("the answers' schemas", () => {
         createElement(ApiProvider, { client }, children),
       );
 
-    const { result } = renderHook(() => useCalls(), { wrapper });
+    const { result } = renderHook(() => useCalls(undefined), { wrapper });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.data).toBeUndefined();

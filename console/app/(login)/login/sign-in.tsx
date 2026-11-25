@@ -16,7 +16,10 @@ function failureOf(error: unknown): { limited: boolean; text: string } {
     const wait = error.retryAfterSeconds;
     return {
       limited: true,
-      text: `Too many attempts. Wait ${wait === null || wait === 60 ? "one minute" : `${wait} seconds`}, then try again.`,
+      text:
+        wait === null
+          ? "Too many attempts. Try again in a minute."
+          : `Too many attempts. Try again in ${wait} ${wait === 1 ? "second" : "seconds"}.`,
     };
   }
   if (error instanceof ApiError && ["network", "timeout", "unavailable"].includes(error.kind)) {

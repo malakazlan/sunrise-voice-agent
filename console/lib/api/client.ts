@@ -44,12 +44,18 @@ interface ApiClientOptions {
   timeoutMs?: number;
 }
 
-interface Exchange {
+export interface ReadOptions {
+  // The caller's own cancellation (a query that is no longer wanted); the timeout applies as well.
+  signal?: AbortSignal;
+  // A longer wait than the default, for a read known to be slow (the audit chain check).
+  timeoutMs?: number;
+}
+
+interface Exchange extends ReadOptions {
   method: "GET" | "POST" | "DELETE";
   path: string;
   params?: QueryParams;
   body?: unknown;
-  signal?: AbortSignal;
   // The sign-in itself: no token exists yet, and a 401 means the credentials were wrong.
   signingIn?: boolean;
 }
@@ -93,8 +99,13 @@ export class ApiClient {
     return url.toString();
   }
 
-  async get<T>(path: string, schema: ZodType<T>, params?: QueryParams, signal?: AbortSignal): Promise<T> {
-    const response = await this.exchange({ method: "GET", path, params, signal });
+  async get<T>(
+    path: string,
+    schema: ZodType<T>,
+    params?: QueryParams,
+    { signal, timeoutMs }: ReadOptions = {},
+  ): Promise<T> {
+    const response = await this.exchange({ method: "GET", path, params, signal, timeoutMs });
     return this.parse(response, schema);
   }
 
@@ -122,6 +133,7 @@ export class ApiClient {
     params,
     body,
     signal,
+    timeoutMs = this.timeoutMs,
     signingIn = false,
   }: Exchange): Promise<Response> {
     const headers = new Headers({ Accept: "application/json" });
@@ -134,7 +146,7 @@ export class ApiClient {
       }
       headers.set("X-CSRF-Token", this.csrfToken);
     }
-    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const timeout = AbortSignal.timeout(timeoutMs);
     let response: Response;
     try {
       response = await fetch(this.url(path, params), {

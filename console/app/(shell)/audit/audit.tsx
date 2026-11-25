@@ -1,7 +1,6 @@
 "use client";
 
 import { Link2, ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
-import { useSearchParams } from "next/navigation";
 import { useId, useState, type FormEvent } from "react";
 
 import { CallLink } from "@/components/call-link";
@@ -53,14 +52,18 @@ function ChainPanel() {
     } else {
       tone = "broken";
       Icon = ShieldAlert;
-      title = `Chain broken at event ${result.breaks[0]?.seq ?? "?"}`;
+      const first = result.breaks.find((found) => found.seq !== null);
+      title = first ? `Chain broken at event ${first.seq}` : "Chain broken";
       lines = [
-        `${plural(result.checked, "event")} checked; ${plural(result.breaks.length, "break")} found:`,
-        ...result.breaks.map((found) => `Event ${found.seq}: ${found.kind.replaceAll("_", " ")}`),
+        `${plural(result.checked, "event")} checked; ${plural(result.breaks.length, "break")} listed:`,
+        ...result.breaks.map(
+          (found) =>
+            `${found.seq === null ? "An event whose position is not known" : `Event ${found.seq}`}: ${found.kind.replaceAll("_", " ")}`,
+        ),
       ];
     }
     if (result.truncated) {
-      lines.push("The check stopped at its limit; events after it were not checked.");
+      lines.push("More breaks were found than are listed here.");
     }
   }
 
@@ -84,8 +87,8 @@ function ChainPanel() {
       </span>
       <div className="min-w-0 flex-1">
         <h2 className="font-heading font-semibold">{title}</h2>
-        {lines.map((line) => (
-          <p key={line} className="text-sm text-muted-foreground">
+        {lines.map((line, index) => (
+          <p key={index} className="text-sm text-muted-foreground">
             {line}
           </p>
         ))}
@@ -109,10 +112,8 @@ function record(resourceType: string, resourceId: string | null) {
   );
 }
 
-export function AuditView() {
+export function AuditView({ fromLink }: { fromLink: string }) {
   const { time_zone: zone } = useClinic();
-  const params = useSearchParams();
-  const fromLink = params.get("call_id") ?? "";
   const [callIdText, setCallIdText] = useState(fromLink);
   const [actionChoice, setActionChoice] = useState(ALL_ACTIONS);
   const [filter, setFilter] = useState<AuditFilter>(isCallId(fromLink) ? { callId: fromLink } : {});

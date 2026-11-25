@@ -55,15 +55,28 @@ function StreamStatus({ live, zone }: { live: LiveCalls; zone: string }) {
     case "invalid":
       text = "A live update could not be read and was not shown";
       break;
+    case "replaced":
+      text =
+        since === null
+          ? "Live updates are open in another tab"
+          : `Live updates are open in another tab. Showing the list from ${since}`;
+      break;
   }
   return (
-    <p role="status" className="flex flex-wrap items-center gap-x-2 md:justify-end">
-      <span className="inline-flex items-center gap-2 font-medium whitespace-nowrap text-foreground">
-        <LivePulse active={live.state === "live"} />
-        {live.state === "live" ? "Live" : "Not live"}
-      </span>
-      <span>{text}</span>
-    </p>
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 md:justify-end">
+      <p role="status" className="flex flex-wrap items-center gap-x-2 md:justify-end">
+        <span className="inline-flex items-center gap-2 font-medium whitespace-nowrap text-foreground">
+          <LivePulse active={live.state === "live"} />
+          {live.state === "live" ? "Live" : "Not live"}
+        </span>
+        <span>{text}</span>
+      </p>
+      {live.state === "replaced" ? (
+        <Button variant="outline" onClick={live.useHere}>
+          Use here
+        </Button>
+      ) : null}
+    </div>
   );
 }
 

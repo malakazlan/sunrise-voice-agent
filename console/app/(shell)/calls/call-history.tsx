@@ -26,20 +26,15 @@ const FILTERS: { value: Filter; label: string }[] = [
 export function CallHistoryView() {
   const { time_zone: zone } = useClinic();
   const [filter, setFilter] = useState<Filter>("all");
-  const calls = useCalls();
-  const loaded = allRows(calls.data);
-  const rows = filter === "all" ? loaded : loaded.filter((call) => call.end_reason === filter);
-  const shown =
-    filter === "all"
-      ? `Showing ${plural(loaded.length, "call")}`
-      : `${plural(rows.length, "call")} ended as “${END_REASON_LABEL[filter]}” among the ${plural(loaded.length, "call")} loaded`;
+  const calls = useCalls(filter === "all" ? undefined : filter);
+  const rows = allRows(calls.data);
   const showOlder = (
     <ShowMore
       hasMore={calls.hasNextPage}
       loading={calls.isFetchingNextPage}
       onClick={() => void calls.fetchNextPage()}
       label="Show older calls"
-      shown={shown}
+      shown={`Showing ${plural(rows.length, "call")}`}
     />
   );
 
@@ -48,21 +43,13 @@ export function CallHistoryView() {
     body = <TableSkeleton label="Loading the calls" />;
   } else if (calls.isError) {
     body = <ErrorState error={calls.error} onRetry={() => void calls.refetch()} />;
-  } else if (loaded.length === 0) {
-    body = (
-      <EmptyState icon={History} title="No calls yet">
-        A call is listed here once it has ended.
-      </EmptyState>
-    );
   } else if (rows.length === 0) {
     body = (
-      <>
-        <EmptyState icon={History} title="No calls ended this way">
-          {`None of the ${plural(loaded.length, "call")} loaded ended as “${END_REASON_LABEL[filter as EndReason]}”.`}
-          {calls.hasNextPage ? " Show older calls to look further back." : ""}
-        </EmptyState>
-        {showOlder}
-      </>
+      <EmptyState icon={History} title={filter === "all" ? "No calls yet" : "No calls ended this way"}>
+        {filter === "all"
+          ? "A call is listed here once it has ended."
+          : `No call has ended as “${END_REASON_LABEL[filter]}”. Choose another filter to see the rest.`}
+      </EmptyState>
     );
   } else {
     body = (
@@ -151,7 +138,7 @@ export function CallHistoryView() {
         title="Call history"
         description="Every call that has ended, newest first. Open a call to read its masked transcript and see what the agent did."
       />
-      <Section title="Ended calls" description="Filter the calls loaded by how they ended.">
+      <Section title="Ended calls" description="Filter by how the call ended.">
         <div className="border-b px-5 py-4">
           <FilterPills label="How the call ended" value={filter} options={FILTERS} onChange={setFilter} />
         </div>

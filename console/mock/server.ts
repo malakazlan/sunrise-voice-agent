@@ -4,8 +4,11 @@
 // a session, and the live calls stream. It is never part of the console's build.
 //
 // MOCK_SCENARIO picks what it answers: "normal" (default), "empty" (nothing recorded yet),
-// "error" (every read fails), "invalid" (answers of the wrong shape), "paused" (the stream pauses).
-// MOCK_SIGNED_IN=1 treats every request as signed in, for screenshots.
+// "error" (every read fails), "invalid" (answers of the wrong shape), "paused" (the stream pauses
+// once, two seconds in, and the next list clears it). MOCK_SIGNED_IN=1 treats every request from
+// the console's origin as signed in, for screenshots. As the API does, a session is honoured only
+// on a request that carries the console's Origin, and the cookie's name is the mock's own: the
+// console never reads it.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
@@ -17,7 +20,7 @@ const SCENARIO = process.env.MOCK_SCENARIO ?? "normal";
 const ALWAYS_SIGNED_IN = process.env.MOCK_SIGNED_IN === "1";
 const USER = "admin";
 const PASSWORD = "mock-password";
-const COOKIE = "admin_session";
+const COOKIE = "mock_session";
 const SESSION = "mock-session-id";
 const PREFIX = "/admin/api";
 
@@ -27,6 +30,7 @@ function cors(request: IncomingMessage, response: ServerResponse) {
   if (request.headers.origin === CONSOLE_ORIGIN) {
     response.setHeader("Access-Control-Allow-Origin", CONSOLE_ORIGIN);
     response.setHeader("Access-Control-Allow-Credentials", "true");
+    response.setHeader("Access-Control-Expose-Headers", "Retry-After");
     response.setHeader("Vary", "Origin");
   }
 }
@@ -46,6 +50,9 @@ function send(
 }
 
 function signedIn(request: IncomingMessage): boolean {
+  if (request.headers.origin !== CONSOLE_ORIGIN) {
+    return false;
+  }
   return ALWAYS_SIGNED_IN || (request.headers.cookie ?? "").split(/;\s*/).includes(`${COOKIE}=${SESSION}`);
 }
 
@@ -131,15 +138,31 @@ function read(path: string, url: URL): unknown {
   return null;
 }
 
+// The one session's open stream: a newer one replaces it, as the API does.
+let openStream: ServerResponse | null = null;
+
 function stream(request: IncomingMessage, response: ServerResponse) {
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-store",
     "X-Accel-Buffering": "no",
   });
+  if (openStream !== null) {
+    openStream.write("event: replaced\ndata: {}\n\n");
+    openStream.end();
+  }
+  openStream = response;
   // Nothing sent yet: the first list always goes, even an empty one.
   let last: string | null = null;
+  let ticks = 0;
   const tick = () => {
+    ticks += 1;
+    if (SCENARIO === "paused" && ticks === 2) {
+      response.write("event: paused\ndata: {}\n\n");
+      // After a pause the next list always goes.
+      last = null;
+      return;
+    }
     const calls = SCENARIO === "empty" ? [] : fixtures.liveCalls(new Date());
     // The fixtures' calls only change by their start times, which move with the clock: a change is
     // a call that came or went.
@@ -147,9 +170,6 @@ function stream(request: IncomingMessage, response: ServerResponse) {
     if (listed !== last) {
       response.write(`event: calls\ndata: ${JSON.stringify(calls)}\n\n`);
       last = listed;
-      if (SCENARIO === "paused") {
-        response.write("event: paused\ndata: {}\n\n");
-      }
     }
   };
   tick();
@@ -159,10 +179,13 @@ function stream(request: IncomingMessage, response: ServerResponse) {
     response.write("event: renew\ndata: {}\n\n");
     response.end();
   }, 300_000);
-  request.on("close", () => {
+  response.on("close", () => {
     clearInterval(ticker);
     clearInterval(comment);
     clearTimeout(renew);
+    if (openStream === response) {
+      openStream = null;
+    }
   });
 }
 
@@ -212,19 +235,16 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (!signedIn(request)) {
-    send(response, 401, { detail: "Sign-in required" });
-    return;
-  }
-
+  // Sign-out always answers 204 and ends whatever session there was.
   if (path === "/session" && request.method === "DELETE") {
-    if (request.headers["x-csrf-token"] !== "csrf-fixture" || request.headers.origin !== CONSOLE_ORIGIN) {
-      send(response, 403, { detail: "Forbidden" });
-      return;
-    }
     send(response, 204, undefined, {
       "Set-Cookie": `${COOKIE}=; HttpOnly; SameSite=Strict; Path=${PREFIX}; Max-Age=0`,
     });
+    return;
+  }
+
+  if (!signedIn(request)) {
+    send(response, 401, { detail: "Sign-in required" });
     return;
   }
 
