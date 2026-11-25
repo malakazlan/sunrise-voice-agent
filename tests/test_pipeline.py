@@ -31,7 +31,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
-from speech_fakes import CallPipeline, FakeTime, FakeVoice, until
+from speech_fakes import CallPipeline, FakeTime, FakeVoice, settle, until
 from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
@@ -244,9 +244,9 @@ async def test_turns_wait_for_the_finalized_transcript(offline_deps: Deps) -> No
     async with CallPipeline(processor, playback, FakeVoice()) as call:
         processor.connected()
         await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("first part"), transcript("still first", finalized=True))
+        await until(lambda: len(turns(call)) == 1, "the first turn")
         await call.send(
-            transcript("first part"),
-            transcript("still first", finalized=True),
             # Deepgram had already sent the text when it confirmed the finalize.
             transcript("second"),
             TranscriptionFinalizedFrame(),
@@ -310,6 +310,42 @@ async def test_a_withheld_reply_reaches_the_page_by_its_rule() -> None:
     assert (turn["lines"], turn["withheld"]) == ([ADVICE_REFUSAL], "medical_advice")
     page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert "A reply was withheld: ${message.withheld}" in page
+
+
+class Slow(Withheld):
+    """Turns that take as long as the test says, and what each was given."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.given: list[str] = []
+        self.go = asyncio.Event()
+
+    async def handle(self, transcript: str, speak: Speak | None = None) -> TurnResult:
+        self.given.append(transcript)
+        await self.go.wait()
+        return await super().handle(transcript, speak)
+
+
+@pytest.mark.anyio
+async def test_utterances_waiting_together_become_one_turn() -> None:
+    agent = Slow()
+    processor, playback = adapter(agent, Clock())
+
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        await call.send(transcript("My number is", finalized=True))
+        await until(lambda: agent.given == ["My number is"], "the first turn")
+        # While that turn runs the caller goes on, in two pieces: one turn for both, not two
+        # replies one after the other.
+        await call.send(transcript("five five five two zero one", finalized=True))
+        await call.send(transcript("three three four four.", finalized=True))
+        agent.go.set()
+        await until(lambda: len(turns(call)) == 2, "the second turn")
+        await settle()
+
+    assert agent.given == ["My number is", "five five five two zero one three three four four."]
+    assert [turn["turn"] for turn in turns(call)] == [1, 2]
 
 
 class Broken(Withheld):

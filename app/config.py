@@ -339,7 +339,7 @@ class Settings(DatabaseSettings):
     )
     tts_model: str = Field(default="eleven_flash_v2_5", pattern=LOW_LATENCY_TTS_MODEL)
     # The silence that ends a caller's turn (app/voice/pipeline.py).
-    vad_stop_seconds: float = Field(default=0.5, ge=0.2, le=2.0)
+    vad_stop_seconds: float = Field(default=0.8, ge=0.2, le=2.0)
     # Silence from the caller before the agent asks whether they are still there, and again
     # before it says goodbye.
     idle_seconds: int = Field(default=30, ge=5, le=300)

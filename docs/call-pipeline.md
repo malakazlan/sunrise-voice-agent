@@ -40,8 +40,11 @@ over the data channel.
   opted out of Deepgram's model improvement programme. Smart formatting writes "three three
   four four" as `3344` and a date as `March 14, 1985`; a spelled name stays letters (`J O H N
   S O N`); the input guard reads digits and number words either way. The caller is taken to
-  have stopped after `VAD_STOP_SECONDS` of silence (0.5 by default); Deepgram is then asked to
-  finalize, and only a finalized transcript makes a turn.
+  have stopped after `VAD_STOP_SECONDS` of silence (0.8 by default); Deepgram is then asked to
+  finalize, and only a finalized transcript makes a turn. Utterances that are waiting together
+  when a turn can start (the caller went on, in pieces, while the turn before ran) are one
+  turn, their words joined. The wait is a trade: shorter answers sooner but takes a pause
+  inside a phone number for the end of the turn.
 - Vocabulary hints (`app/voice/vocabulary.py`): Nova-3's keyterm prompting, one `keyterm`
   query parameter per term, so that "Lisinopril" is heard as the drug. The list is built once
   at start-up: the distinct medication names of the `medications` table cut to their drug word
@@ -139,10 +142,13 @@ through the functions of "Messages, transfer, emergency and the end of the call"
   until its opening line has played, and while one of those lines is to be played, the caller
   is muted: their audio goes on as silence to voice activity detection and speech-to-text, and
   whatever is reported anyway is neither an interruption nor a turn. Every other line can be
-  interrupted: when the caller starts speaking over it, speech out stops, the lines not yet
-  played are dropped, and the conversation keeps only the words ElevenLabs reported played of
-  the line that was cut (counted from its word timestamps), none of the others. The page notes
-  the interruption.
+  interrupted: when the caller speaks over it, speech out stops, the lines not yet played are
+  dropped, and the conversation keeps only the words ElevenLabs reported played of the line
+  that was cut (counted from its word timestamps), none of the others. The page notes the
+  interruption. Speaking is words, not sound: the line stops once speech-to-text has heard two
+  words of an utterance still going on, or any word of a finished piece of one. A noise in the
+  room, which voice activity detection reports and speech-to-text hears no words in, stops
+  nothing.
 - The caller cannot be heard during the greeting, the closed line or the 911 line: anything
   they say then, an emergency included, is not acted on.
 - An emergency is heard whatever the call is doing: every finished utterance goes through the
@@ -228,5 +234,6 @@ Limits:
 - If speech out takes more than 3 seconds to its first audio, Pipecat gives the line up as
   silent, so the caller can be unmuted before an uninterruptible line (the greeting, the closed
   line, the 911 line) has finished playing.
-- On a real call the agent's own voice coming back through loudspeakers can be taken for the
-  caller speaking and interrupt it: use headphones.
+- On a real call the agent's own voice coming back through loudspeakers can be heard as the
+  caller's words and interrupt it. The call page asks the browser for echo cancellation, noise
+  suppression and automatic gain; headphones remove the cause.

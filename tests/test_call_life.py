@@ -17,7 +17,16 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
 )
-from speech_fakes import CallPipeline, FakeTime, FakeVoice, agent_call, caller_says, settle, until
+from speech_fakes import (
+    CallPipeline,
+    FakeTime,
+    FakeVoice,
+    agent_call,
+    caller_says,
+    caller_talks_over,
+    settle,
+    until,
+)
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from test_turn import (
@@ -501,7 +510,7 @@ async def test_an_emergency_while_the_call_closes(
         # Three words in, the caller speaks over it: the line stops, and what they say is an
         # emergency. The call had decided to end; the emergency is heard all the same.
         await voice.start(3)
-        await call.send(VADUserStartedSpeakingFrame())
+        await call.send(*caller_talks_over())
         await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
         await call.send(*caller_says(CHEST_PAIN)[1:])
         await ends_with_the_emergency(call, voice, owner_engine, call_id)

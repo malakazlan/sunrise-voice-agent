@@ -165,7 +165,7 @@ flowchart LR
 
 One caller turn, and where each guard sits:
 
-1. Silero voice activity detection hears the caller stop (`VAD_STOP_SECONDS`, 0.5 s by default);
+1. Silero voice activity detection hears the caller stop (`VAD_STOP_SECONDS`, 0.8 s by default);
    Deepgram is asked to finalize, and only a final transcript makes a turn
    (`app/voice/pipeline.py`).
 2. **Input guard** (`app/guard/input.py`), pure code, before the model: an emergency phrase
@@ -184,7 +184,8 @@ One caller turn, and where each guard sits:
    spoken: SSN digits, patient data outside the gate, medical advice, a promised refill.
    Scripted lines are code's and are said word for word.
 6. Released lines go to ElevenLabs. The caller can talk over any line but the greeting, the
-   closed line and the 911 line. An emergency is heard even while a turn runs or the call is
+   closed line and the 911 line: a line stops once speech-to-text has heard words, so a
+   noise in the room stops nothing. An emergency is heard even while a turn runs or the call is
    closing.
 7. Off the audio path: the turn's timings go to an in-memory queue; the audit events of the
    call's start, end and emergencies are written by background tasks; after the call the masked
@@ -496,7 +497,7 @@ start, an empty value counts as unset, and an unknown key in `.env` is refused. 
 | `ELEVENLABS_API_KEY` | speech out's API key, never logged | required unless dev |
 | `ELEVENLABS_VOICE_ID` | the ElevenLabs voice: 1 to 64 letters and digits | required unless dev; no default |
 | `TTS_MODEL` | `eleven_flash_v2_5` or `eleven_flash_v2` | `eleven_flash_v2_5` |
-| `VAD_STOP_SECONDS` | 0.2 to 2: the silence that ends the caller's turn | `0.5` |
+| `VAD_STOP_SECONDS` | 0.2 to 2: the silence that ends the caller's turn | `0.8` |
 | `IDLE_SECONDS` | 5 to 300: silence before "Are you still there?", and again before goodbye | `30` |
 
 What each Compose service receives, and nothing more. CI compares the running containers and

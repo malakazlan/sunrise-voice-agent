@@ -96,6 +96,8 @@ def test_page_is_self_contained_and_writes_text_only() -> None:
     # drawing in the page itself.
     assert re.findall(r"https?:|//[a-z]", page) == []
     assert re.findall(r"""(?:src|href)\s*=\s*["'](?!/fonts/|#[a-z])""", markup) == []
+    # The microphone is asked for with the browser's echo cancellation and noise suppression.
+    assert "echoCancellation: true, noiseSuppression: true, autoGainControl: true" in page
     # What the server sends is written as text, never as markup.
     for writer in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
         assert writer not in page

@@ -17,8 +17,16 @@ from typing import Any
 
 import pytest
 from conftest import OFFLINE_DB_ENV, REPO_ROOT, offline_settings
-from pipecat.frames.frames import InterruptionFrame, VADUserStartedSpeakingFrame
-from speech_fakes import CallPipeline, FakeTime, FakeVoice, agent_call, caller_says, until
+from pipecat.frames.frames import InterruptionFrame
+from speech_fakes import (
+    CallPipeline,
+    FakeTime,
+    FakeVoice,
+    agent_call,
+    caller_says,
+    caller_talks_over,
+    until,
+)
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from test_admin_api import admin_settings
@@ -742,7 +750,7 @@ async def test_an_interrupted_reply_is_recorded_as_heard(
         await until(lambda: voice.waiting == 1, "the reply")
         # Four words in, the caller speaks.
         await voice.start(4)
-        await call.send(VADUserStartedSpeakingFrame())
+        await call.send(*caller_talks_over())
         await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
         await call.send(*caller_says("Actually, I have a question.")[1:])
         await until(lambda: voice.waiting == 1, "the next reply")
