@@ -42,6 +42,7 @@ Identifiers
       registered tool is never recorded.
     - the admin's browser `session`: none. Its events (the admin signing in and out) name no
       record, and never the session's id.
+    - the id of a `config` change: its key, `calls` or `office` (app/db/models.py).
     - `actor`: `agent`, or `admin:` and a user name of 1 to 32 letters and underscores,
       starting with a letter (ADMIN_NAME, which ADMIN_USER is held to as well).
 
@@ -78,7 +79,7 @@ from sqlalchemy import BigInteger, and_, case, cast, extract, func, insert, sele
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ADMIN_NAME
-from app.db.models import AuditEvent
+from app.db.models import CONFIG_VALUES, AuditEvent
 from app.db.session import in_database_transaction
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,13 @@ class Action(StrEnum):
     ADMIN_READ_SLOTS = "admin_read_slots"
     ADMIN_READ_GUARDRAILS = "admin_read_guardrails"
     ADMIN_READ_METRICS = "admin_read_metrics"
+    # The admin API's writes (app/api/writes.py): a request marked handled, a callback's
+    # details shown, the config read and changed. And a call refused while calls are off.
+    ADMIN_MARKED_HANDLED = "admin_marked_handled"
+    ADMIN_REVEALED_CALLBACK = "admin_revealed_callback"
+    ADMIN_READ_CONFIG = "admin_read_config"
+    ADMIN_CHANGED_CONFIG = "admin_changed_config"
+    CALL_REFUSED = "call_refused"
     REFILL_PREVIEWED = "refill_previewed"
     REFILL_NOT_FOUND = "refill_not_found"
     DOCTOR_MESSAGE_PREVIEWED = "doctor_message_previewed"
@@ -170,10 +178,13 @@ class ResourceType(StrEnum):
     MESSAGE = "message"
     AUDIT_EVENT = "audit_event"
     SESSION = "session"
+    CONFIG = "config"
 
 
 # A session event names no record: no id has this shape.
 NO_ID = re.compile(r"(?!)")
+# A config change names its key.
+CONFIG_KEY = re.compile("|".join(CONFIG_VALUES))
 
 # The shape of each resource type's ids.
 ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
@@ -187,6 +198,7 @@ ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
     ResourceType.MESSAGE: ROW_ID,
     ResourceType.AUDIT_EVENT: ROW_ID,
     ResourceType.SESSION: NO_ID,
+    ResourceType.CONFIG: CONFIG_KEY,
 }
 
 
@@ -194,6 +206,9 @@ class Outcome(StrEnum):
     SUCCESS = "success"
     FAILURE = "failure"
     REFUSED = "refused"
+    # An admin's write that found it done: the row already marked, the key already set.
+    ALREADY = "already"
+    UNCHANGED = "unchanged"
 
 
 class Reason(StrEnum):
@@ -219,6 +234,15 @@ class Reason(StrEnum):
     PHI_OUTSIDE_GATE = "phi_outside_gate"
     MEDICAL_ADVICE = "medical_advice"
     REFILL_PROMISE = "refill_promise"
+    # A config change, `<key>_<value>` (CONFIG_VALUES in app/db/models.py); `calls_off` is also
+    # why a call is refused while calls are off.
+    CALLS_ON = "calls_on"
+    CALLS_OFF = "calls_off"
+    OFFICE_SCHEDULE = "office_schedule"
+    OFFICE_OPEN = "office_open"
+    OFFICE_CLOSED = "office_closed"
+    # Why a call is refused before the voice service has read its config.
+    CONFIG_UNKNOWN = "config_unknown"
 
 
 def _check_member(name: str, value: object, registry: type[StrEnum]) -> None:

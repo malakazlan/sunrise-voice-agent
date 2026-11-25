@@ -202,6 +202,8 @@ def basic(user: str | bytes, password: str | bytes) -> dict[str, str]:
 
 
 SIGNED_IN = basic(ADMIN_USER, PASSWORD)
+# The API's own origin, as the test client reaches it.
+OWN_ORIGIN = "http://testserver"
 
 
 def admin_settings(database: StartupSettings, **overrides: Any) -> Settings:
@@ -426,11 +428,72 @@ def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings)
             )
             for route in ROUTES
         }
+        # The session's routes and the writes, from a signed-in browser.
+        signed = client.post(
+            "/admin/api/session",
+            json={"user": ADMIN_USER, "password": PASSWORD},
+            headers={"Origin": OWN_ORIGIN},
+        )
+        write = {"X-CSRF-Token": signed.json()["csrf_token"], "Origin": OWN_ORIGIN}
+        written = {
+            "POST /session": signed,
+            "GET /session": client.get("/admin/api/session"),
+            "GET /config": client.get("/admin/api/config", headers=SIGNED_IN),
+            "POST /config": client.post(
+                "/admin/api/config",
+                json={"key": "office", "value": "open", "confirm": True},
+                headers=write,
+            ),
+            "POST /queue/{source}/{row_id}/handled": client.post(
+                "/admin/api/queue/requests/2/handled", json={}, headers=write
+            ),
+            "GET /queue?state=all": client.get("/admin/api/queue?state=all", headers=SIGNED_IN),
+        }
+        # The one route that shows a value unmasked: a callback's name and number, asked for
+        # one row at a time.
+        shown = client.post("/admin/api/queue/requests/2/callback", json={}, headers=write)
+        written["DELETE /session"] = client.delete("/admin/api/session", headers=write)
 
-    for route, response in bodies.items():
-        assert response.status_code == 200, route
+    for route, response in [*bodies.items(), *written.items()]:
+        assert response.status_code in (200, 201, 204), route
         for value in raw:
             assert value not in response.text, (route, value)
+    assert shown.status_code == 200
+    assert shown.json() == {
+        "source": "requests",
+        "id": 2,
+        "callbacks": [{"name": CALLER_NAME, "callback_number": "555-201-3344"}],
+    }
+
+    # Every route of the admin API is one of these, so each is checked here: the reads above
+    # (the live stream sends the rows of /calls/live, its first included), the session's
+    # routes and the writes; the callback's details are the one exception. A new route fails
+    # this until it is added and checked.
+    routes = {
+        (decorator.func.attr.upper(), decorator.args[0].value)
+        for node in ast.walk(ast.parse(ADMIN_MODULE.read_text(encoding="utf-8")))
+        if isinstance(node, ast.AsyncFunctionDef)
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id in ("app", "reads")
+        and isinstance(decorator.args[0], ast.Constant)
+    }
+    checked = {
+        ("GET", route.removeprefix("/admin/api").replace(cid(1), "{call_id}")) for route in ROUTES
+    } | {(name.split()[0], name.split()[1].split("?")[0]) for name in written}
+    assert routes == checked | {
+        ("GET", "/calls/live/stream"),
+        ("POST", "/queue/{source}/{row_id}/callback"),
+    }
+    # The details are read by one function, called by that one route only.
+    unmasked = [
+        node
+        for node in ast.walk(ast.parse(ADMIN_MODULE.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Attribute) and node.attr == "callback_details"
+    ]
+    assert len(unmasked) == 1
 
     # The caller's name is hidden wherever it stands, the message's own field included.
     refill = {
@@ -469,8 +532,8 @@ def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings)
     # each with the masked numbers its message left, never the caller's name.
     assert bodies[QUEUE_ROUTE].json() == {
         "requests": [
-            {**left, "callbacks": ["***-***-3344"], "after_hours": False},
-            {**refill, "callbacks": [], "after_hours": False},
+            {**left, "callbacks": ["***-***-3344"], "after_hours": False, "handled": None},
+            {**refill, "callbacks": [], "after_hours": False, "handled": None},
         ]
     }
     call = {

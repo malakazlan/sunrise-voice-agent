@@ -31,6 +31,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
 from speech_fakes import CallPipeline, FakeTime, FakeVoice, until
+from test_offer import taking_calls
 from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
@@ -540,7 +541,7 @@ def active_calls(fastapi_app: FastAPI) -> int:
 def test_connection_closed_when_answer_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     # The peer connection exists, then answering the offer fails on a malformed SDP.
     opened = record_connections(monkeypatch)
-    fastapi_app = create_app(offline_settings(**DEV_WITHOUT_VOICE))
+    fastapi_app = create_app(offline_settings(**DEV_WITHOUT_VOICE), config=taking_calls())
 
     with TestClient(fastapi_app) as client:
         response = client.post("/offer", json={"sdp": "v=0 not-an-sdp", "type": "offer"})
@@ -561,7 +562,7 @@ def test_connection_closed_when_call_setup_fails(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(app.voice.pipeline, "AgentCall", broken_call)
     offer = asyncio.run(offer_without_candidates())
-    fastapi_app = create_app(offline_settings(**DEV_WITHOUT_VOICE))
+    fastapi_app = create_app(offline_settings(**DEV_WITHOUT_VOICE), config=taking_calls())
 
     with TestClient(fastapi_app) as client:
         response = client.post("/offer", json={"sdp": offer, "type": "offer"})
@@ -584,7 +585,9 @@ def test_no_call_without_both_vendor_keys(
     caplog.set_level(logging.INFO)
     opened = record_connections(monkeypatch)
     offer = asyncio.run(offer_without_candidates())
-    fastapi_app = create_app(offline_settings(**DEV_WITHOUT_VOICE, **{missing: None}))
+    fastapi_app = create_app(
+        offline_settings(**DEV_WITHOUT_VOICE, **{missing: None}), config=taking_calls()
+    )
 
     with TestClient(fastapi_app) as client:
         response = client.post("/offer", json={"sdp": offer, "type": "offer"})

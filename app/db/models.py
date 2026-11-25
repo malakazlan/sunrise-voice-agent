@@ -15,16 +15,20 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    and_,
     event,
     false,
     func,
     literal_column,
+    or_,
     text,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.config import ADMIN_NAME
 from app.domain.clinic import DOCTORS
+from app.domain.office_hours import OFFICE_OVERRIDES, SCHEDULE
 
 # Every constraint gets a predictable name, so the migration and the models can be compared
 # constraint by constraint and errors name the rule that was broken.
@@ -281,6 +285,74 @@ class CallTurn(Base):
     total_ms: Mapped[int]
     record_us: Mapped[int]
     dropped_before: Mapped[int]
+
+
+def _admin_name(column: str) -> CheckConstraint:
+    """The admin's user name, as the settings hold it to (ADMIN_NAME in app/config.py)."""
+    return CheckConstraint(f"{column} ~ '^{ADMIN_NAME.pattern}$'", name=column)
+
+
+# The tables the requests' queue (app/api/reads.py) is made of: its rows are requests.
+QUEUE_REQUESTS = "requests"
+QUEUE_SOURCES = (QUEUE_REQUESTS,)
+
+
+class HandledMark(Base):
+    """A row of the requests' queue that the staff marked handled: which, by whom and when. A
+    row is marked once; a mark is never changed or removed."""
+
+    __tablename__ = "handled_marks"
+    __table_args__ = (
+        UniqueConstraint("source", "row_id"),
+        CheckConstraint(literal_column("source").in_(QUEUE_SOURCES), name="source"),
+        CheckConstraint("row_id >= 1", name="row_id"),
+        _admin_name("marked_by"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str]
+    row_id: Mapped[int]
+    marked_by: Mapped[str]
+    marked_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+# What staff may change while the service runs, each key with its values and its default:
+# whether new calls are taken (`off` is the kill switch), and whether the office follows its
+# hours or is forced open or closed for the calls that start after the change.
+CALLS = "calls"
+OFFICE = "office"
+CALLS_ON = "on"
+CALLS_OFF = "off"
+CONFIG_VALUES: dict[str, tuple[str, ...]] = {
+    CALLS: (CALLS_ON, CALLS_OFF),
+    OFFICE: OFFICE_OVERRIDES,
+}
+CONFIG_DEFAULTS = {CALLS: CALLS_ON, OFFICE: SCHEDULE}
+
+
+class ConfigChange(Base):
+    """One change of a key's value, by whom and when. A key's value is its newest row's (the
+    highest id); a key with no row has its default. Rows are added, never changed or removed."""
+
+    __tablename__ = "config_changes"
+    __table_args__ = (
+        CheckConstraint(
+            or_(
+                *(
+                    and_(literal_column("key") == key, literal_column("value").in_(values))
+                    for key, values in CONFIG_VALUES.items()
+                )
+            ),
+            name="setting",
+        ),
+        _admin_name("changed_by"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str]
+    value: Mapped[str]
+    changed_by: Mapped[str]
+    changed_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 # Every text column of an audit event except the MACs: identifiers and registry codes only.

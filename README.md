@@ -967,9 +967,9 @@ calls, and runs in a process of its own (`app/api/security.py`, `sessions.py`, `
 | Route | Does | Audit action |
 |---|---|---|
 | `POST /admin/api/session` | body `{"user", "password"}` (JSON, at most 1 KiB): signs in and answers as `GET` does, with the session cookie | `admin_signed_in` |
-| `GET /admin/api/session` | `{"user", "csrf_token", "expires_in", "office_open", "time_zone"}`: who is signed in, the session's anti-forgery token, the seconds left if it is not used, and the office open or closed by the agent's clock (simulated when set) with the clinic's zone; `401` when not signed in | none (reads no patient data) |
+| `GET /admin/api/session` | `{"user", "csrf_token", "expires_in", "office_open", "time_zone"}`: who is signed in, the session's anti-forgery token, the seconds left if it is not used, and whether the office is open for a call starting now: the agent's clock (simulated when set), or the office override set on the config page, read from the table when asked (if that read fails, the clock's answer), with the clinic's zone; `401` when not signed in | none (reads no patient data) |
 | `DELETE /admin/api/session` | ends the session and clears the cookie; `204`, always: if `admin_signed_out` cannot be written the session ends all the same, and the log says `admin_sign_out_unaudited` | `admin_signed_out` |
-| `GET /admin/api/queue?type=&before=` | `{"requests": [...]}`: the Requests page's rows, newest received first (the higher id first at the same instant), 50 a page; each with id, created_at, call_id, type, summary (masked, names hidden), patient_id, `callbacks` (the masked numbers of the messages it was left with) and `after_hours`; never the caller's name. `before=<id>` is the last request of the page before | `admin_read_queue` |
+| `GET /admin/api/queue?type=&before=&state=` | `{"requests": [...]}`: the Requests page's rows, newest received first (the higher id first at the same instant), 50 a page; each with id, created_at, call_id, type, summary (masked, names hidden), patient_id, `callbacks` (the masked numbers of the messages it was left with), `after_hours` and `handled` (`{"by", "at"}` or `null`); never the caller's name. `state` is `todo` (the default: not handled), `handled` or `all`. `before=<id>` is the last request of the page before | `admin_read_queue` |
 | `GET /admin/api/calls/{call_id}/detail` | `{"call": {...}, "events": [...]}`: the call as `/admin/api/calls/{call_id}` shows it, and its audit events oldest first (the latest 100) | `admin_read_call_detail` |
 | `GET /admin/api/calls/live/stream` | `text/event-stream` of the live calls, session only | `admin_read_live_calls`, once per stream |
 
@@ -1066,6 +1066,45 @@ caller shares the proxy's address and one limit. Set `CONSOLE_ORIGIN` there too.
 - Limits:
   - Sessions and stream places are per process and in memory: one `admin-api` process, no
     sharing between replicas.
+
+### Admin writes: handled, callback details, config and the kill switch
+
+Three writes (`app/api/writes.py`). Each needs a browser session (never Basic), its
+`X-CSRF-Token` and the `Origin` rule above; a JSON body (`Content-Type: application/json`, else
+`415`) of at most 1 KiB (else `413`) with no field it does not know (else
+`422 {"detail": "Invalid request"}`, which echoes nothing). Each writes its audit event in the
+transaction of the change: no event, no change, and the answer is `503`.
+
+| Route | Does | Audit action |
+|---|---|---|
+| `POST /admin/api/queue/{source}/{id}/handled` | body `{}`. `201 {"source", "id", "handled": {"by", "at"}}`; again, `200` with the same mark, nothing written. `{source}` is `requests`, the table the queue's rows come from; any other, or a row that is not there, `404` with no event | `admin_marked_handled`, outcome `success` or `already` |
+| `POST /admin/api/queue/{source}/{id}/callback` | body `{}`. `200 {"source", "id", "callbacks": [{"name", "callback_number"}]}`: the caller's name and full number of each message the request was left with that has a number to call back, oldest first. The one route that answers with values unmasked: a `POST`, so they are never in a URL or a cache, and they are in no log line, audit row or error. A row without a number, `404` with no event | `admin_revealed_callback` (record: the request) |
+| `GET /admin/api/config` | `{"config": {"calls": {"value", "changed_by", "changed_at"}, "office": {...}}, "applies_within_seconds": 5, "facts": {"environment", "model", "speech_to_text", "text_to_speech", "max_concurrent_calls", "max_call_seconds", "test_clock"}}`; Basic or a session. Nothing secret, no key | `admin_read_config` |
+| `POST /admin/api/config` | body `{"key", "value", "confirm": true}`. `201 {"key", "value", "changed_by", "changed_at", "applies_within_seconds": 5}`; the value it already has, `200` with the current setting, nothing written | `admin_changed_config`, outcome `success` or `unchanged`, reason `calls_on`, `calls_off`, `office_schedule`, `office_open` or `office_closed` |
+
+The config's keys and values are a closed set, checked in code and by the table
+(`config_changes`): `calls` is `on` (default) or `off`; `office` is `schedule` (default: its
+hours decide), `open` or `closed`. A key's value is its newest row. Marks (`handled_marks`) and
+changes are only ever added: the runtime role may insert and read them, never update or delete.
+There is no unmarking in this version.
+
+The voice service reads the config at start-up and then every 5 seconds, in one background task
+(each read given up after 1 second), and holds it in memory; call handling reads only that
+memory, so a call never waits on the config and a failed read never stops one. A failed read
+keeps the last good values and is logged once per outage (`runtime_config_read_failed`). A
+change therefore reaches calls up to 5 seconds after it is written, in every role. The admin
+process runs no such task.
+
+- Kill switch: with `calls` `off`, `/offer` refuses a new call before reading its body:
+  `503 {"reason": "unavailable"}`, which the call page shows as "The clinic's phone assistant
+  is unavailable right now. Please call the front desk. If this is an emergency, call 911."
+  Calls already connected go on to their end. The refusal is audited (`call_refused`, reason
+  `calls_off`, no caller data) by a bounded background writer the answer does not wait for.
+  Until its first read succeeds the voice service does not know the config, and refuses calls
+  the same way (reason `config_unknown`).
+- Office override: `open` or `closed` decides whether the office is open for calls that start
+  after the change; a running call keeps the answer it started with. `schedule` is the clock,
+  exactly as before.
 
 ### Output guard
 
@@ -1426,7 +1465,7 @@ its own variables, as follows.
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | every variable of `app` and `admin-api` but `APP_ROLE`, and `POSTGRES_USER`, `POSTGRES_PASSWORD`: the whole deployment, checked together, once |
 | `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
-| `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN`, and uvicorn's `FORWARDED_ALLOW_IPS` |
+| `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `MAX_CONCURRENT_CALLS`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN`, and uvicorn's `FORWARDED_ALLOW_IPS` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the

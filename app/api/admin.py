@@ -1,9 +1,16 @@
 """The admin API: read-only views of the requests, the messages, the calls and the audit log,
 and the console's reads (app/audit/console.py, app/api/reads.py): the calls in progress and
-their live stream, a call's turns and detail, the requests' queue, the appointments, the slots
-and the summaries of the guardrails and the calls' numbers. app/api/service.py mounts it at
-PREFIX only when ADMIN_PASSWORD is set. The calls in progress, the slots' default day and the
-summaries' days follow the clinic's clock.
+their live stream, a call's turns and detail, the requests' queue, the appointments, the slots,
+the summaries of the guardrails and the calls' numbers, and the config. app/api/service.py
+mounts it at PREFIX only when ADMIN_PASSWORD is set. The calls in progress, the slots' default
+day and the summaries' days follow the clinic's clock.
+
+Three writes (app/api/writes.py): a request of the queue marked handled, a callback's details
+shown, a config key changed. Each takes a browser session only, never Basic, with its
+anti-forgery token and from the console's origin, and a JSON body of at most MAX_BODY_BYTES
+with no field it does not know; each writes its audit event in the transaction of the change,
+and nothing is changed or returned without it. The callback's details are the one answer with
+values unmasked. A config change reaches the calls within POLL_SECONDS (app/runtime_config.py).
 
 Two ways to sign in, one check (AdminAccess): HTTP Basic, for scripts, which reads only; or a
 browser session (POST /session, app/api/sessions.py), held in a cookie, whose state-changing
@@ -28,22 +35,33 @@ import re
 import time
 from base64 import b64decode
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import ASGIApp
 
+from app.api import writes
 from app.api.live import LiveStream, LiveStreams
 from app.api.reads import (
     DEFAULT_PAGE,
     MAX_ROW_ID,
+    TODO,
     AuditPage,
     Page,
+    QueueState,
     call,
     call_detail,
     calls,
@@ -51,6 +69,7 @@ from app.api.reads import (
     messages,
     request_queue,
     requests,
+    shown_mark,
 )
 from app.api.security import (
     CSRF_HEADER,
@@ -64,19 +83,22 @@ from app.audit import console
 from app.audit.log import (
     ADMIN_PREFIX,
     CALL_ID,
+    ROW_ID,
     Action,
     AuditLog,
     Event,
     Outcome,
+    Reason,
     ResourceType,
     Verification,
 )
 from app.audit.read import MAX_PAGE, recent_events
-from app.config import Settings
+from app.config import SPEECH_TO_TEXT, TEXT_TO_SPEECH, Settings
 from app.db import models
 from app.domain.clinic import CLINIC_TZ
-from app.domain.office_hours import clinic_now, is_open
+from app.domain.office_hours import SCHEDULE, clinic_now, office_open
 from app.guard.rate_limit import RateLimiter
+from app.runtime_config import POLL_SECONDS, read_config, read_config_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +111,8 @@ HOST_COOKIE = "__Host-admin_session"
 # A Basic header for a 32-character user name and a long password is well under this. A longer
 # header is refused before it is decoded or hashed.
 MAX_AUTHORIZATION_LENGTH = 1024
-# A session sign-in's JSON body; a longer one is refused unread.
-MAX_SIGN_IN_BYTES = 1024
+# A session sign-in's or a write's JSON body; a longer one is refused unread.
+MAX_BODY_BYTES = 1024
 JSON_TYPE = "application/json"
 SIGN_IN_FAILURES = 5
 SIGN_IN_WINDOW_SECONDS = 60
@@ -151,18 +173,41 @@ class RequestPage(Page):
 
 
 class QueueQuery(BaseModel):
-    """A page of the queue: optionally of one known type, after the request a page before
-    ended with."""
+    """A page of the queue: of the requests still to do unless asked for those handled or all,
+    optionally of one known type, after the request a page before ended with."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: str | None = None
     before: int | None = Field(default=None, ge=1, le=MAX_ROW_ID)
+    state: QueueState = TODO
 
     @field_validator("type")
     @classmethod
     def _known_type(cls, value: str | None) -> str | None:
         return _a_request_type(value)
+
+
+class EmptyBody(NoQuery):
+    """The body of a write that takes nothing: `{}`."""
+
+
+class ConfigBody(BaseModel):
+    """A config change: a known key, one of its values, and the admin's confirmation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    key: str
+    value: str
+    confirm: bool
+
+    @model_validator(mode="after")
+    def _known_setting_confirmed(self) -> "ConfigBody":
+        if self.value not in models.CONFIG_VALUES.get(self.key, ()):
+            raise ValueError("not a known key with one of its values")
+        if self.confirm is not True:
+            raise ValueError("a change needs confirm: true")
+        return self
 
 
 class TurnPage(BaseModel):
@@ -262,15 +307,16 @@ def _masked(row: Mapping[str, Any]) -> dict[str, Any]:
 async def _audited[T](
     sessions: SessionFactory,
     audit: AuditLog,
-    event: Event,
+    event: Callable[[T], Event],
     read: Reader[T],
 ) -> T | None:
-    """The read and its audit event in one transaction; nothing is returned unless both
-    committed. A read that finds nothing (None) writes no event."""
+    """The read or the write and its audit event, made from what it found, in one transaction;
+    nothing is returned unless both committed. One that finds nothing (None) writes no
+    event."""
     async with sessions() as session:
         result = await read(session)
         if result is not None:
-            await audit.append(session, event, now=datetime.now(UTC))
+            await audit.append(session, event(result), now=datetime.now(UTC))
             await session.commit()
     return result
 
@@ -350,13 +396,23 @@ class AdminAccess:
             return None
         return session_id, session
 
-    def _event(self, action: Action, resource_type: ResourceType, resource_id: str | None) -> Event:
+    def event(
+        self,
+        action: Action,
+        resource_type: ResourceType,
+        resource_id: str | None,
+        *,
+        outcome: Outcome = Outcome.SUCCESS,
+        reason: Reason | None = None,
+    ) -> Event:
+        """An event of the admin's."""
         return Event(
             actor=self.actor,
             action=action,
             resource_type=resource_type,
-            outcome=Outcome.SUCCESS,
+            outcome=outcome,
             resource_id=resource_id,
+            reason=reason,
         )
 
     async def read[T](
@@ -368,9 +424,24 @@ class AdminAccess:
     ) -> T | None:
         """The read with its audit event, in one transaction; None, and no event, when it
         found nothing. Any failure is raised, and nothing was read."""
-        return await _audited(
-            self._sessions, self._audit, self._event(action, resource_type, resource_id), read
-        )
+        event = self.event(action, resource_type, resource_id)
+        return await _audited(self._sessions, self._audit, lambda _found: event, read)
+
+    async def write[T](self, write: Reader[T], event: Callable[[T], Event]) -> T | None:
+        """The write with its audit event, made from what the write did, in one transaction;
+        None, and no event, when it found nothing to write to. Any failure is raised, and
+        nothing was written."""
+        return await _audited(self._sessions, self._audit, event, write)
+
+    async def office(self) -> str:
+        """The office override as the table has it now, read in a transaction of its own
+        within READ_SECONDS; the schedule when it cannot be read: the office then follows its
+        hours, as the calls do before their config is read."""
+        try:
+            return (await read_config_bounded(self._sessions))[models.OFFICE].value
+        except Exception as error:
+            logger.warning("admin_office_read_failed error=%s", type(error).__name__)
+            return SCHEDULE
 
     async def read_again[T](self, read: Reader[T]) -> T | None:
         """A read the audit event of an earlier read already covers (the live stream's ticks),
@@ -380,12 +451,8 @@ class AdminAccess:
 
     async def record(self, action: Action) -> None:
         """An act of the admin that reads nothing, audited: signing in or out."""
-        await _audited(
-            self._sessions,
-            self._audit,
-            self._event(action, ResourceType.SESSION, None),
-            _nothing_read,
-        )
+        event = self.event(action, ResourceType.SESSION, None)
+        await _audited(self._sessions, self._audit, lambda _found: event, _nothing_read)
 
     async def verify(self) -> Verification:
         """The whole chain, verified and audited. The whole chain is read, on the worker that
@@ -457,13 +524,43 @@ def _sends_json(request: Request) -> bool:
 
 
 async def _bounded_body(request: Request) -> bytes | None:
-    """The request's body; None when it is longer than MAX_SIGN_IN_BYTES, read no further."""
+    """The request's body; None when it is longer than MAX_BODY_BYTES, read no further."""
     body = bytearray()
     async for chunk in request.stream():
         body += chunk
-        if len(body) > MAX_SIGN_IN_BYTES:
+        if len(body) > MAX_BODY_BYTES:
             return None
     return bytes(body)
+
+
+def _too_large() -> HTTPException:
+    return HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail="Request too large")
+
+
+async def _write_body[Body: BaseModel](request: Request, model: type[Body]) -> Body:
+    """A write's body: a JSON object of `model`'s fields and no other, within MAX_BODY_BYTES.
+    Anything else is refused with a fixed answer that echoes nothing of it."""
+    if not _sends_json(request):
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Content-Type must be application/json"
+        )
+    body = await _bounded_body(request)
+    if body is None:
+        raise _too_large()
+    try:
+        return model.model_validate_json(body)
+    except ValidationError:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid request"
+        ) from None
+
+
+def _queue_row(source: str, row_id: str) -> int:
+    """The id of a row of the queue, from a path that names one of its sources and a row id of
+    the declared shape; anything else is answered as an unknown path is."""
+    if source not in models.QUEUE_SOURCES or not ROW_ID.fullmatch(row_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
+    return int(row_id)
 
 
 def build_admin_app(
@@ -512,14 +609,44 @@ def build_admin_app(
         logger.info("admin_read action=%s", action.value)
         return result
 
-    def shown_session(session: Session) -> dict[str, Any]:
+    def writing_session(request: Request) -> tuple[str, Session]:
+        """The session a change of state is made in, and its id: a browser session only, never
+        Basic, whose request carries the session's anti-forgery token and comes from the
+        console's origin."""
+        found = access.browser_session(request)
+        if found is None:
+            raise _sign_in_required(request, basic=False)
+        token_matches = tokens_match(request.headers.get(CSRF_HEADER), found[1].token)
+        if not (token_matches and from_console(request, settings.console_origin)):
+            raise _forbidden()
+        return found
+
+    async def write_and_audit[T](
+        action: Action, write: Reader[T], event: Callable[[T], Event]
+    ) -> T:
+        """The write and its audit event (AdminAccess.write); one that finds nothing to write
+        to is answered 404, and any failure 503."""
+        try:
+            result = await access.write(write, event)
+        except Exception as error:
+            logger.error(
+                "admin_write_failed action=%s error=%s", action.value, type(error).__name__
+            )
+            raise _unavailable() from None
+        if result is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=NOT_FOUND)
+        logger.info("admin_write action=%s", action.value)
+        return result
+
+    async def shown_session(session: Session) -> dict[str, Any]:
         """What a signed-in browser is told: who, the session's anti-forgery token, the seconds
-        left if it is not used, and the office as the agent's clock has it."""
+        left if it is not used, and whether the office is open for a call starting now: the
+        agent's clock, or the override staff set."""
         return {
             "user": session.user,
             "csrf_token": session.token,
             "expires_in": access.signed_in.seconds_left(session),
-            "office_open": is_open(clinic_now(settings)),
+            "office_open": office_open(clinic_now(settings), await access.office()),
             "time_zone": CLINIC_TZ.key,
         }
 
@@ -549,7 +676,7 @@ def build_admin_app(
             raise _limited()
         body = await _bounded_body(request)
         if body is None:
-            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail="Request too large")
+            raise _too_large()
         if not access.signs_in(address, _signed_credentials(body)):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Sign-in failed")
         # No event, no session.
@@ -563,7 +690,7 @@ def build_admin_app(
             access.signed_in.close(replaced)
         session_id, session = access.signed_in.open(access.user)
         logger.info("admin_signed_in")
-        response = JSONResponse(shown_session(session))
+        response = JSONResponse(await shown_session(session))
         response.set_cookie(
             access.cookie,
             session_id,
@@ -580,17 +707,11 @@ def build_admin_app(
         found = access.browser_session(request, touch=False)
         if found is None:
             raise _sign_in_required(request, basic=False)
-        return shown_session(found[1])
+        return await shown_session(found[1])
 
     @app.delete("/session")
     async def sign_out(request: Request, _query: Annotated[NoQuery, Query()]) -> Response:
-        found = access.browser_session(request)
-        if found is None:
-            raise _sign_in_required(request, basic=False)
-        session_id, session = found
-        token_matches = tokens_match(request.headers.get(CSRF_HEADER), session.token)
-        if not (token_matches and from_console(request, settings.console_origin)):
-            raise _forbidden()
+        session_id, _session = writing_session(request)
         # Signing out always signs out: the session ends whatever the audit log says, and an
         # event it could not take is missing from it, which the log says by name.
         access.signed_in.close(session_id)
@@ -646,7 +767,92 @@ def build_admin_app(
         logger.info("admin_stream_opened")
         return stream
 
+    # The writes: a session only, with its token, from the console's origin; each with its
+    # audit event in its transaction.
+    @app.post("/queue/{source}/{row_id}/handled")
+    async def mark_handled(
+        request: Request, source: str, row_id: str, _query: Annotated[NoQuery, Query()]
+    ) -> JSONResponse:
+        _session_id, session = writing_session(request)
+        row = _queue_row(source, row_id)
+        await _write_body(request, EmptyBody)
+        now = datetime.now(UTC)
+        mark = await write_and_audit(
+            Action.ADMIN_MARKED_HANDLED,
+            lambda db: writes.mark_handled(db, source, row, session.user, now),
+            lambda found: access.event(
+                Action.ADMIN_MARKED_HANDLED,
+                ResourceType.REQUEST,
+                row_id,
+                outcome=Outcome.SUCCESS if found.new else Outcome.ALREADY,
+            ),
+        )
+        return JSONResponse(
+            {"source": source, "id": row, "handled": shown_mark(mark.by, mark.at)},
+            status_code=status.HTTP_201_CREATED if mark.new else status.HTTP_200_OK,
+        )
+
+    # The one route that answers with values unmasked: the caller's name and number, for one
+    # row, read and audited in one transaction, and logged by event name only.
+    @app.post("/queue/{source}/{row_id}/callback")
+    async def reveal_callback(
+        request: Request, source: str, row_id: str, _query: Annotated[NoQuery, Query()]
+    ) -> dict[str, Any]:
+        writing_session(request)
+        row = _queue_row(source, row_id)
+        await _write_body(request, EmptyBody)
+        callbacks = await write_and_audit(
+            Action.ADMIN_REVEALED_CALLBACK,
+            lambda db: writes.callback_details(db, source, row),
+            lambda _found: access.event(
+                Action.ADMIN_REVEALED_CALLBACK, ResourceType.REQUEST, row_id
+            ),
+        )
+        return {"source": source, "id": row, "callbacks": callbacks}
+
+    @app.post("/config")
+    async def change_config(request: Request, _query: Annotated[NoQuery, Query()]) -> JSONResponse:
+        _session_id, session = writing_session(request)
+        body = await _write_body(request, ConfigBody)
+        now = datetime.now(UTC)
+        change = await write_and_audit(
+            Action.ADMIN_CHANGED_CONFIG,
+            lambda db: writes.change_config(db, body.key, body.value, session.user, now),
+            lambda found: access.event(
+                Action.ADMIN_CHANGED_CONFIG,
+                ResourceType.CONFIG,
+                body.key,
+                outcome=Outcome.SUCCESS if found.changed else Outcome.UNCHANGED,
+                reason=Reason(f"{body.key}_{body.value}"),
+            ),
+        )
+        return JSONResponse(
+            {
+                "key": body.key,
+                **_json(asdict(change.setting)),
+                "applies_within_seconds": POLL_SECONDS,
+            },
+            status_code=status.HTTP_201_CREATED if change.changed else status.HTTP_200_OK,
+        )
+
     reads = APIRouter(dependencies=[Depends(require_admin)])
+
+    @reads.get("/config")
+    async def read_settings(_query: Annotated[NoQuery, Query()]) -> dict[str, Any]:
+        found = await read_and_audit(Action.ADMIN_READ_CONFIG, ResourceType.CONFIG, read_config)
+        return {
+            "config": {key: _json(asdict(setting)) for key, setting in found.items()},
+            "applies_within_seconds": POLL_SECONDS,
+            "facts": {
+                "environment": settings.app_env,
+                "model": settings.llm_model,
+                "speech_to_text": SPEECH_TO_TEXT,
+                "text_to_speech": TEXT_TO_SPEECH,
+                "max_concurrent_calls": settings.max_concurrent_calls,
+                "max_call_seconds": settings.max_call_seconds,
+                "test_clock": settings.simulated_now is not None,
+            },
+        }
 
     @reads.get("/requests")
     async def read_requests(page: Annotated[RequestPage, Query()]) -> dict[str, Any]:
@@ -672,7 +878,7 @@ def build_admin_app(
         rows = await read_and_audit(
             Action.ADMIN_READ_QUEUE,
             ResourceType.REQUEST,
-            lambda session: request_queue(session, page, query.type),
+            lambda session: request_queue(session, page, query.type, query.state),
         )
         return {"requests": [_json(row) for row in rows]}
 

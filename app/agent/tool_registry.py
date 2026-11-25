@@ -41,6 +41,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -72,6 +73,7 @@ from app.agent.state import (
 from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.domain.clinic import CLINIC_TZ
 from app.guard.text import plain_text
+from app.runtime_config import LiveConfig
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +169,11 @@ RESERVED_ACTIONS = frozenset(
         Action.ADMIN_SIGNED_OUT,
         Action.ADMIN_READ_CALL_DETAIL,
         Action.ADMIN_READ_QUEUE,
+        Action.ADMIN_MARKED_HANDLED,
+        Action.ADMIN_REVEALED_CALLBACK,
+        Action.ADMIN_READ_CONFIG,
+        Action.ADMIN_CHANGED_CONFIG,
+        Action.CALL_REFUSED,
     }
 )
 
@@ -311,12 +318,15 @@ class DeclarationError(ValueError):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Deps:
     """What dispatch needs to run a tool: sessions as the runtime role, the audit log, the
-    clock (aware datetimes) and the hasher of identity claims."""
+    clock (aware datetimes) and the hasher of identity claims; and the config in memory, which
+    the start of a call reads (app/runtime_config.py). Until it has been read, the clock alone
+    decides whether the office is open."""
 
     sessions: async_sessionmaker[AsyncSession]
     audit: AuditLog
     now: Callable[[], datetime]
     claim_keys: ClaimKeys
+    config: LiveConfig = dataclass_field(default_factory=LiveConfig)
 
 
 def _key(name: str) -> str:
