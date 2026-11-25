@@ -9,11 +9,21 @@ activity detection (Silero) and Deepgram's streaming speech-to-text to the agent
 lines ("Voice out and the call's life", below) and sends each turn's result to the call page
 over the data channel.
 
-- `GET /` serves a plain test page: access token, Call and Hang up, a "relay only" switch, the
-  connection state, the ICE candidate types in use, and one entry per turn: what the model was
-  given (the guard's text, or "(not shown to the assistant)" for a swallowed or emergency
-  turn), the lines said, the output guard's rule when it withheld part of a reply, the timings
-  and whether a hand-off was asked for. The server's text is written as text, never as markup.
+- `GET /` serves the call page (`web/index.html`, built by `app/api/page.py`): a phone with
+  the access code, Call and End call, a "relay only" switch, the call's time and a line that
+  follows the two audio levels (the assistant's and the caller's, read in the browser and
+  never sent anywhere). Beside it, once the call talks, the conversation as text: what the
+  model was given of each caller turn (the guard's text, or a redaction bar for a swallowed
+  or emergency turn), the lines said, "scripted line" where no model was asked, the tool
+  steps, the output guard's rule when it withheld part of a reply, a hand-off, and the
+  timings behind a switch; and the connection state, the ICE candidate types in use and why
+  the call ended. The server's text is written as text, never as markup.
+- The page is read once, when the app is built, with its two font files (IBM Plex, served
+  from `/fonts/`; no other name is found). It is served with a Content-Security-Policy made
+  from the page itself: `default-src 'none'`, its one inline script and one inline style
+  allowed by their SHA-256, `connect-src 'self'`, `font-src 'self'`, no framing; and with
+  `nosniff`, `Referrer-Policy: no-referrer` and a `Permissions-Policy` that gives the
+  microphone to this origin only. The page loads nothing from another origin.
 - `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
   shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
 - `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.

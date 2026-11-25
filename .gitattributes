@@ -5,3 +5,5 @@ deploy/coturn/* text eol=lf
 # stay binary.
 console/** text eol=lf
 console/**/*.woff2 binary
+# The call page's fonts stay binary.
+web/fonts/*.woff2 binary
