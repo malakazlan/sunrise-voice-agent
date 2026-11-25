@@ -154,7 +154,11 @@ jobs:
             ANTHROPIC_API_KEY=ci-compose-only-fake-anthropic-key-0001 \
             DEEPGRAM_API_KEY=ci-compose-only-fake-deepgram-key-00001 \
             ELEVENLABS_API_KEY=ci-compose-only-fake-elevenlabs-key-0001 \
-            ELEVENLABS_VOICE_ID=cicomposeonlyfakevoice UNRELATED_DECOY=1 > .env
+            ELEVENLABS_VOICE_ID=cicomposeonlyfakevoice ADMIN_USER=ci_admin \
+            UNRELATED_DECOY=1 > .env
+          # The admin's sign-in; only the admin API and the start-up check are given it.
+          admin_pass="ci-compose-only-admin-pass-0001"
+          printf 'ADMIN_PASSWORD=%s\n' "$admin_pass" >> .env
       - name: Smoke test through Compose
         run: |
           . .github/ci-wait.sh
@@ -165,10 +169,43 @@ jobs:
           docs=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)
           echo "GET /docs -> $docs"
           test "$docs" = "404"
-          # No ADMIN_PASSWORD in the env file: the admin API is not mounted.
-          admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/admin/api/requests)
-          echo "GET /admin/api/requests -> $admin"
-          test "$admin" = "404"
+          # The app runs the voice role: no admin route, though the env file holds the
+          # admin's sign-in (only the admin API and the start-up check are given it).
+          for path in /admin/api/requests /admin/api/session /admin/api/calls/live/stream; do
+            admin=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "app GET $path -> $admin"
+            test "$admin" = "404"
+          done
+          # The admin API runs the admin role, without any key of the calls: the admin API,
+          # and no call route.
+          wait_for_status 120 http://127.0.0.1:8001/health 200 "the admin API to answer /health"
+          for check in "/admin/api/requests 401" "/admin/api/session 401" "/ 404" \
+            "/ice-servers 404"; do
+            set -- $check
+            status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8001$1")
+            echo "admin-api GET $1 -> $status"
+            test "$status" = "$2"
+          done
+          # A browser's sign-in from the API's own origin, the password on stdin only: a
+          # __Host- session cookie outside dev.
+          admin_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' .env)
+          test -n "$admin_pass"
+          signed=$(printf '{"user": "ci_admin", "password": "%s"}' "$admin_pass" \
+            | curl -s -m 10 -o /dev/null -D - -w '%{http_code}' -X POST \
+              -H 'Origin: http://127.0.0.1:8001' -H 'Content-Type: application/json' \
+              --data-binary @- http://127.0.0.1:8001/admin/api/session)
+          echo "admin-api POST /admin/api/session -> $(echo "$signed" | tail -n 1)"
+          test "$(echo "$signed" | tail -n 1)" = "200"
+          echo "$signed" | grep -qi '^set-cookie: __Host-admin_session=.*; HttpOnly; Path=/; SameSite=strict; Secure'
+          admin=$($compose ps -q admin-api)
+          health=none
+          for _ in $(seq 1 30); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$admin")
+            [ "$health" = "healthy" ] && break
+            sleep 1
+          done
+          echo "admin-api HEALTHCHECK -> $health"
+          test "$health" = "healthy"
           uid=$(bounded 30 "id -u in the app container" $compose exec -T app id -u)
           echo "container uid: $uid"
           test "$uid" != "0"
@@ -250,15 +287,18 @@ jobs:
           }
           {
             echo "app $(configured app)"
+            echo "admin-api $(configured admin-api)"
             echo "startup $(configured startup)"
           } | tee "$RUNNER_TEMP/configured-env"
           bounded_run 60 "the configured-environment comparison" ci-configured-env -i --rm \
             --entrypoint python sunrise-voice-agent:ci -c '
           import sys
-          from app.config import Settings, StartupSettings
+          from app.config import ADMIN_FIELDS, STARTUP_CHECK_FIELDS, VOICE_FIELDS
           expected = {
-              "app": {name.upper() for name in Settings.model_fields},
-              "startup": {name.upper() for name in StartupSettings.model_fields},
+              "app": {name.upper() for name in VOICE_FIELDS},
+              # The one variable that is no setting: read by uvicorn, for the proxy address.
+              "admin-api": {name.upper() for name in ADMIN_FIELDS} | {"FORWARDED_ALLOW_IPS"},
+              "startup": {name.upper() for name in STARTUP_CHECK_FIELDS},
           }
           found = {}
           for line in sys.stdin:
@@ -382,23 +422,27 @@ jobs:
             grep -qx "$name" "$RUNNER_TEMP/db-env"
           done
           echo "db environment holds only the database variables"
-      - name: Compose gives app and startup exactly their settings variables
+      - name: Compose gives app, admin-api and startup exactly their settings variables
         run: |
           set -o pipefail
           . .github/ci-wait.sh
           # Compose's resolved configuration, read by the app's own settings classes inside the
           # image. Names only; values are never printed. The running containers are checked
-          # against the same classes above.
+          # against the same fields above.
           timeout 60 docker compose --env-file .env -f deploy/docker-compose.yml config --format json \
             | bounded_run 60 "the settings-field comparison" ci-app-env -i --rm \
               --entrypoint python sunrise-voice-agent:ci -c '
           import json, sys
-          from app.config import Settings, StartupSettings
+          from app.config import ADMIN_FIELDS, STARTUP_CHECK_FIELDS, VOICE_FIELDS
           services = json.load(sys.stdin)["services"]
           failed = False
-          for service, settings_class in (("app", Settings), ("startup", StartupSettings)):
+          for service, expected in (
+              ("app", VOICE_FIELDS),
+              ("admin-api", ADMIN_FIELDS | {"forwarded_allow_ips"}),
+              ("startup", STARTUP_CHECK_FIELDS),
+          ):
               received = set(services[service]["environment"])
-              fields = {name.upper() for name in settings_class.model_fields}
+              fields = {name.upper() for name in expected}
               print(service, "environment names:", " ".join(sorted(received)))
               if received != fields:
                   print("missing:", sorted(fields - received), "unexpected:", sorted(received - fields))
@@ -573,12 +617,9 @@ jobs:
           echo "$output" | tail -n 5
           echo "exit code: $code"
           test "$code" = "1"
-          echo "$output" | grep -q "1 validation error for StartupSettings"
+          # One error: the deployment's settings, all checked at once, break only this rule.
+          echo "$output" | grep -q "1 validation error for DeploymentSettings"
           echo "$output" | grep -q "postgres_user must differ from app_db_user"
-          if echo "$output" | grep -Eq "validation errors? for Settings"; then
-            echo "the application settings were refused too; only the start-up rule should be"
-            exit 1
-          fi
       - name: A failed start-up keeps the app from starting
         run: |
           . .github/ci-wait.sh
@@ -601,6 +642,10 @@ jobs:
           test "$(docker inspect --format '{{.State.ExitCode}}' "$startup")" = "1"
           state=$(docker inspect --format '{{.State.Status}}' "$app")
           echo "app container: $state"
+          test "$state" = "created"
+          admin=$($compose ps -a -q admin-api)
+          state=$(docker inspect --format '{{.State.Status}}' "$admin")
+          echo "admin-api container: $state"
           test "$state" = "created"
           status=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
           echo "GET /health -> $status"
