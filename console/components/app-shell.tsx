@@ -145,7 +145,8 @@ function TopBar({ menu, right, banner }: { menu: ReactNode; right: ReactNode; ba
 }
 
 // On every page while the phone assistant is switched off, or while its settings could not be
-// read (the session says which; the shell reads it already, so no page asks the config itself).
+// read. The session says which; the shell reads it again every 60 s while the tab is shown, so the
+// banner follows a change someone else made, and no page asks for the config itself.
 export function SettingsBanner({ calls }: { calls: Session["calls"] }) {
   if (calls === "on") return null;
   const off = calls === "off";

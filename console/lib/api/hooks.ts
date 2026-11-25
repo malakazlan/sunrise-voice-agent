@@ -36,7 +36,8 @@ import {
 import { openLiveStream, type LiveStreamState } from "@/lib/api/stream";
 
 // Every read of the console, as a TanStack Query hook over the one fetch wrapper. The cache is in
-// memory only. Nothing here polls: the live page uses the stream, the rest read when opened.
+// memory only. Only the session is read on a timer (below); the live page uses the stream, the
+// rest read when opened.
 
 export const PAGE_SIZE = 50;
 
@@ -54,6 +55,11 @@ export function useApi(): ApiClient {
   return client;
 }
 
+// How often the shell reads the session again while the tab is shown, so the office state and the
+// calls banner follow a change someone else made. The API does not audit this read, and it does
+// not extend the session's idle time.
+export const SESSION_REFRESH_MS = 60_000;
+
 export function useSession() {
   const api = useApi();
   return useQuery({
@@ -63,7 +69,9 @@ export function useSession() {
       api.setCsrfToken(session.csrf_token);
       return session;
     },
-    staleTime: 60_000,
+    staleTime: SESSION_REFRESH_MS,
+    refetchInterval: SESSION_REFRESH_MS,
+    refetchIntervalInBackground: false,
   });
 }
 
@@ -165,11 +173,15 @@ export function useMarkHandled() {
   });
 }
 
+// Each read of the config is an audited event: it is read when the page is opened and after a
+// change, never on window focus.
 export function useConfig() {
   const api = useApi();
   return useQuery({
     queryKey: ["config"],
     queryFn: async ({ signal }) => api.get("/config", configSchema, undefined, { signal }),
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
   });
 }
 

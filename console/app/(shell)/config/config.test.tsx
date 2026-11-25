@@ -1,5 +1,7 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { focusManager } from "@tanstack/react-query";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { ConfigView } from "@/app/(shell)/config/config";
 import * as fixtures from "@/mock/fixtures";
@@ -101,5 +103,58 @@ describe("Config", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Switch the assistant off" }));
 
     expect(await screen.findByText("Your session has changed. Sign in again.")).toBeTruthy();
+  });
+});
+
+// Each read of the config is an audited event: it is read when the page is opened and after a
+// change, not whenever the window gets focus.
+describe("Config reads", () => {
+  afterEach(() => {
+    focusManager.setFocused(undefined);
+  });
+
+  const reads = (sent: Sent[]) =>
+    sent.filter((each) => each.method === "GET" && each.path === "/config").length;
+
+  it("are not repeated when the window gets focus", async () => {
+    const { sent } = api();
+    renderConsole(<ConfigView />, { defaultOptions: { queries: { staleTime: 0 } } });
+    await screen.findByRole("radiogroup", { name: "Phone assistant" });
+
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    expect(reads(sent)).toBe(1);
+  });
+
+  it("happen each time the page is opened, even when the last is recent", async () => {
+    const { sent } = api();
+    function OpenedTwice() {
+      const [opened, setOpened] = useState(1);
+      return (
+        <>
+          <button onClick={() => setOpened(opened + 1)}>Open again</button>
+          <ConfigView key={opened} />
+        </>
+      );
+    }
+    renderConsole(<OpenedTwice />, { defaultOptions: { queries: { staleTime: 15_000 } } });
+    await screen.findByRole("radiogroup", { name: "Phone assistant" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open again" }));
+
+    await waitFor(() => expect(reads(sent)).toBe(2));
+  });
+
+  it("happen again after a change", async () => {
+    const { sent } = api();
+    renderConsole(<ConfigView />, { defaultOptions: { queries: { staleTime: 15_000 } } });
+
+    const dialog = await choose("Phone assistant", "Off");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Switch the assistant off" }));
+
+    await waitFor(() => expect(reads(sent)).toBe(2));
   });
 });
