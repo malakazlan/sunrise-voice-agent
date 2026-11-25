@@ -485,6 +485,10 @@ def test_the_digits_of_a_number_are_read_apart_from_a_date() -> None:
         ("My number is five five four, three two one.", "554321"),
         ("five five six", "556"),
         ("No digits here.", ""),
+        # A time of day is not a number.
+        ("Monday at 9:30 AM works.", ""),
+        ("Tuesday at 2 pm or 10 a.m.", ""),
+        ("at 3 o'clock, and my number starts 555", "555"),
     ]
     assert [(text, digits_given(text, 1)) for text, _ in rows] == rows
     # One digit beside a date in numerals does not make the date a number where three are asked.

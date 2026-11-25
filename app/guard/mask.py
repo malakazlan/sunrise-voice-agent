@@ -418,19 +418,26 @@ def spoken_digits(text: str) -> str:
     return "".join(_digits(run) for run in _runs(text))
 
 
+# A time of day, as speech-to-text writes it: never part of a number.
+_CLOCK = re.compile(
+    r"(?<![\w:])\d{1,2}(?::\d{2}(?![\w:])|[ \t]{0,2}(?:[ap]\.?m\b\.?|o'clock\b))"
+    r"(?:[ \t]{0,2}[ap]\.?m\b\.?)?",
+    re.IGNORECASE,
+)
 # Dates written with the month's name, or as Python writes them: never part of a number.
 _WORDED_DATES = frozenset({"repr", "month_first", "day_first"})
 
 
 def digits_given(text: str, least: int) -> str:
     """The digits of a number the caller is giving, in order, written or spoken: every digit
-    the text says but those of a date. A date with its month's name is never part of a number.
+    the text says but those of a date or a time of day. A date with its month's name is never
+    part of a number.
     One written in numerals alone ("05/05/1964") is a date when the text says fewer than
     `least` other digits, and digits speech-to-text wrote as a date when it says more."""
 
     def apart_from(kinds: frozenset[str]) -> str:
         kept = _IDENTIFIER.sub(lambda found: " " if found.lastgroup in kinds else found[0], text)
-        return spoken_digits(kept)
+        return spoken_digits(_CLOCK.sub(" ", kept))
 
     apart = apart_from(_DATE_KINDS)
     return apart if len(apart) < least else apart_from(_WORDED_DATES)

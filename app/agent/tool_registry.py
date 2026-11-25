@@ -194,6 +194,26 @@ REFUSED_MESSAGE = "That is not available right now."
 FAILED_MESSAGE = "That could not be done right now."
 
 
+def bad_arguments_message(fields: tuple[str, ...]) -> str:
+    """What the model is told when a call's arguments are not valid: which of the tool's
+    own arguments, by their declared names, so that it asks the caller for them instead of
+    giving the request up. Never a name or a value the model sent."""
+    named = f": {', '.join(fields)}" if fields else ""
+    return (
+        f"Some details are missing or not valid{named}. Ask the caller for them, then call"
+        " the tool again with every detail."
+    )
+
+
+def _bad_fields(tool: "Tool", error: Exception) -> tuple[str, ...]:
+    """The declared arguments a validation error names, in order of name."""
+    if not isinstance(error, ValidationError):
+        return ()
+    declared = tool.arguments.model_fields
+    named = {str(detail["loc"][0]) for detail in error.errors() if detail["loc"]}
+    return tuple(sorted(named & set(declared)))
+
+
 class ToolResult(BaseModel):
     """What a handler returns: data for its caller, the transition it asks for, a line for code
     to speak and the values it is spoken with, the action of its event when the tool declares
@@ -642,7 +662,8 @@ class Registry:
         except Exception as error:
             count = error.error_count() if isinstance(error, ValidationError) else 0
             logger.warning("tool_arguments_refused tool=%s errors=%d", tool.name, count)
-            return await self._refuse(state, tool.name, "bad_arguments", deps)
+            message = bad_arguments_message(_bad_fields(tool, error))
+            return await self._refuse(state, tool.name, "bad_arguments", deps, message)
 
         try:
             async with asyncio.timeout(DISPATCH_DEADLINE_SECONDS), deps.sessions() as session:
@@ -719,7 +740,12 @@ class Registry:
         return after, _outcome(Status.DONE, after, result)
 
     async def _refuse(
-        self, state: CallState, name: str | None, reason: str, deps: Deps
+        self,
+        state: CallState,
+        name: str | None,
+        reason: str,
+        deps: Deps,
+        message: str | None = None,
     ) -> tuple[CallState, ToolOutcome]:
         refused = count_refusal(state)
         logger.warning(
@@ -730,7 +756,10 @@ class Registry:
             refused.tool_refusals,
         )
         await self._record(refused, Action.TOOL_REFUSED, Outcome.REFUSED, name, deps)
-        return refused, _outcome(Status.REFUSED, refused)
+        outcome = _outcome(Status.REFUSED, refused)
+        if message is not None:
+            outcome = outcome.model_copy(update={"message": message})
+        return refused, outcome
 
     async def _record(
         self, state: CallState, action: Action, outcome: Outcome, name: str | None, deps: Deps

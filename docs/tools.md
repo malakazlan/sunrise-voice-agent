@@ -119,7 +119,10 @@ the four ways a call ends, with the code-only hand-off (below); a call's turns
   rolled back and no event is written for that tool call; the call's own end event records
   the hang-up.
 - The model gets fixed text for a refusal or a failure, never an exception or an argument
-  value. Failures and refusals are counted separately: from two failures, or five refusals,
+  value. One refusal says more: arguments that are not valid, for a tool that is offered,
+  are refused with the names of the tool's own arguments that are missing or not valid
+  (never a name or a value the model sent), so that the model asks the caller for them
+  instead of giving the request up. Failures and refusals are counted separately: from two failures, or five refusals,
   every outcome asks for a hand-off. Tool calls of one call run one at a time.
 - The application's database sessions end any statement after 5 seconds, so a connected but
   stalled server cannot hold a tool call; the start-up steps keep their own limits.

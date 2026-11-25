@@ -1,5 +1,5 @@
-# A first-time caller gives their details, is offered at most three open slots, hears the one
-# they chose read back, and books it. The seed is loaded for Tuesday 24 November, so the
+# A first-time caller gives their details, hears the email read back, is offered at most
+# three open slots, hears the one they chose read back, and books it. The seed is loaded for Tuesday 24 November, so the
 # earliest open slots are Wednesday's generated ones: Dr. Patel at 9:30 (slot 8), Dr. Lee at
 # 10:00 (slot 11) and Dr. Patel at 11:00 (slot 9). The seven task slots take ids 1 to 7; each
 # day's generated rows go in Dr. Patel's three times first, then Dr. Lee's two.
@@ -24,14 +24,19 @@ turns:
           email: "ann@example.com"
           self_pay: true
           reason_short: "Checkup"
+      - say: "I have your email as A N N at E X A M P L E dot C O M. Is that right?"
+    expect:
+      tools:
+        - call: collect_new_patient
+          returns: {email_spelled: "A N N at E X A M P L E dot C O M"}
+  - caller: "Yes, that's right. What times do you have?"
+    model:
       - call: find_slots
       - say: >-
           I have Wednesday, November 25 at 9:30 AM with Dr. Patel, 10:00 AM with Dr. Lee,
           or 11:00 AM with Dr. Patel. Which would you like?
     expect:
       tools:
-        - call: collect_new_patient
-          returns: {email_spelled: "A N N at E X A M P L E dot C O M"}
         - call: find_slots
           returns:
             slots:

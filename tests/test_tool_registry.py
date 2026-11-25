@@ -51,6 +51,7 @@ from app.agent.tool_registry import (
     ToolDescription,
     ToolOutcome,
     ToolResult,
+    bad_arguments_message,
     check_declaration,
     is_available,
 )
@@ -472,21 +473,30 @@ async def test_dispatch_refuses_bad_arguments(
     calls: Calls = []
     registry = registry_of(declared("look_up", recording(calls), arguments=Topic))
     state = intake()
-    bad: list[object] = [
-        {},
-        {"topic": 5},
-        {"topic": None},
-        {"topic": "hours", "patient_id": "P002"},
-        {"topic": "hours", "note": MARKER},
-        {MARKER: MARKER},
-        f"topic={MARKER}",
-        [MARKER],
-        None,
+    # The model is told which of the tool's own arguments are missing or not valid, by
+    # their declared names, so that it asks the caller for them: never a name or a
+    # value it sent.
+    topic = REFUSED.model_copy(update={"message": bad_arguments_message(("topic",))})
+    unnamed = REFUSED.model_copy(update={"message": bad_arguments_message(())})
+    bad: list[tuple[object, ToolOutcome]] = [
+        ({}, topic),
+        ({"topic": 5}, topic),
+        ({"topic": None}, topic),
+        ({"topic": "hours", "patient_id": "P002"}, unnamed),
+        ({"topic": "hours", "note": MARKER}, unnamed),
+        ({MARKER: MARKER}, topic),
+        (f"topic={MARKER}", unnamed),
+        ([MARKER], unnamed),
+        (None, unnamed),
     ]
-    for arguments in bad:
+    assert topic.message is not None and unnamed.message is not None
+    assert "topic" in topic.message and "topic" not in unnamed.message
+    assert unnamed.message != REFUSED.message
+    for arguments, told in bad:
         after, outcome = await registry.dispatch(state, "look_up", arguments, deps)
-        assert (after, outcome) == (after_refusal(state), REFUSED)
+        assert (after, outcome) == (after_refusal(state), told)
         assert MARKER not in outcome.model_dump_json()
+        assert "patient_id" not in outcome.model_dump_json()
     assert calls == []
     assert MARKER not in caplog.text
     assert events(owner_engine) == [refused_event(state, "look_up")] * len(bad)
@@ -641,9 +651,17 @@ async def test_failures_are_generic(
     )
     state = intake()
     outcomes = []
-    for name, arguments in (("no_such_tool", {}), ("read_chart", {}), ("look_up", {"x": MARKER})):
+    # A tool that is not there and one that is not offered are refused alike. Arguments
+    # that are not valid, for a tool that is offered, are refused by the tool's own
+    # argument names and nothing the model sent.
+    not_valid = REFUSED.model_copy(update={"message": bad_arguments_message(("topic",))})
+    for name, arguments, told in (
+        ("no_such_tool", {}, REFUSED),
+        ("read_chart", {}, REFUSED),
+        ("look_up", {"x": MARKER}, not_valid),
+    ):
         after, outcome = await registry.dispatch(state, name, arguments, deps)
-        assert outcome == REFUSED
+        assert outcome == told
         outcomes.append(outcome)
     for name in ("breaks", "breaks_too", "bad_move"):
         # A fresh state each time, so the hand-off signal stays out of this test.
@@ -1340,7 +1358,7 @@ async def test_handler_gets_the_patient_from_the_state(deps: Deps) -> None:
     # The model cannot name another patient: unknown fields are refused.
     assert await registry.dispatch(state, "read_chart", {"patient_id": "P001"}, deps) == (
         after_refusal(state),
-        REFUSED,
+        REFUSED.model_copy(update={"message": bad_arguments_message(())}),
     )
     assert len(chart) == 1
 

@@ -70,6 +70,16 @@ SERVING_TOOLS = [
 REFUSED = ToolOutcome(
     status=Status.REFUSED, message="That is not available right now.", data={}, hand_off=False
 )
+
+
+def not_valid(outcome: ToolOutcome) -> bool:
+    """A refusal for arguments that are not valid: nothing ran, nothing is returned, and
+    the model is told to ask the caller for the details."""
+    told = outcome.message or ""
+    fixed = outcome.model_copy(update={"message": REFUSED.message})
+    return fixed == REFUSED and told.startswith("Some details are missing or not valid")
+
+
 FAILED = ToolOutcome(
     status=Status.FAILED, message="That could not be done right now.", data={}, hand_off=False
 )
@@ -238,7 +248,7 @@ async def new_patient(
 ) -> CallState:
     """A first-time caller in booking with their details collected."""
     state, data = await done(registry, deps, intake(), START)
-    assert data == {}
+    assert data == {"status": "started"}
     state, _ = await done(registry, deps, state, COLLECT, DETAILS if details is None else details)
     return state
 
@@ -390,7 +400,7 @@ async def test_find_slots(
         {"preferred_time_of_day": "evening"},
         {"date": "2026-11-25"},
     ):
-        assert (await run(registry, deps, sarah(), FIND, arguments))[1] == REFUSED, arguments
+        assert not_valid((await run(registry, deps, sarah(), FIND, arguments))[1]), arguments
 
 
 # --- R2: only an open, offered, future slot --------------------------------------------------
@@ -475,9 +485,9 @@ async def test_booking_needs_confirmation(
     # Only a real true confirms.
     for value in ("true", "yes", 1):
         outcome = (await run(registry, deps, state, BOOK, {**book(first), "confirmed": value}))[1]
-        assert outcome == REFUSED, value
+        assert not_valid(outcome), value
         confirming = {**booking_args(second), "confirmed": value}
-        assert (await run(registry, deps, newcomer, BOOK_NEW, confirming))[1] == REFUSED, value
+        assert not_valid((await run(registry, deps, newcomer, BOOK_NEW, confirming))[1]), value
 
     assert rows(owner_engine, APPOINTMENTS) == []
     assert rows(owner_engine, REQUESTS) == []
@@ -957,7 +967,7 @@ async def test_new_patient_details_are_bounded(
     state, _ = await done(registry, deps, intake(), START)
     for arguments in refused:
         after, outcome = await run(registry, deps, state, COLLECT, arguments)
-        assert outcome == REFUSED, arguments
+        assert not_valid(outcome), arguments
         assert after.new_patient_details is None
     for arguments, stored in accepted:
         after, data = await done(registry, deps, state, COLLECT, arguments)
@@ -1197,12 +1207,10 @@ async def test_booking_tools_are_gated(
         {"dob": "1972-11-08"},
         {"ssn_last4": "1020"},
     ):
-        assert (await run(registry, deps, offered_patient, BOOK, {**book(first, True), **extra}))[
-            1
-        ] == REFUSED
-        assert (
-            await run(registry, deps, offered_new, BOOK_NEW, {**booking_args(first, True), **extra})
-        )[1] == REFUSED
+        named = {**book(first, True), **extra}
+        assert not_valid((await run(registry, deps, offered_patient, BOOK, named))[1])
+        named = {**booking_args(first, True), **extra}
+        assert not_valid((await run(registry, deps, offered_new, BOOK_NEW, named))[1])
     assert rows(owner_engine, APPOINTMENTS) == []
 
     # Each books for its own caller: the verified patient's record, or the new one's.

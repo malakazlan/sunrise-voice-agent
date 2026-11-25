@@ -253,7 +253,9 @@ def _tool_failure(position: int, called: _Called, expected: ToolExpect) -> str |
         return f"call {position} is {called.name}, {expected.call} expected"
     arguments = called.arguments if isinstance(called.arguments, dict) else {}
     for key, value in expected.args.items():
-        if key not in arguments or not _same(arguments[key], value):
+        # A flag the model leaves out is false, as the tool reads it.
+        found = arguments.get(key, False) if value is False else arguments.get(key)
+        if (key not in arguments and value is not False) or not _same(found, value):
             return f"call {position} argument {key} differs"
     if expected.returns is not None:
         data = called.result.get("data") if isinstance(called.result, dict) else None

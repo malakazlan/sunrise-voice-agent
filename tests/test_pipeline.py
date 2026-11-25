@@ -383,6 +383,10 @@ def test_what_is_plainly_unfinished() -> None:
         ("double five six seven eight", True),
         # The last four, a whole number, a time, one digit: answers as they stand.
         ("three three four four", False),
+        # However speech-to-text ends them: a whole answer never waits.
+        ("Three, three, four, four,", False),
+        ("3, 3, 4, 4,", False),
+        ("double three, double four,", False),
         ("Four five six seven.", False),
         ("five five five two zero one three three four four", False),
         ("(554) 321-2342.", False),

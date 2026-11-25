@@ -43,6 +43,16 @@ SERVING_TOOLS = [APPOINTMENT, REFILL, LAB, BALANCE, MESSAGE]
 REFUSED = ToolOutcome(
     status=Status.REFUSED, message="That is not available right now.", data={}, hand_off=False
 )
+
+
+def not_valid(outcome: ToolOutcome) -> bool:
+    """A refusal for arguments that are not valid: nothing ran, nothing is returned, and
+    the model is told to ask the caller for the details."""
+    told = outcome.message or ""
+    fixed = outcome.model_copy(update={"message": REFUSED.message})
+    return fixed == REFUSED and told.startswith("Some details are missing or not valid")
+
+
 FAILED = ToolOutcome(
     status=Status.FAILED, message="That could not be done right now.", data={}, hand_off=False
 )
@@ -278,7 +288,7 @@ async def test_no_patient_argument(
         (MESSAGE, {**message("hello", True), "dob": "1972-11-08"}),
     ]
     for name, arguments in attempts:
-        assert await call(registry, deps, state, name, arguments) == REFUSED, name
+        assert not_valid(await call(registry, deps, state, name, arguments)), name
     assert rows(owner_engine, REQUESTS) == []
     assert rows(owner_engine, MESSAGES) == []
 
@@ -474,8 +484,8 @@ async def test_writes_need_confirmation(
     # Only a real true confirms; text or a number is refused.
     for value in ("true", "yes", 1):
         for name, arguments in ((REFILL, refill("lisinopril")), (MESSAGE, message(note))):
-            assert await call(registry, deps, state, name, {**arguments, "confirmed": value}) == (
-                REFUSED
+            assert not_valid(
+                await call(registry, deps, state, name, {**arguments, "confirmed": value})
             ), (name, value)
     assert rows(owner_engine, REQUESTS) == []
     assert rows(owner_engine, MESSAGES) == []
@@ -792,7 +802,7 @@ async def test_message_bounds(
     for body in (too_long, grows, "", "   ", "\n\t", *control):
         for confirmed in (None, True):
             outcome = await call(registry, deps, state, MESSAGE, message(body, confirmed))
-            assert outcome == REFUSED, repr(body)
+            assert not_valid(outcome), repr(body)
             assert MARKER not in outcome.model_dump_json()
     assert MARKER not in caplog.text
     assert rows(owner_engine, MESSAGES) == []

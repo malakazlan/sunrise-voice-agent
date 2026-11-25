@@ -98,7 +98,7 @@ from app.agent.tool_registry import (
 from app.agent.tools import call_tool, hand_off, offers_a_message, submit_claim
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.guard.input import GuardAction, guard_input
-from app.guard.mask import digits_given, mask_ssns
+from app.guard.mask import digits_given, mask_ssns, single_digits_alone
 from app.guard.output import GuardedReply, OutputRule, guard_reply
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,18 @@ PHONE_DIGITS = 10
 PHONE_DIGITS_MOST = 11
 SSN_DIGITS = 9
 SWALLOWED_TURN = "(turn withheld)"
+# What the model is told, in place of the digits it is never given, once code has checked them:
+# without it the model sees its question and then the scripted line with no answer between,
+# and may ask for the digits again.
+VERIFIED_NOTE = (
+    "(The caller said the digits. The clinic's system checked them: the caller is verified."
+    " Do not ask for them again.)"
+)
+NOT_VERIFIED_NOTE = (
+    "(The caller said the digits. The clinic's system checked them: no match, the caller is"
+    " not verified. If the caller gives a name and a date of birth again, call"
+    " verify_identity again: the system counts the tries, not you.)"
+)
 EMERGENCY_TURN = "(emergency turn withheld)"
 
 # What the model is told about a tool call that ended its turn with a scripted line, and about
@@ -351,8 +363,12 @@ class CallAgent:
         return self._state.phase is Phase.BOOKING or not self._state.office_open
 
     def _digits_note(self, text: str) -> str | None:
-        """For digits the model can read: what code read of them, and how many. They are the
-        caller's own, which a reply may read back."""
+        """For a verified caller's digits, which the model can read: what code read of them,
+        and how many. They are the caller's own, which a reply may read back. A caller who
+        is not verified gets no note: what the mask leaves of a number is not digits they
+        gave."""
+        if not self._state.verified:
+            return None
         digits = digits_given(text, DIGITS_NOTED)
         self._own_digits += digits
         if len(digits) < DIGITS_NOTED:
@@ -369,10 +385,13 @@ class CallAgent:
         digits than a number has are not one: none is kept. Nor are nine hidden digits as a
         turn ends: they read as an SSN said in pieces, which one more digit must never turn
         into a number the model is given. A turn that says no digit ends the number: the
-        pieces are the caller's turns one after another."""
+        pieces are the caller's turns one after another. A piece is three digits or more, or
+        fewer said alone while a number is being given: "the first one" is no piece."""
         piece = digits_given(mask_ssns(said), 1)
-        if not piece:
-            # The caller moved on: what comes next is another number.
+        going_on = bool(self._number) and bool(single_digits_alone(said))
+        if len(piece) < DIGITS_NOTED and not (piece and going_on):
+            # The caller moved on, or said a word that happens to be a digit ("the first
+            # one"): what comes next is another number.
             self._number = ""
             return None
         readable = digits_given(text, 1) == piece
@@ -382,14 +401,14 @@ class CallAgent:
         if len(kept) > PHONE_DIGITS_MOST or (not readable and len(kept) == SSN_DIGITS):
             self._number = ""
             hidden = "" if readable else ", not shown"
-            return f"digits heard{hidden}: {len(kept)}; a telephone number has ten"
+            return f"digits heard{hidden}: {len(kept)}"
         if readable:
             self._own_digits += piece
         if len(kept) < PHONE_DIGITS:
             self._number = kept
             if readable:
-                return f"digits heard so far: {kept} ({len(kept)}); a telephone number has ten"
-            return f"digits heard so far, not shown: {len(kept)}; a telephone number has ten"
+                return f"digits heard so far: {kept} ({len(kept)})"
+            return f"digits heard so far, not shown: {len(kept)}"
         self._number = ""
         if not readable:
             self._own_digits += kept
@@ -482,6 +501,9 @@ class CallAgent:
         if decision.submit:
             self._state, outcome = await submit_claim(self._state, self._deps)
             self._hand_off = self._hand_off or outcome.hand_off
+            # For the model alone, before the line code says about it.
+            note = VERIFIED_NOTE if self._state.verified else NOT_VERIFIED_NOTE
+            self._messages.append({"role": "user", "content": note})
             self._line_for(outcome)
         elif decision.script is not None:
             self.say(decision.script)
@@ -687,12 +709,20 @@ class CallAgent:
         """Each tool through `call_tool`, one at a time, with its result for the model. The
         first outcome that carries a scripted line ends the turn and is returned; tools asked
         for after it do not run. A message an outcome returns for the caller to confirm is
-        added to `read_back`."""
+        added to `read_back`. A call the reply repeats, the same tool with the same arguments,
+        runs once: the second is answered as the first was, not refused for what the first
+        already did (a model told "not available" tells the caller it cannot help)."""
         results: list[dict[str, Any]] = []
         scripted: ToolOutcome | None = None
+        answered: dict[str, tuple[dict[str, Any], bool]] = {}
         for call in tool_calls:
             if scripted is not None:
                 results.append(_result(call, NOT_RUN, error=True))
+                continue
+            asked = json.dumps([call.name, call.arguments], sort_keys=True, default=str)
+            if asked in answered:
+                content, error = answered[asked]
+                results.append(_result(call, content, error=error))
                 continue
             refusals = self._state.tool_refusals
             self._state, outcome = await call_tool(
@@ -718,6 +748,7 @@ class CallAgent:
                 "message": outcome.message,
                 "data": outcome.data,
             }
+            answered[asked] = (content, outcome.status is not Status.DONE)
             results.append(_result(call, content, error=outcome.status is not Status.DONE))
         self._append({"role": "user", "content": results})
         return scripted
