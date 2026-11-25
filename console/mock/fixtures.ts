@@ -324,12 +324,13 @@ export const QUEUE: QueueItem[] = [
 ];
 
 // What "Show callback details" answers for each callback row: the name and the number as the
-// caller gave them, oldest first (a corrected number is an entry of its own). Made up.
+// caller gave them, oldest first (a corrected number is an entry of its own). Made up, in the
+// 555-01xx range kept for fiction; one is not ten digits, to show it is left as sent.
 export const CALLBACK_DETAILS: Record<number, { name: string | null; callback_number: string }[]> = {
-  91: [{ name: "Pat Doe", callback_number: "555 010 3344" }],
+  91: [{ name: "Pat Doe", callback_number: "5550103344" }],
   90: [
-    { name: null, callback_number: "555 010 7788" },
-    { name: "Sam Roe", callback_number: "555 010 9021" },
+    { name: null, callback_number: "5550107788" },
+    { name: "Sam Roe", callback_number: "+1 555 010 9021" },
   ],
 };
 

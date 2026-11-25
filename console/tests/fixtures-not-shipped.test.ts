@@ -10,7 +10,7 @@ const MARKERS = [
   "csrf-fixture",
   "mock-password",
   "Metformin 500 mg at Walgreens Oak Ave",
-  "555 010 9021", // a made-up callback number the mock reveals
+  "5550107788", // a made-up callback number the mock reveals
   "mock/fixtures",
   "mock/server",
   "MOCK_SCENARIO",

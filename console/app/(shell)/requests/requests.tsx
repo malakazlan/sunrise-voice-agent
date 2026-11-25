@@ -12,7 +12,7 @@ import {
   Pill,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { CallLink } from "@/components/call-link";
 import { useClinic } from "@/components/clinic";
@@ -34,7 +34,7 @@ import {
   type QueueState,
   type RequestType,
 } from "@/lib/api/schemas";
-import { clinicDateTime, plural } from "@/lib/format";
+import { clinicDateTime, phoneForReading, plural } from "@/lib/format";
 import { REQUEST_TYPE_LABEL } from "@/lib/labels";
 
 type Filter = RequestType | "all";
@@ -77,6 +77,30 @@ function Summary({ request }: { request: QueueItem }) {
   );
 }
 
+// A row's two places focus can be sent to: its mark ("Mark handled", "Marking…" or the handled
+// text) and its callback details (the button, "Showing…" or the details).
+type Slot = "mark" | "reveal";
+
+interface FocusRequest {
+  id: number;
+  slot: Slot;
+}
+
+function slotName(slot: Slot, id: number): string {
+  return `${slot}-${id}`;
+}
+
+// Whether focus is on what fills that slot now (or nowhere): then it follows when the slot's
+// content is replaced, as it would otherwise be lost.
+function focusIn(slot: Slot, id: number): boolean {
+  const active = document.activeElement;
+  return (
+    active === null ||
+    active === document.body ||
+    active.closest(`[data-focus-slot="${slotName(slot, id)}"]`) !== null
+  );
+}
+
 // One row's state, as the page holds it: its handled mark (from the list or the API's answer to
 // "Mark handled"), whether a write for it is on its way, what went wrong with the last one, and,
 // for at most one row at a time, the callback details the API showed.
@@ -86,9 +110,13 @@ interface RowState {
   revealing: boolean;
   revealed: CallbackDetails | null;
   failure: string | null;
+  focus: FocusRequest | null;
 }
 
-// What staff can do with a request, written once for the stacked rows and the table.
+const pending = "inline-flex h-8 items-center px-2.5 text-sm text-muted-foreground outline-none";
+
+// What staff can do with a request, written once for the stacked rows and the table (one of the
+// two is hidden by the layout; focus sent to a hidden one goes nowhere).
 function RequestActions({
   request,
   row,
@@ -106,10 +134,31 @@ function RequestActions({
   onReveal: () => void;
   onHide: () => void;
 }) {
+  const markSlot = useRef<HTMLElement | null>(null);
+  const revealSlot = useRef<HTMLElement | null>(null);
+  const { focus } = row;
+  useEffect(() => {
+    if (focus === null) return;
+    (focus.slot === "mark" ? markSlot : revealSlot).current?.focus();
+  }, [focus]);
+  const intoMark = (element: HTMLElement | null) => {
+    markSlot.current = element;
+  };
+  const intoReveal = (element: HTMLElement | null) => {
+    revealSlot.current = element;
+  };
+  const mark = slotName("mark", request.id);
+  const reveal = slotName("reveal", request.id);
+
   return (
     <div className={className} data-request={request.id}>
       {row.mark ? (
-        <p className="inline-flex items-center gap-1.5 text-sm">
+        <p
+          ref={intoMark}
+          tabIndex={-1}
+          data-focus-slot={mark}
+          className="inline-flex items-center gap-1.5 text-sm outline-none"
+        >
           <StatusPill tone="good" icon={Check}>
             Handled
           </StatusPill>
@@ -117,22 +166,33 @@ function RequestActions({
             by {row.mark.by} at {clinicDateTime(row.mark.at, zone)}
           </span>
         </p>
+      ) : row.marking ? (
+        <span ref={intoMark} tabIndex={-1} data-focus-slot={mark} className={pending}>
+          Marking…
+        </span>
       ) : (
-        <Button variant="outline" size="sm" disabled={row.marking} onClick={onMark}>
-          {row.marking ? "Marking…" : "Mark handled"}
+        <Button ref={intoMark} data-focus-slot={mark} variant="outline" size="sm" onClick={onMark}>
+          Mark handled
         </Button>
       )}
       {request.callbacks.length > 0 ? (
         row.revealed ? (
+          // Keyed apart from the button's wrapper, so hiding them replaces the element that had
+          // focus instead of reusing it.
           <div
-            className="w-full max-w-xs rounded-md border border-primary/30 bg-secondary/60 px-3 py-2 text-left text-sm"
-            aria-live="polite"
+            key="details"
+            ref={intoReveal}
+            tabIndex={-1}
+            role="group"
+            aria-label="Callback details"
+            data-focus-slot={reveal}
+            className="w-full max-w-xs rounded-md border border-primary/30 bg-secondary/60 px-3 py-2 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ul className="space-y-1">
               {row.revealed.map((entry, index) => (
                 <li key={index}>
                   <span className="block font-medium">{entry.name ?? "No name given"}</span>
-                  <span className="block font-mono text-xs">{entry.callback_number}</span>
+                  <span className="block font-mono text-xs">{phoneForReading(entry.callback_number)}</span>
                 </li>
               ))}
             </ul>
@@ -145,11 +205,17 @@ function RequestActions({
             </div>
           </div>
         ) : (
-          <div className="flex flex-col gap-0.5 sm:items-end">
-            <Button variant="ghost" size="sm" disabled={row.revealing} onClick={onReveal}>
-              <Eye aria-hidden />
-              {row.revealing ? "Showing…" : "Show callback details"}
-            </Button>
+          <div key="ask" className="flex flex-col gap-0.5 sm:items-end">
+            {row.revealing ? (
+              <span ref={intoReveal} tabIndex={-1} data-focus-slot={reveal} className={pending}>
+                Showing…
+              </span>
+            ) : (
+              <Button ref={intoReveal} data-focus-slot={reveal} variant="ghost" size="sm" onClick={onReveal}>
+                <Eye aria-hidden />
+                Show callback details
+              </Button>
+            )}
             <span className="text-xs text-muted-foreground">Showing this is recorded in the audit log.</span>
           </div>
         )
@@ -180,25 +246,51 @@ export function RequestsView() {
   const markHandled = useMarkHandled();
 
   const [marks, setMarks] = useState<Record<number, HandledMark>>({});
+  // The rows whose "Mark handled" is on its way, each until its own answer comes.
+  const [marking, setMarking] = useState<ReadonlySet<number>>(new Set());
   const [failures, setFailures] = useState<Record<number, string>>({});
   const [confirming, setConfirming] = useState<number | null>(null);
-  const [revealing, setRevealing] = useState<number | null>(null);
+  // The rows whose details were asked for and not answered yet.
+  const [revealing, setRevealing] = useState<ReadonlySet<number>>(new Set());
   const [revealed, setRevealed] = useState<Revealed | null>(null);
+  const [focus, setFocus] = useState<FocusRequest | null>(null);
+  // Read by assistive technology; it says only that details were shown or hidden.
+  const [announcement, setAnnouncement] = useState("");
+  // The one reveal whose answer is still wanted: asking for another row's details or a new list
+  // makes any answer on its way unwanted (leaving the page drops it with the page's state).
+  const wanted = useRef(0);
 
   // Shown details belong to the list they were shown over; when the list is read again, or
   // another one is shown, they go.
   const list = `${filter}|${state}|${queue.dataUpdatedAt}`;
   if (revealed !== null && revealed.list !== list) {
     setRevealed(null);
+    setAnnouncement("Callback details hidden");
   }
+  useEffect(() => {
+    wanted.current += 1;
+  }, [list]);
 
-  // And they go after REVEAL_SECONDS in any case.
+  const hide = (id: number, refocus: boolean) => {
+    setRevealed(null);
+    setAnnouncement("Callback details hidden");
+    if (refocus) setFocus({ id, slot: "reveal" });
+  };
+
+  // And they go after REVEAL_SECONDS in any case; focus inside them goes back to the row's button.
   useEffect(() => {
     if (revealed === null) return;
-    const timer = setTimeout(() => setRevealed(null), REVEAL_SECONDS * 1000);
+    const { id } = revealed;
+    const timer = setTimeout(() => {
+      const refocus = focusIn("reveal", id);
+      setRevealed(null);
+      setAnnouncement("Callback details hidden");
+      if (refocus) setFocus({ id, slot: "reveal" });
+    }, REVEAL_SECONDS * 1000);
     return () => clearTimeout(timer);
   }, [revealed]);
 
+  const without = (set: ReadonlySet<number>, id: number) => new Set([...set].filter((each) => each !== id));
   const fail = (id: number, message: string) => setFailures((current) => ({ ...current, [id]: message }));
   const clearFailure = (id: number) =>
     setFailures((current) => {
@@ -207,40 +299,56 @@ export function RequestsView() {
       return rest;
     });
 
-  const confirmMark = () => {
+  const confirmMark = async () => {
     if (confirming === null) return;
     const id = confirming;
     setConfirming(null);
     clearFailure(id);
-    markHandled.mutate(id, {
+    setMarking((current) => new Set(current).add(id));
+    setFocus({ id, slot: "mark" });
+    // Each row's write is awaited on its own, so two on their way at once each get their answer.
+    try {
+      const { answer } = await markHandled.mutateAsync(id);
       // The row changes only once the API has answered; a mark it already had reads the same.
-      onSuccess: ({ answer }) => setMarks((current) => ({ ...current, [id]: answer.handled })),
-      onError: (error) => fail(id, writeFailure(error, "Could not mark it handled. Nothing changed.")),
-    });
+      setMarks((current) => ({ ...current, [id]: answer.handled }));
+    } catch (error) {
+      fail(id, writeFailure(error, "Could not mark it handled. Nothing changed."));
+    }
+    const refocus = focusIn("mark", id);
+    setMarking((current) => without(current, id));
+    if (refocus) setFocus({ id, slot: "mark" });
   };
 
   const reveal = async (id: number) => {
+    const ask = ++wanted.current;
     clearFailure(id);
-    setRevealing(id);
+    if (revealed !== null) hide(revealed.id, false);
+    setRevealing((current) => new Set(current).add(id));
+    setFocus({ id, slot: "reveal" });
     const shownOver = list;
     try {
       // A plain call through the fetch wrapper, not a query or a mutation: the answer goes into
-      // this page's state and nowhere else.
+      // this page's state and nowhere else, and only while it is still wanted.
       const { answer } = await api.post(`/queue/requests/${id}/callback`, callbackDetailsSchema, {});
-      setRevealed({ id, callbacks: answer.callbacks, list: shownOver });
+      if (ask === wanted.current) {
+        setRevealed({ id, callbacks: answer.callbacks, list: shownOver });
+        setAnnouncement("Callback details shown");
+      }
     } catch (error) {
       fail(id, writeFailure(error, "Could not show the details."));
-    } finally {
-      setRevealing(null);
     }
+    const refocus = focusIn("reveal", id);
+    setRevealing((current) => without(current, id));
+    if (refocus) setFocus({ id, slot: "reveal" });
   };
 
   const rowState = (request: QueueItem): RowState => ({
     mark: marks[request.id] ?? request.handled,
-    marking: markHandled.isPending && markHandled.variables === request.id,
-    revealing: revealing === request.id,
+    marking: marking.has(request.id),
+    revealing: revealing.has(request.id),
     revealed: revealed !== null && revealed.id === request.id ? revealed.callbacks : null,
     failure: failures[request.id] ?? null,
+    focus: focus !== null && focus.id === request.id ? focus : null,
   });
 
   const actions = (request: QueueItem, className: string) => (
@@ -251,7 +359,7 @@ export function RequestsView() {
       className={className}
       onMark={() => setConfirming(request.id)}
       onReveal={() => void reveal(request.id)}
-      onHide={() => setRevealed(null)}
+      onHide={() => hide(request.id, true)}
     />
   );
 
@@ -384,13 +492,21 @@ export function RequestsView() {
       <ConfirmDialog
         open={confirming !== null}
         onOpenChange={(open) => {
-          if (!open) setConfirming(null);
+          if (!open && confirming !== null) {
+            // The row's mark takes focus back: its button, or what replaces it once confirmed.
+            setFocus({ id: confirming, slot: "mark" });
+            setConfirming(null);
+          }
         }}
         title="Mark this request as handled?"
         description="This cannot be undone here. The mark, with your name and the time, is recorded in the audit log."
         action="Mark handled"
-        onConfirm={confirmMark}
+        onConfirm={() => void confirmMark()}
+        returnFocus={false}
       />
+      <p id="reveal-status" role="status" aria-live="polite" className="sr-only">
+        {announcement}
+      </p>
     </>
   );
 }

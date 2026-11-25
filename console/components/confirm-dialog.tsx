@@ -14,10 +14,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { ApiError } from "@/lib/api/client";
 
-// The one confirmation every write goes through: it says what will happen in plain words and
-// names the action on its button. Nothing is sent until that button is pressed; "Cancel" (or
-// Escape, or a click outside) sends nothing. Focus starts on "Cancel", never on the action, so a
-// stray Enter does not confirm, and a destructive action is drawn as one.
+// The one confirmation every write that changes something goes through: it says what will happen
+// in plain words and names the action on its button. Nothing is sent until that button is
+// pressed; "Cancel" or Escape sends nothing (a click outside does nothing: it is an alert dialog).
+// Focus starts on "Cancel", never on the action, so a stray Enter does not confirm, and a
+// destructive action is drawn as one. On closing, focus goes back where it was, unless the page
+// says (`returnFocus={false}`) that it moves focus itself.
 export function ConfirmDialog({
   open,
   onOpenChange,
@@ -26,6 +28,7 @@ export function ConfirmDialog({
   action,
   destructive = false,
   onConfirm,
+  returnFocus = true,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -34,10 +37,16 @@ export function ConfirmDialog({
   action: string;
   destructive?: boolean;
   onConfirm: () => void;
+  returnFocus?: boolean;
 }) {
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className="data-[size=default]:max-w-md data-[size=default]:sm:max-w-md">
+      <AlertDialogContent
+        className="data-[size=default]:max-w-md data-[size=default]:sm:max-w-md"
+        onCloseAutoFocus={(event) => {
+          if (!returnFocus) event.preventDefault();
+        }}
+      >
         <AlertDialogHeader>
           <AlertDialogTitle className="text-lg font-semibold">{title}</AlertDialogTitle>
           <AlertDialogDescription className="text-[0.95rem] text-foreground/80">
