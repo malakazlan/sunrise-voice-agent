@@ -572,6 +572,71 @@ async def test_booking_is_one_transaction(
     )
 
 
+# --- the confirmation email, simulated ----------------------------------------------------------
+
+BY_ID = text("SELECT id FROM appointments ORDER BY id")
+
+
+def simulated_emails(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("email_simulated")
+    ]
+
+
+async def test_confirmation_email_is_simulated_once_the_booking_is_saved(
+    registry: Registry,
+    deps: Deps,
+    seeded: None,
+    owner_engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    first = slot_id(owner_engine, "Dr. Patel", at(11, 25, 9, 30))
+    second = slot_id(owner_engine, "Dr. Lee", at(11, 25, 10))
+    state, _ = await done(registry, deps, sarah(), FIND)
+    newcomer, _ = await done(registry, deps, await new_patient(registry, deps), FIND)
+
+    # A preview saves nothing, and a booking that fails saves nothing: no email for either.
+    await done(registry, deps, newcomer, BOOK_NEW, booking_args(second, False))
+    execute(
+        owner_engine,
+        text(
+            "ALTER TABLE requests ADD CONSTRAINT ck_requests_test_refuses CHECK (type <> 'booking')"
+        ),
+    )
+    assert (await run(registry, deps, newcomer, BOOK_NEW, booking_args(second, True)))[1] == FAILED
+    execute(owner_engine, text("ALTER TABLE requests DROP CONSTRAINT ck_requests_test_refuses"))
+    assert simulated_emails(caplog) == []
+
+    # A patient with no email on file is confirmed by phone: no email.
+    await done(registry, deps, state, BOOK, book(first, True))
+    assert simulated_emails(caplog) == []
+    assert rows(owner_engine, REQUESTS)[-1][3].endswith("; confirm by phone")
+
+    # A new patient gave an email: once the booking is saved, one line, naming the appointment
+    # and the call and nothing of the caller.
+    await done(registry, deps, newcomer, BOOK_NEW, booking_args(second, True))
+    [*_, (appointment,)] = rows(owner_engine, BY_ID)
+    assert simulated_emails(caplog) == [
+        f"email_simulated kind=booking_confirmation appointment_id={appointment}"
+        f" call_id={newcomer.call_id}"
+    ]
+    assert rows(owner_engine, REQUESTS)[-1][3].endswith("; confirmation email simulated")
+    assert "@" not in caplog.text
+
+    # A patient with an email on file gets one too.
+    execute(owner_engine, text("UPDATE patients SET email = 'p001@example.org' WHERE id = 'P001'"))
+    third = next(slot for slot in state.offered_slots if slot not in (first, second))
+    await done(registry, deps, state, BOOK, book(third, True))
+    [*_, (latest,)] = rows(owner_engine, BY_ID)
+    assert simulated_emails(caplog)[1:] == [
+        f"email_simulated kind=booking_confirmation appointment_id={latest} call_id={state.call_id}"
+    ]
+    assert "@" not in caplog.text
+
+
 # --- R5: the slot row is kept ----------------------------------------------------------------
 
 
@@ -1004,7 +1069,7 @@ async def test_draft_stays_hidden(
     [(_, _, request_type, summary)] = rows(owner_engine, REQUESTS)
     assert (request_type, summary) == (
         "booking",
-        "Dr. Patel on Wednesday, November 25, 2026 at 9:30 AM; confirm by email",
+        "Dr. Patel on Wednesday, November 25, 2026 at 9:30 AM; confirmation email simulated",
     )
     texts.append(summary)
 

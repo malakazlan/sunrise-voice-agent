@@ -198,7 +198,9 @@ class ToolResult(BaseModel):
     """What a handler returns: data for its caller, the transition it asks for, a line for code
     to speak and the values it is spoken with, the action of its event when the tool declares
     more than one, the reason its event records, and, for a tool whose resource type is
-    neither `tool` nor `patient`, the id of the record it acted on."""
+    neither `tool` nor `patient`, the id of the record it acted on. `emailed_appointment` is
+    the appointment a booking's confirmation email is for: dispatch simulates it, by a log
+    line, once the booking is committed."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
@@ -217,6 +219,7 @@ class ToolResult(BaseModel):
     script_values: dict[str, str] = {}
     audit_action: Action | None = None
     audit_reason: Reason | None = None
+    emailed_appointment: int | None = None
     resource_id: str | None = None
 
 
@@ -704,6 +707,15 @@ class Registry:
             await self._record(failed, Action.TOOL_FAILED, Outcome.FAILURE, tool.name, deps)
             return failed, _outcome(Status.FAILED, failed)
         logger.info("tool_called tool=%s call_id=%s", tool.name, state.call_id)
+        if result.emailed_appointment is not None:
+            # The confirmation email, simulated: this line is the email. It names the
+            # appointment and the call, never the address or the patient, and is written only
+            # now that the booking is saved.
+            logger.info(
+                "email_simulated kind=booking_confirmation appointment_id=%d call_id=%s",
+                result.emailed_appointment,
+                state.call_id,
+            )
         return after, _outcome(Status.DONE, after, result)
 
     async def _refuse(

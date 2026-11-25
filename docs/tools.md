@@ -225,9 +225,11 @@ for a verified patient and for a first-time caller. All need the office open.
 - The runtime role may insert patients and appointments but not change or delete them, and may
   change only `is_available` on a slot.
 - Limits:
-  - No email is sent. The request's summary tells staff to `confirm by email` when an email is
-    on file or was given, `confirm by phone` otherwise. The `booking_instructions` line still
-    says a confirmation will come by email, as the task's text has it.
+  - The confirmation email is simulated, not sent. When an email is on file or was given, the
+    booking's result names the appointment and dispatch writes, once the booking is committed,
+    the log line `email_simulated kind=booking_confirmation appointment_id=… call_id=…` (no
+    address, no name); the request's summary then reads `confirmation email simulated`. With no
+    email the summary reads `confirm by phone` and no line is written.
   - The last word of the name is stored as the last name, the rest as the first name; a
     suffix (`Jr`) becomes the last name.
   - A name that is a single word cannot be collected.
