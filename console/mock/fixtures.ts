@@ -7,6 +7,7 @@ import type {
   AuditEvent,
   Call,
   CallDetail,
+  Config,
   Guardrails,
   LatencyRow,
   LiveCall,
@@ -32,6 +33,27 @@ export function session(): Session {
     expires_in: 1800,
     office_open: true,
     time_zone: CLINIC_TIME_ZONE,
+    calls: "on",
+  };
+}
+
+// The config as the API answers it before anyone changed anything.
+export function config(): Config {
+  return {
+    config: {
+      calls: { value: "on", changed_by: null, changed_at: null },
+      office: { value: "schedule", changed_by: null, changed_at: null },
+    },
+    applies_within_seconds: 5,
+    facts: {
+      environment: "dev",
+      model: "claude-haiku-5-5",
+      speech_to_text: "deepgram",
+      text_to_speech: "elevenlabs",
+      max_concurrent_calls: 3,
+      max_call_seconds: 600,
+      test_clock: false,
+    },
   };
 }
 
@@ -231,6 +253,7 @@ export const QUEUE: QueueItem[] = [
     patient_id: "P003",
     callbacks: [],
     after_hours: false,
+    handled: null,
   },
   {
     id: 95,
@@ -241,6 +264,7 @@ export const QUEUE: QueueItem[] = [
     patient_id: "P001",
     callbacks: [],
     after_hours: false,
+    handled: null,
   },
   {
     id: 94,
@@ -251,6 +275,7 @@ export const QUEUE: QueueItem[] = [
     patient_id: "P006",
     callbacks: [],
     after_hours: false,
+    handled: null,
   },
   {
     id: 93,
@@ -261,6 +286,7 @@ export const QUEUE: QueueItem[] = [
     patient_id: null,
     callbacks: [],
     after_hours: false,
+    handled: { by: "admin", at: "2026-11-25T14:50:31+00:00" },
   },
   {
     id: 92,
@@ -271,6 +297,7 @@ export const QUEUE: QueueItem[] = [
     patient_id: "P002",
     callbacks: [],
     after_hours: false,
+    handled: null,
   },
   {
     id: 91,
@@ -281,8 +308,30 @@ export const QUEUE: QueueItem[] = [
     patient_id: null,
     callbacks: ["***-***-3344"],
     after_hours: true,
+    handled: null,
+  },
+  {
+    id: 90,
+    created_at: "2026-11-24T23:41:09+00:00",
+    call_id: fixtureCallId("6a3e1f27"),
+    type: "callback",
+    summary: "Asks for a call back about a bill.",
+    patient_id: null,
+    callbacks: ["***-***-7788", "***-***-9021"],
+    after_hours: true,
+    handled: null,
   },
 ];
+
+// What "Show callback details" answers for each callback row: the name and the number as the
+// caller gave them, oldest first (a corrected number is an entry of its own). Made up.
+export const CALLBACK_DETAILS: Record<number, { name: string | null; callback_number: string }[]> = {
+  91: [{ name: "Pat Doe", callback_number: "555 010 3344" }],
+  90: [
+    { name: null, callback_number: "555 010 7788" },
+    { name: "Sam Roe", callback_number: "555 010 9021" },
+  ],
+};
 
 export const APPOINTMENTS: Appointment[] = [
   ["2026-11-30T09:30:00-05:00", "Dr. Patel", "P006", true, "New patient visit", fixtureCallId("a02b77d1")],

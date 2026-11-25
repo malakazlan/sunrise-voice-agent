@@ -15,7 +15,10 @@ import {
   auditEventsSchema,
   callDetailSchema,
   callsSchema,
+  configChangeSchema,
+  configSchema,
   guardrailsSchema,
+  handledAnswerSchema,
   isCallId,
   metricsSchema,
   queueSchema,
@@ -23,8 +26,11 @@ import {
   slotsSchema,
   turnsSchema,
   verificationSchema,
+  type CallsValue,
   type EndReason,
   type LiveCall,
+  type OfficeValue,
+  type QueueState,
   type RequestType,
 } from "@/lib/api/schemas";
 import { openLiveStream, type LiveStreamState } from "@/lib/api/stream";
@@ -134,15 +140,54 @@ export function useCallTurns(callId: string) {
   });
 }
 
-export function useQueue(type: RequestType | undefined) {
+export function useQueue(type: RequestType | undefined, state: QueueState) {
   const api = useApi();
   return useInfiniteQuery({
-    queryKey: ["queue", type ?? "all"],
+    queryKey: ["queue", type ?? "all", state],
     queryFn: async ({ pageParam, signal }) =>
       // The queue's pages are the API's own size (PAGE_SIZE); it takes no limit.
-      (await api.get("/queue", queueSchema, { before: pageParam, type }, { signal })).requests,
+      (await api.get("/queue", queueSchema, { before: pageParam, type, state }, { signal })).requests,
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (page) => nextBefore(page, (request) => request.id),
+  });
+}
+
+// The writes. None is retried by the query library, whatever its defaults: a write that failed
+// is the user's to try again. Their answers hold nothing sensitive; the one that does (a
+// callback's details) never goes through the query library at all (app/(shell)/requests).
+
+export function useMarkHandled() {
+  const api = useApi();
+  return useMutation({
+    mutationFn: (requestId: number) =>
+      api.post(`/queue/requests/${requestId}/handled`, handledAnswerSchema, {}),
+    retry: false,
+  });
+}
+
+export function useConfig() {
+  const api = useApi();
+  return useQuery({
+    queryKey: ["config"],
+    queryFn: async ({ signal }) => api.get("/config", configSchema, undefined, { signal }),
+  });
+}
+
+export type ConfigRequest = { key: "calls"; value: CallsValue } | { key: "office"; value: OfficeValue };
+
+export function useChangeConfig() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    // Only ever called from the confirmation dialog's action: the API requires `confirm: true`.
+    mutationFn: (change: ConfigRequest) =>
+      api.post("/config", configChangeSchema, { ...change, confirm: true }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["config"] });
+      // The session carries the calls switch the banner reads.
+      void queryClient.invalidateQueries({ queryKey: ["session"] });
+    },
   });
 }
 

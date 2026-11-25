@@ -4,12 +4,14 @@ import {
   CalendarDays,
   ChartColumn,
   CircleCheck,
+  CircleQuestionMark,
   History,
   Inbox,
   LogOut,
   Menu,
   Moon,
   Phone,
+  PhoneOff,
   ShieldCheck,
   ShieldHalf,
   SlidersHorizontal,
@@ -27,6 +29,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSession, useSignOut } from "@/lib/api/hooks";
+import type { Session } from "@/lib/api/schemas";
 import { zoneName } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -34,7 +37,6 @@ interface NavItem {
   href: string;
   label: string;
   icon: LucideIcon;
-  soon?: boolean;
 }
 
 const NAV: { group: string; items: NavItem[] }[] = [
@@ -62,7 +64,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
   },
   {
     group: "Settings",
-    items: [{ href: "/config", label: "Config", icon: SlidersHorizontal, soon: true }],
+    items: [{ href: "/config", label: "Config", icon: SlidersHorizontal }],
   },
 ];
 
@@ -94,7 +96,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
             {group}
           </p>
           <ul className="flex flex-col gap-0.5">
-            {items.map(({ href, label, icon: Icon, soon }) => {
+            {items.map(({ href, label, icon: Icon }) => {
               const current = isCurrent(pathname, href);
               return (
                 <li key={href}>
@@ -110,11 +112,6 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
                   >
                     <Icon className="size-[1.1rem] shrink-0" aria-hidden />
                     <span className="flex-1">{label}</span>
-                    {soon ? (
-                      <span className="rounded-full px-2 py-px text-[0.7rem] text-sidebar-muted ring-1 ring-sidebar-muted/40">
-                        Soon
-                      </span>
-                    ) : null}
                   </Link>
                 </li>
               );
@@ -135,12 +132,47 @@ function AuditNote() {
   );
 }
 
-function TopBar({ menu, right }: { menu: ReactNode; right: ReactNode }) {
+function TopBar({ menu, right, banner }: { menu: ReactNode; right: ReactNode; banner: ReactNode }) {
   return (
-    <header className="sticky top-0 z-30 flex min-h-16 items-center gap-3 border-b bg-card/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-card/80 sm:px-6 lg:px-8">
-      {menu}
-      {right}
+    <header className="sticky top-0 z-30 border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
+      <div className="flex min-h-16 items-center gap-3 px-4 sm:px-6 lg:px-8">
+        {menu}
+        {right}
+      </div>
+      {banner}
     </header>
+  );
+}
+
+// On every page while the phone assistant is switched off, or while its settings could not be
+// read (the session says which; the shell reads it already, so no page asks the config itself).
+export function SettingsBanner({ calls }: { calls: Session["calls"] }) {
+  if (calls === "on") return null;
+  const off = calls === "off";
+  return (
+    <div
+      role="status"
+      className={cn(
+        "flex items-center gap-2 border-t px-4 py-2 text-sm font-medium sm:px-6 lg:px-8",
+        off
+          ? "border-destructive/25 bg-destructive/8 text-destructive"
+          : "border-border bg-muted text-muted-foreground",
+      )}
+    >
+      {off ? (
+        <PhoneOff className="size-4 shrink-0" aria-hidden />
+      ) : (
+        <CircleQuestionMark className="size-4 shrink-0" aria-hidden />
+      )}
+      <span className="flex-1">
+        {off
+          ? "The phone assistant is switched off. New calls are refused."
+          : "The assistant's settings could not be read just now."}
+      </span>
+      <Link href="/config" className="shrink-0 underline underline-offset-3">
+        Config
+      </Link>
+    </div>
   );
 }
 
@@ -247,6 +279,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             </Sheet>
           }
           right={<SignedInBar />}
+          banner={session.data === undefined ? null : <SettingsBanner calls={session.data.calls} />}
         />
         <main id="main" className="w-full max-w-[1400px] flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
           {content}

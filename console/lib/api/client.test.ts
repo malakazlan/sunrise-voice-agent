@@ -106,6 +106,7 @@ describe("the fetch wrapper", () => {
       expires_in: 1800,
       office_open: true,
       time_zone: "America/New_York",
+      calls: "on",
     };
     const { client, fetchMock } = setUp(async () =>
       fetchMock.mock.calls.length === 1 ? json(session) : new Response(null, { status: 204 }),
