@@ -1050,15 +1050,30 @@ def is_audit_append(node: ast.AST) -> bool:
     )
 
 
+def route_decorators(tree: ast.AST) -> set[int]:
+    """The `app.<method>` attributes that decorate a function: `@app.delete(...)` is a route."""
+    return {
+        id(decorator.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "app"
+    }
+
+
 def admin_write_uses(source: str) -> list[str]:
     tree = ast.parse(source)
     prose = docstring_ids(tree)
+    routes = route_decorators(tree)
     uses = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in WRITE_NAMES:
             uses.append(node.id)
         elif isinstance(node, ast.Attribute) and node.attr in WRITE_NAMES:
-            if not (isinstance(node.value, ast.Name) and node.value.id == "app"):
+            if id(node) not in routes:
                 uses.append(f".{node.attr}")
         elif isinstance(node, ast.alias) and node.name.split(".")[-1] in WRITE_NAMES:
             uses.append(f"import {node.name}")
@@ -1098,6 +1113,9 @@ def test_admin_is_read_only() -> None:
         "SQL = 'drop table requests'\n",
         "rows.append(row)\n",
         "self.audit.append(session, event, now=now)\n",
+        # Only a route decorator is a route: anything else named app.delete is not.
+        "await app.delete(row)\n",
+        "remove = app.delete\n",
     ):
         assert admin_write_uses(sample), sample
     assert not admin_write_uses(

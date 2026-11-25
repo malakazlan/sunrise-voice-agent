@@ -40,16 +40,15 @@ from starlette.types import ASGIApp
 
 from app.api.live import LiveStream, LiveStreams
 from app.api.reads import (
-    CALL_COLUMNS,
     DEFAULT_PAGE,
     MAX_ROW_ID,
     AuditPage,
     Page,
     call,
     call_detail,
+    calls,
     masked,
     messages,
-    newest,
     request_queue,
     requests,
 )
@@ -82,8 +81,11 @@ from app.guard.rate_limit import RateLimiter
 logger = logging.getLogger(__name__)
 
 PREFIX = "/admin/api"
-# The browser session's cookie, sent back to this API's paths only.
+# The browser session's cookie. Outside dev, over HTTPS, a __Host- cookie: Secure, Path=/ and
+# no Domain, so a sibling host of the site can neither plant nor overwrite it. In dev, over
+# plain http, where a __Host- cookie cannot be set, it is sent back to this API's paths only.
 COOKIE = "admin_session"
+HOST_COOKIE = "__Host-admin_session"
 # A Basic header for a 32-character user name and a long password is well under this. A longer
 # header is refused before it is decoded or hashed.
 MAX_AUTHORIZATION_LENGTH = 1024
@@ -122,6 +124,19 @@ def _a_request_type(value: str | None) -> str | None:
     if value is not None and value not in models.REQUEST_TYPES:
         raise ValueError("type is not a request type")
     return value
+
+
+class CallPage(Page):
+    """A page of calls, optionally of those that ended one known way."""
+
+    end_reason: str | None = None
+
+    @field_validator("end_reason")
+    @classmethod
+    def _known_reason(cls, value: str | None) -> str | None:
+        if value is not None and value not in models.CALL_END_REASONS:
+            raise ValueError("end_reason is not one a call ends for")
+        return value
 
 
 class RequestPage(Page):
@@ -283,6 +298,8 @@ class AdminAccess:
         self.user = settings.admin_user
         self.actor = f"{ADMIN_PREFIX}{settings.admin_user}"
         self.signed_in = SessionTable(clock=clock)
+        self.secure = settings.app_env != "dev"
+        self.cookie, self.cookie_path = (HOST_COOKIE, "/") if self.secure else (COOKIE, PREFIX)
         self._console_origin = settings.console_origin
         self._expected_user = hashlib.sha256(settings.admin_user.encode("utf-8")).digest()
         self._expected_password = hashlib.sha256(
@@ -305,8 +322,9 @@ class AdminAccess:
         return False
 
     def signs_in(self, address: str, credentials: tuple[bytes, bytes] | None) -> bool:
-        """Whether the user name and password are the admin's. Anything else, missing
-        credentials included, counts as a failure of the address and is logged by its count."""
+        """Whether the user name and password presented are the admin's. Anything else,
+        credentials that cannot be read included, counts as a failure of the address and is
+        logged by its count. A request that presents none is not asked here."""
         if credentials is not None and _credentials_match(
             *credentials, self._expected_user, self._expected_password
         ):
@@ -319,11 +337,14 @@ class AdminAccess:
         self, request: Request, *, touch: bool = True
     ) -> tuple[str, Session] | None:
         """The live session the request's cookie names, and its id; marked used unless `touch`
-        is false. None when there is none, and for a request from another origin than the
-        console's: its cookie is not honoured."""
-        if "origin" in request.headers and not from_console(request, self._console_origin):
+        is false. None when there is none, and for a request that does not come from the
+        console's origin: its cookie is not honoured. With CONSOLE_ORIGIN set the request must
+        name it; without, it names the API's own origin or none (a browser's same-origin
+        read)."""
+        bare = "origin" not in request.headers and self._console_origin is None
+        if not (bare or from_console(request, self._console_origin)):
             return None
-        session_id = request.cookies.get(COOKIE)
+        session_id = request.cookies.get(self.cookie)
         session = self.signed_in.find(session_id, touch=touch)
         if session_id is None or session is None:
             return None
@@ -454,18 +475,22 @@ def build_admin_app(
 ) -> ASGIApp:
     """The admin API. `clock` and `sleep` time the live stream; the sessions' clock is
     `access`'s."""
-    secure = settings.app_env != "dev"
     streams = LiveStreams()
 
     async def require_admin(request: Request) -> None:
-        """A browser session, or else HTTP Basic, as the read routes take them."""
+        """A browser session, or else HTTP Basic, as the read routes take them. Only
+        credentials presented count against the address: a request with none is refused and
+        not counted, so a page that makes a browser send such requests locks no one out."""
         if access.browser_session(request) is not None:
             return
+        header = request.headers.get("authorization")
+        if header is None:
+            raise _sign_in_required(request, basic=True)
         address = _address(request)
         # A limited address is refused before its credentials are looked at.
         if access.limited(address):
             raise _limited()
-        if access.signs_in(address, _supplied_credentials(request.headers.get("authorization"))):
+        if access.signs_in(address, _supplied_credentials(header)):
             return
         raise _sign_in_required(request, basic=True)
 
@@ -533,14 +558,19 @@ def build_admin_app(
         except Exception as error:
             logger.error("admin_sign_in_unaudited error=%s", type(error).__name__)
             raise _unavailable() from None
-        replaced = request.cookies.get(COOKIE)
+        replaced = request.cookies.get(access.cookie)
         if replaced:
             access.signed_in.close(replaced)
         session_id, session = access.signed_in.open(access.user)
         logger.info("admin_signed_in")
         response = JSONResponse(shown_session(session))
         response.set_cookie(
-            COOKIE, session_id, path=PREFIX, secure=secure, httponly=True, samesite="strict"
+            access.cookie,
+            session_id,
+            path=access.cookie_path,
+            secure=access.secure,
+            httponly=True,
+            samesite="strict",
         )
         return response
 
@@ -561,19 +591,22 @@ def build_admin_app(
         token_matches = tokens_match(request.headers.get(CSRF_HEADER), session.token)
         if not (token_matches and from_console(request, settings.console_origin)):
             raise _forbidden()
-        # The session ends whatever the audit log says; the answer says if it could not record.
+        # Signing out always signs out: the session ends whatever the audit log says, and an
+        # event it could not take is missing from it, which the log says by name.
         access.signed_in.close(session_id)
-        response = Response(status_code=status.HTTP_204_NO_CONTENT)
         try:
             await access.record(Action.ADMIN_SIGNED_OUT)
         except Exception as error:
             logger.error("admin_sign_out_unaudited error=%s", type(error).__name__)
-            response = JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"detail": "Service unavailable"},
-            )
         logger.info("admin_signed_out")
-        response.delete_cookie(COOKIE, path=PREFIX, secure=secure, httponly=True, samesite="strict")
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        response.delete_cookie(
+            access.cookie,
+            path=access.cookie_path,
+            secure=access.secure,
+            httponly=True,
+            samesite="strict",
+        )
         return response
 
     # Before /calls/{call_id}, which would take "live" for a call id. A session only, never
@@ -589,27 +622,29 @@ def build_admin_app(
         if stop is None:
             logger.warning("admin_stream_refused")
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many live streams")
-        try:
-            first = await read_and_audit(
-                Action.ADMIN_READ_LIVE_CALLS, ResourceType.CALL, live_calls
-            )
-        except BaseException:
-            streams.close(key, stop)
-            raise
 
         async def read() -> str:
             return live_json(await access.read_again(live_calls) or [])
 
+        # From the place taken to the answer returned, any failure gives the place back.
+        try:
+            first = await read_and_audit(
+                Action.ADMIN_READ_LIVE_CALLS, ResourceType.CALL, live_calls
+            )
+            stream = LiveStream(
+                live_json(first),
+                read=read,
+                signed_in=lambda: access.signed_in.find(session_id, touch=False) is not None,
+                stop=stop,
+                release=lambda: streams.close(key, stop),
+                clock=clock,
+                sleep=sleep,
+            )
+        except BaseException:
+            streams.close(key, stop)
+            raise
         logger.info("admin_stream_opened")
-        return LiveStream(
-            live_json(first),
-            read=read,
-            signed_in=lambda: access.signed_in.find(session_id, touch=False) is not None,
-            stop=stop,
-            release=lambda: streams.close(key, stop),
-            clock=clock,
-            sleep=sleep,
-        )
+        return stream
 
     reads = APIRouter(dependencies=[Depends(require_admin)])
 
@@ -642,13 +677,13 @@ def build_admin_app(
         return {"requests": [_json(row) for row in rows]}
 
     @reads.get("/calls")
-    async def read_calls(page: Annotated[Page, Query()]) -> dict[str, Any]:
+    async def read_calls(page: Annotated[CallPage, Query()]) -> dict[str, Any]:
         rows = await read_and_audit(
             Action.ADMIN_READ_CALLS,
             ResourceType.CALL,
-            lambda session: newest(session, CALL_COLUMNS, models.CallSession.id, page),
+            lambda session: calls(session, page, page.end_reason),
         )
-        return {"calls": [_masked(row) for row in rows]}
+        return {"calls": [_json(row) for row in rows]}
 
     # Before /calls/{call_id}, which would take "live" for a call id.
     @reads.get("/calls/live")

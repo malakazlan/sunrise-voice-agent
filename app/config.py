@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import re
 import sys
@@ -69,6 +70,8 @@ WEB_ORIGIN = re.compile(
     r"(?::(?P<port>[1-9][0-9]{0,4}))?"
 )
 MAX_PORT = 65535
+# The port a browser leaves out of the Origin it sends, for each scheme.
+DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 def _outside_dev(info: ValidationInfo) -> bool:
@@ -455,6 +458,10 @@ class Settings(DatabaseSettings):
             )
         if match["scheme"] == "http" and _outside_dev(info):
             raise ValueError("outside dev console_origin must be https")
+        if match["port"] is not None and int(match["port"]) == DEFAULT_PORTS[match["scheme"]]:
+            raise ValueError(
+                "console_origin must leave out its scheme's own port: a browser never sends it"
+            )
         return value
 
     @model_validator(mode="after")
@@ -514,8 +521,23 @@ class DeploymentSettings(Settings, StartupSettings):
     """Every setting of the deployment at once, as the start-up check reads them: the start-up
     steps' and the application's, checked by both classes' rules as the role that holds them
     all (main() sets it). Each long-running role holds only some of the secrets, so only here
-    are they all compared: the admin password with every other, the database passwords
-    included. Never the settings of a running application."""
+    are they all compared: every secret with every other, the database passwords included.
+    Never the settings of a running application."""
+
+    @model_validator(mode="after")
+    def _every_secret_is_its_own(self) -> "DeploymentSettings":
+        """No two secrets are the same: every SecretStr field, whatever its name, by the
+        SHA-256 of its value; a clash names both fields and never a value."""
+        seen: dict[bytes, str] = {}
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if not isinstance(value, SecretStr):
+                continue
+            digest = hashlib.sha256(value.get_secret_value().encode("utf-8")).digest()
+            if digest in seen:
+                raise ValueError(f"{name} must differ from {seen[digest]}")
+            seen[digest] = name
+        return self
 
 
 # Every variable of either class, so that each can leave the other's in the shared .env file.

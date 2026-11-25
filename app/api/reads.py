@@ -208,6 +208,16 @@ async def _names_hidden(
     return shown
 
 
+async def calls(session: AsyncSession, page: Page, end_reason: str | None) -> list[dict[str, Any]]:
+    """A page of the calls, newest id first, of those that ended for `end_reason` if one is
+    given; masked, and no transcript."""
+    if end_reason is not None and end_reason not in models.CALL_END_REASONS:
+        raise ValueError("end_reason is not one a call ends for")
+    conditions = [] if end_reason is None else [models.CallSession.end_reason == end_reason]
+    rows = await newest(session, CALL_COLUMNS, models.CallSession.id, page, *conditions)
+    return [masked(row) for row in rows]
+
+
 async def requests(
     session: AsyncSession, page: Page, request_type: str | None
 ) -> list[dict[str, Any]]:

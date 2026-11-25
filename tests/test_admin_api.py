@@ -735,6 +735,16 @@ def test_admin_query_bounds(
         # request of the page before, one call's turns after a turn number, the slots of up to
         # 14 days from a date, and summaries of 1 to 30 days.
         own = {
+            "/admin/api/calls": (
+                [
+                    "end_reason=nope",
+                    "end_reason=COMPLETED",
+                    "end_reason=",
+                    "end_reason=completed'",
+                    "end_reason=completed&end_reason=error",
+                ],
+                ["end_reason=completed", "end_reason=error&limit=5&before=7"],
+            ),
             QUEUE_ROUTE: (
                 [
                     "type=nope",
@@ -825,7 +835,7 @@ def test_admin_query_bounds(
             written += len(allowed)
             assert len(events(owner_engine)) == written, route
     assert len(events(owner_engine)) == written
-    assert written == 4 + 4 + 7 + 4 + 4 + 3 + 2 + 3 + 5 + 2 + 2
+    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 2 + 3 + 5 + 2 + 2
     # No read failed: every refused value was refused before the database was asked.
     assert "admin_read_failed" not in caplog.text
 
@@ -1082,9 +1092,10 @@ def test_admin_headers_and_schema(
             client.get(f"/admin/api/calls/{cid(2)}", headers=SIGNED_IN),
             client.get("/admin/api/calls/not-a-call", headers=SIGNED_IN),
         ]
+        wrong = basic(ADMIN_USER, TRIED_PASSWORD)
         for _ in range(5):
-            client.get(ROUTES[0])
-        responses.append(client.get(ROUTES[0]))
+            client.get(ROUTES[0], headers=wrong)
+        responses.append(client.get(ROUTES[0], headers=wrong))
     down = create_app(admin_settings(database, postgres_port=closed_port()))
     with client_from(down) as client:
         responses.append(client.get(ROUTES[0], headers=SIGNED_IN))
@@ -1421,3 +1432,57 @@ def test_rate_limiter_keeps_an_address_that_failed_again() -> None:
     assert limiter.record_failure("a") == 3
     # "b" was dropped: it starts again from one (and "c" makes room for it).
     assert limiter.record_failure("b") == 1
+
+
+INSERT_ENDED_CALL = text(
+    "INSERT INTO call_sessions (id, call_id, started_at, ended_at, office_open, verified,"
+    " patient_id, end_reason, turn_count, transcript, transcript_truncated, names_masked)"
+    " VALUES (:id, :call_id, :started_at, :ended_at, true, false, NULL, :end_reason, 1,"
+    " 'agent: Goodbye.', false, true)"
+)
+END_REASONS = (
+    "completed",
+    "emergency",
+    "transferred",
+    "caller_hung_up",
+    "idle_timeout",
+    "max_duration",
+    "error",
+)
+
+
+def test_calls_filter_by_how_they_ended(admin_app: FastAPI, owner_engine: Engine) -> None:
+    # Three calls for each way a call ends, written out by hand, ids in turn.
+    with owner_engine.begin() as connection:
+        for number in range(1, 3 * len(END_REASONS) + 1):
+            connection.execute(
+                INSERT_ENDED_CALL,
+                {
+                    "id": number,
+                    "call_id": cid(number),
+                    "started_at": T0 + timedelta(minutes=number),
+                    "ended_at": T0 + timedelta(minutes=number + 1),
+                    "end_reason": END_REASONS[(number - 1) % len(END_REASONS)],
+                },
+            )
+    with client_from(admin_app) as client:
+        everything = client.get("/admin/api/calls", headers=SIGNED_IN).json()["calls"]
+        assert len(everything) == 21
+        for offset, reason in enumerate(END_REASONS):
+            response = client.get(f"/admin/api/calls?end_reason={reason}", headers=SIGNED_IN)
+            ids = [row["id"] for row in response.json()["calls"]]
+            assert ids == [offset + 15, offset + 8, offset + 1], reason
+            assert {row["end_reason"] for row in response.json()["calls"]} == {reason}
+            # Paging keeps the filter: a page of one at a time.
+            seen: list[int] = []
+            query = f"end_reason={reason}&limit=1"
+            for _ in range(4):
+                rows = client.get(f"/admin/api/calls?{query}", headers=SIGNED_IN).json()["calls"]
+                if not rows:
+                    break
+                seen += [row["id"] for row in rows]
+                query = f"end_reason={reason}&limit=1&before={rows[-1]['id']}"
+            assert seen == ids, reason
+        refused = client.get("/admin/api/calls?end_reason=hung_up", headers=SIGNED_IN)
+        assert refused.status_code == 422
+        assert refused.json() == INVALID_QUERY_BODY

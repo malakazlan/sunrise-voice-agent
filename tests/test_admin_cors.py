@@ -79,9 +79,11 @@ def test_only_the_console_origin_is_answered(database: StartupSettings) -> None:
                 headers={"Origin": CONSOLE_ORIGIN},
             ),
         ):
+            # Retry-After too, so the console can read when to try a refused sign-in again.
             assert cors_headers(response) == {
                 "access-control-allow-origin": CONSOLE_ORIGIN,
                 "access-control-allow-credentials": "true",
+                "access-control-expose-headers": "Retry-After",
             }, response.status_code
             assert "Origin" in [part.strip() for part in response.headers["vary"].split(",")]
 
@@ -165,6 +167,9 @@ def test_only_the_console_origin_is_answered(database: StartupSettings) -> None:
                 "https://console.example.org:0",
                 "https://console.example.org:65536",
                 "https://console.example.org:",
+                # A scheme's own port: a browser never sends it, so sign-in would never work.
+                "https://console.example.org:443",
+                "http://localhost:80",
                 "https://CONSOLE.example.org",
                 "https://console..example.org",
                 "https://-console.example.org",

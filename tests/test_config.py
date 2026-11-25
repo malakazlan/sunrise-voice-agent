@@ -318,7 +318,15 @@ def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
     assert set(DeploymentSettings.model_fields) == APPLICATION_FIELDS | STARTUP_FIELDS
 
     assert compose_environment("app") == {name.upper() for name in VOICE_FIELDS}
-    assert compose_environment("admin-api") == {name.upper() for name in ADMIN_FIELDS}
+    # One variable that is no setting, read by uvicorn itself: which proxies' forwarded
+    # addresses to trust. The admin API's alone, its sign-in limit counts by address.
+    assert compose_environment("admin-api") == {name.upper() for name in ADMIN_FIELDS} | {
+        "FORWARDED_ALLOW_IPS"
+    }
+    assert "FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}" in compose_service("admin-api")
+    for service in ("db", "startup", "app", "coturn"):
+        assert "FORWARDED_ALLOW_IPS" not in compose_environment(service), service
+    assert "FORWARDED_ALLOW_IPS" not in every_variable()
     assert compose_environment("startup") == {name.upper() for name in STARTUP_CHECK_FIELDS}
     assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
     # Each service runs the role it is given the fields of.
@@ -378,14 +386,36 @@ def test_shared_secrets_are_refused_at_startup() -> None:
         ), name
         assert shared not in text, name
 
+    # Not only the admin password: every secret differs from every other, the call access token
+    # and the TURN secret among them, each pair named and no value shown.
+    others = dict(distinct, admin_password="-".join(["admin", "password", "of", "this", "test"]))
+    names = sorted(others)
+    for index, first in enumerate(names):
+        for second in names[index + 1 :]:
+            values = {**base, **others, first: shared, second: shared}
+            with pytest.raises(ValidationError) as refused:
+                DeploymentSettings(_env_file=None, **values)
+            text = str(refused.value)
+            assert re.search(
+                rf"{first} must differ from {second}|{second} must differ from {first}", text
+            ), (first, second)
+            assert shared not in text, (first, second)
+
 
 def test_ci_checks_each_service_against_its_role() -> None:
     # CI compares the running containers, and Compose's resolved configuration, with the
     # fields of each service (.github/workflows/ci.yml): the admin API's and the start-up's.
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert 'echo "admin-api $(configured admin-api)"' in workflow
-    assert '"admin-api": {name.upper() for name in ADMIN_FIELDS}' in workflow
-    assert '("admin-api", ADMIN_FIELDS)' in workflow
+    assert '"admin-api": {name.upper() for name in ADMIN_FIELDS} | {"FORWARDED_ALLOW_IPS"}' in (
+        workflow
+    )
+    assert '("admin-api", ADMIN_FIELDS | {"forwarded_allow_ips"})' in workflow
+    # The start-up check reports as the deployment's settings, and a failed start-up keeps the
+    # admin API down as it keeps the app down.
+    assert 'grep -q "1 validation error for DeploymentSettings"' in workflow
+    assert "StartupSettings" not in workflow
+    assert 'echo "admin-api container: $state"' in workflow
     assert '"app": {name.upper() for name in VOICE_FIELDS}' in workflow
     assert '("app", VOICE_FIELDS)' in workflow
     assert '"startup": {name.upper() for name in STARTUP_CHECK_FIELDS}' in workflow

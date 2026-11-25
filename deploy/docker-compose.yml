@@ -130,11 +130,16 @@ services:
     build: *app-image
     ports:
       - "127.0.0.1:${ADMIN_API_HOST_PORT:-8001}:8000"
-    # Exactly the admin role's fields (ADMIN_FIELDS in app/config.py).
+    # Exactly the admin role's fields (ADMIN_FIELDS in app/config.py), and FORWARDED_ALLOW_IPS.
     environment:
       <<: [*runtime-database, *clock-and-audit, *admin-settings]
       APP_ROLE: admin
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
+      # No setting: uvicorn reads it itself. The addresses whose X-Forwarded-For and
+      # X-Forwarded-Proto it trusts; behind the HTTPS proxy, the proxy's, so that the sign-in
+      # limit counts each client's address and not the proxy's. Set it in the shell, like
+      # APP_HOST_PORT, not in .env.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     depends_on:
       startup:
         condition: service_completed_successfully

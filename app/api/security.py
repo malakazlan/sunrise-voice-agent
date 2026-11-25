@@ -27,6 +27,8 @@ HEADERS = {
 ALLOWED_METHODS = ("GET", "POST", "DELETE")
 ALLOWED_HEADERS = ("Content-Type", "X-CSRF-Token")
 PREFLIGHT_SECONDS = 600
+# What the console may read of an answer beyond the safelisted headers: when to try again.
+EXPOSED_HEADERS = "Retry-After"
 CSRF_HEADER = "x-csrf-token"
 
 
@@ -78,6 +80,7 @@ class ConsoleCors:
                 response_headers.add_vary_header("Origin")
                 if answered:
                     response_headers.update(self._allowed())
+                    response_headers["Access-Control-Expose-Headers"] = EXPOSED_HEADERS
             await send(message)
 
         await self._app(scope, receive, send_with_cors)

@@ -12,6 +12,7 @@ import pytest
 from admin_client import (
     ADMIN_USER,
     COOKIE,
+    HOST_COOKIE,
     OWN_ORIGIN,
     PASSWORD,
     SESSION_ROUTE,
@@ -95,8 +96,8 @@ def chain_lock_held(engine: Engine) -> Iterator[None]:
         holder.rollback()
 
 
-def session_token(client: TestClient) -> str:
-    response = client.get(SESSION_ROUTE)
+def session_token(client: TestClient, origin: str | None = None) -> str:
+    response = client.get(SESSION_ROUTE, headers={} if origin is None else {"Origin": origin})
     assert response.status_code == 200, response.status_code
     token = response.json()["csrf_token"]
     assert isinstance(token, str)
@@ -264,21 +265,30 @@ def test_sign_in_rules(
     # Failed sign-ins are not audited; the one that worked is.
     assert admin_events(owner_engine) == [("admin_signed_in", "session", None, "success")]
 
-    # The cookie: the id and nothing else, with exactly these flags; Secure outside dev, where
-    # the API is reached over HTTPS. Host-only: no Domain. A session cookie: no Max-Age.
-    for app_env, secure, scheme in (("dev", "", "http"), ("demo", "; Secure", "https")):
+    # The cookie: the id and nothing else, with exactly these flags. Host-only: no Domain. A
+    # session cookie: no Max-Age. Outside dev, over HTTPS, a __Host- cookie, which a sibling
+    # host cannot plant or overwrite: Secure and Path=/. In dev, over plain http, Path=/admin/api.
+    for app_env, name, flags, scheme in (
+        ("dev", COOKIE, "HttpOnly; Path=/admin/api; SameSite=strict", "http"),
+        ("demo", HOST_COOKIE, "HttpOnly; Path=/; SameSite=strict; Secure", "https"),
+    ):
         settings = admin_settings(
             database, app_env=app_env, app_role="admin", identity_hash_key=None
         )
         role_app = admin_with_clock(settings, Clock())
-        with client_from(role_app, base_url=f"{scheme}://testserver") as client:
-            response = try_sign_in(client, origin=f"{scheme}://testserver")
+        origin = f"{scheme}://testserver"
+        with client_from(role_app, base_url=origin) as client:
+            response = try_sign_in(client, origin=origin)
             assert response.status_code == 200, app_env
-            session_id = client.cookies[COOKIE]
+            session_id = client.cookies[name]
             assert len(session_id) == 43
-            assert response.headers.get_list("set-cookie") == [
-                f"{COOKIE}={session_id}; HttpOnly; Path=/admin/api; SameSite=strict{secure}"
-            ]
+            assert response.headers.get_list("set-cookie") == [f"{name}={session_id}; {flags}"]
+            # Signing out clears the same cookie.
+            token = session_token(client)
+            cleared = sign_out(client, token, origin=origin)
+            assert cleared.status_code == 204, app_env
+            assert cleared.headers["set-cookie"].startswith(f'{name}=""; '), app_env
+            assert f"; {flags}" in cleared.headers["set-cookie"].replace("Max-Age=0; ", ""), app_env
 
     # What a signed-in browser is told, on signing in and when it asks: who, the token, the
     # seconds left, and the office as the agent's clock has it (Tuesday 10:40 at the clinic).
@@ -446,27 +456,102 @@ def test_forged_requests_are_refused(database: StartupSettings, owner_engine: En
     with client_from(console, "192.0.2.53") as client:
         assert try_sign_in(client).status_code == 403
         sign_in(client, origin=CONSOLE_ORIGIN)
-        token = session_token(client)
+        token = session_token(client, CONSOLE_ORIGIN)
         assert sign_out(client, token).status_code == 401
-        assert client.get(SESSION_ROUTE).status_code == 200
+        from_console = {"Origin": CONSOLE_ORIGIN}
+        assert client.get(SESSION_ROUTE, headers=from_console).status_code == 200
         assert sign_out(client, token, origin=CONSOLE_ORIGIN).status_code == 204
-        assert client.get(SESSION_ROUTE).status_code == 401
+        assert client.get(SESSION_ROUTE, headers=from_console).status_code == 401
 
 
-def test_a_session_is_honoured_only_from_its_origin(database: StartupSettings) -> None:
-    # A page of another origin on the same site sends the SameSite cookie with its requests:
-    # the session does not answer it, so it can neither read nor take the session's stream.
-    app = admin_with_clock(admin_settings(database, console_origin=CONSOLE_ORIGIN), Clock())
+def test_a_session_is_honoured_only_from_its_origin(
+    database: StartupSettings, owner_engine: Engine
+) -> None:
+    # A page of another origin on the same site sends the SameSite cookie with its requests,
+    # and a page that loads an image or a link sends it with no Origin at all: with
+    # CONSOLE_ORIGIN set the session answers neither, so they can neither read, nor check the
+    # chain, nor take the session's stream, nor keep it alive.
+    clock = Clock()
+    app = admin_with_clock(admin_settings(database, console_origin=CONSOLE_ORIGIN), clock)
     with client_from(app, "192.0.2.60") as client:
         sign_in(client, origin=CONSOLE_ORIGIN)
-        for origin in (None, CONSOLE_ORIGIN):
+        from_console = {"Origin": CONSOLE_ORIGIN}
+        assert client.get("/admin/api/requests", headers=from_console).status_code == 200
+        assert client.get(SESSION_ROUTE, headers=from_console).status_code == 200
+        before = events(owner_engine)
+        clock.now += 60
+        for origin in (None, "http://other.console.test", OWN_ORIGIN, "null"):
             headers = {} if origin is None else {"Origin": origin}
-            assert client.get("/admin/api/requests", headers=headers).status_code == 200
-            assert client.get(SESSION_ROUTE, headers=headers).status_code == 200
-        for origin in ("http://other.console.test", OWN_ORIGIN, "null"):
-            for route in ("/admin/api/requests", SESSION_ROUTE, STREAM_ROUTE):
-                response = client.get(route, headers={"Origin": origin})
+            for route in (
+                "/admin/api/requests",
+                "/admin/api/audit/verify",
+                SESSION_ROUTE,
+                STREAM_ROUTE,
+            ):
+                response = client.get(route, headers=headers)
                 assert response.status_code == 401, (origin, route)
+                assert response.json() == REFUSED_BODY, (origin, route)
+        assert events(owner_engine) == before
+        # None of them kept the session alive: a minute of its idle time is gone.
+        shown = client.get(SESSION_ROUTE, headers=from_console).json()
+        assert shown["expires_in"] == admin_sessions.IDLE_SECONDS - 60
+
+    # Without CONSOLE_ORIGIN the console is the API's own origin, whose same-origin reads
+    # carry no Origin: those are honoured.
+    plain = admin_with_clock(admin_settings(database), Clock())
+    with client_from(plain, "192.0.2.62") as client:
+        sign_in(client)
+        assert client.get("/admin/api/requests").status_code == 200
+        assert client.get(SESSION_ROUTE).status_code == 200
+
+
+def test_bare_requests_do_not_lock_sign_in(database: StartupSettings) -> None:
+    # Only credentials presented and wrong count against the address: a page that makes the
+    # admin's browser send requests without any cannot lock the admin out.
+    app = admin_with_clock(admin_settings(database), Clock())
+    with client_from(app, "192.0.2.63") as client:
+        for _ in range(20):
+            response = client.get("/admin/api/requests")
+            assert response.status_code == 401
+            assert response.json() == REFUSED_BODY
+        assert try_sign_in(client).status_code == 200
+    with client_from(app, "192.0.2.64") as client:
+        wrong = basic(ADMIN_USER, TRIED_PASSWORD)
+        for _ in range(5):
+            assert client.get("/admin/api/requests", headers=wrong).status_code == 401
+        assert client.get("/admin/api/requests", headers=wrong).status_code == 429
+        assert try_sign_in(client).status_code == 429
+
+
+def test_sign_out_always_signs_out(
+    database: StartupSettings, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    app = admin_with_clock(admin_settings(database), Clock())
+    with client_from(app, "192.0.2.65") as client:
+        # The audit log can take the event: it is written.
+        sign_in(client)
+        response = sign_out(client, session_token(client))
+        assert response.status_code == 204
+        assert admin_events(owner_engine)[-1] == ("admin_signed_out", "session", None, "success")
+
+        # It cannot: the session ends all the same, the cookie is cleared, and the log says the
+        # event is missing, by name only.
+        session_id = sign_in(client)
+        token = session_token(client)
+        before = events(owner_engine)
+        with chain_lock_held(owner_engine):
+            response = sign_out(client, token)
+        assert response.status_code == 204
+        assert response.headers["set-cookie"].startswith(f'{COOKIE}=""; ')
+        assert events(owner_engine) == before
+        client.cookies.clear()
+        client.cookies.set(COOKIE, session_id, path="/admin/api")
+        assert client.get(SESSION_ROUTE).status_code == 401
+    messages = [record.getMessage() for record in caplog.records]
+    assert [m for m in messages if m.startswith("admin_sign_out_unaudited error=")], messages
+    for message in messages:
+        assert session_id not in message and token not in message
 
 
 def test_sign_in_replaces_the_browsers_session(database: StartupSettings) -> None:

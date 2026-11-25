@@ -809,7 +809,7 @@ API with a browser session (below, "Admin API for the console").
 |---|---|
 | `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
 | `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name (hidden), callback_number, body, patient_id |
-| `/admin/api/calls` | `{"calls": [...]}`: id, call_id, started_at, ended_at, office_open, verified, patient_id, end_reason, turn_count; no transcript |
+| `/admin/api/calls` | `{"calls": [...]}`: id, call_id, started_at, ended_at, office_open, verified, patient_id, end_reason, turn_count; no transcript. `end_reason=` keeps the calls that ended one way: `completed`, `emergency`, `transferred`, `caller_hung_up`, `idle_timeout`, `max_duration` or `error`; anything else gets `422` |
 | `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript, transcript_truncated, names_masked and transcript_withheld; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
 | `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
 | `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
@@ -828,14 +828,17 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8001/admin/api/requests?
 - Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`, or a browser session. The user
   name and the password are each compared as a SHA-256 digest in constant time, both always.
   Anything else (no header, a wrong part, a malformed or non-UTF-8 header, an `Authorization`
-  header over 1024 characters) gets the same `401`, and is logged as
-  `admin_sign_in_failed failures=<n>`, never the name or password tried. The `401` carries the
+  header over 1024 characters) gets the same `401`. Credentials presented and wrong are logged
+  as `admin_sign_in_failed failures=<n>`, never the name or password tried. The `401` carries the
   `WWW-Authenticate` challenge only for a request without an `Origin` header: a browser sends
   one, and must never show the Basic prompt.
-- Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): after five
-  inside a sliding minute the address gets `429`, before its credentials are looked at, until
-  the oldest of them is a minute old. A correct sign-in is not counted. Failed sign-ins are
-  not audited, so a stranger cannot make the audit chain grow.
+- Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): only
+  credentials presented and wrong count (a Basic `Authorization` header, or a session sign-in's
+  body); a request with none gets `401` and is not counted, so a page that makes a browser send
+  bare requests locks no one out. After five failures inside a sliding minute the address gets
+  `429`, before its credentials are looked at, until the oldest of them is a minute old. A
+  correct sign-in is not counted. Failed sign-ins are not audited, so a stranger cannot make
+  the audit chain grow.
 - Paging: newest first; `limit` 1 to 100 (default 50); `before=<id or seq>` for the next page,
   the last id or seq of the page before. An unknown or repeated parameter, a value out of range
   or a filter that is not a call id or an audit action gets `422` with a fixed body. The verify
@@ -869,14 +872,14 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8001/admin/api/requests?
 - The runtime role needs no privilege for the API beyond what the calls use: it reads these
   tables and appends events.
 - Limits:
-  - Behind the HTTPS proxy every caller reaches the app from the proxy's address, so the
-    sign-in limit is shared by everyone. Refused requests are not counted, so each failure
-    ages out after a minute and is replaced by the next: one wrong password every 12 seconds,
-    from anyone, keeps the admin locked out for as long as it goes on. A sustained lockout
-    costs an attacker five requests a minute. It delays the admin; it is not a way in, and the
-    password's strength is the real control. Trusting the proxy's forwarded address is left to
-    the deploy set-up. The limit is held in memory, so a restart clears it, and it keeps at
-    most 10,000 addresses, dropping the one that failed longest ago.
+  - Wrong passwords from one address block that address's sign-in for as long as they go on:
+    refused requests are not counted, so each failure ages out after a minute and is replaced
+    by the next, and one wrong password every 12 seconds keeps the address blocked. It delays;
+    it is not a way in, and the password's strength is the real control. Behind the HTTPS proxy
+    every caller has the proxy's address, and so one limit, unless the proxy's address is
+    trusted for its forwarded headers (`FORWARDED_ALLOW_IPS`, below). The limit is held in
+    memory, so a restart clears it, and it keeps at most 10,000 addresses, dropping the one
+    that failed longest ago.
   - A real console would reveal a callback number only on an explicit, audited action; this
     API never reveals one, it shows the masked form with the last four digits.
   - Masking hides identifiers by their shape, as in the logs, and names only where the records
@@ -965,7 +968,7 @@ calls, and runs in a process of its own (`app/api/security.py`, `sessions.py`, `
 |---|---|---|
 | `POST /admin/api/session` | body `{"user", "password"}` (JSON, at most 1 KiB): signs in and answers as `GET` does, with the session cookie | `admin_signed_in` |
 | `GET /admin/api/session` | `{"user", "csrf_token", "expires_in", "office_open", "time_zone"}`: who is signed in, the session's anti-forgery token, the seconds left if it is not used, and the office open or closed by the agent's clock (simulated when set) with the clinic's zone; `401` when not signed in | none (reads no patient data) |
-| `DELETE /admin/api/session` | ends the session and clears the cookie; `204` | `admin_signed_out` |
+| `DELETE /admin/api/session` | ends the session and clears the cookie; `204`, always: if `admin_signed_out` cannot be written the session ends all the same, and the log says `admin_sign_out_unaudited` | `admin_signed_out` |
 | `GET /admin/api/queue?type=&before=` | `{"requests": [...]}`: the Requests page's rows, newest received first (the higher id first at the same instant), 50 a page; each with id, created_at, call_id, type, summary (masked, names hidden), patient_id, `callbacks` (the masked numbers of the messages it was left with) and `after_hours`; never the caller's name. `before=<id>` is the last request of the page before | `admin_read_queue` |
 | `GET /admin/api/calls/{call_id}/detail` | `{"call": {...}, "events": [...]}`: the call as `/admin/api/calls/{call_id}` shows it, and its audit events oldest first (the latest 100) | `admin_read_call_detail` |
 | `GET /admin/api/calls/live/stream` | `text/event-stream` of the live calls, session only | `admin_read_live_calls`, once per stream |
@@ -979,10 +982,13 @@ Two ways to sign in, one check (`AdminAccess`):
   address), and answers every failure the same way (`401 {"detail": "Sign-in failed"}`). On
   success it opens a new session: 32 random bytes, of which the server keeps only the SHA-256;
   8 hours at most, 30 minutes idle; at most 32 sessions, the one used longest ago ending first.
-  The id goes in the cookie `admin_session`: `HttpOnly`, `SameSite=Strict`, `Path=/admin/api`,
-  no `Domain` (this host only), no expiry (it ends with the browser), and `Secure` unless
-  `APP_ENV=dev`. No audit event, no session: if `admin_signed_in` cannot be written the answer
-  is `503`. A sign-in from a browser that holds a session ends that one.
+  Outside dev the id goes in the cookie `__Host-admin_session`: `Secure`, `HttpOnly`,
+  `SameSite=Strict`, `Path=/`, no `Domain`, no expiry (it ends with the browser). The
+  `__Host-` prefix is why: a browser accepts such a cookie only from this host itself, so a
+  sibling host of the site can neither plant one nor overwrite it. In dev, over plain http
+  where that prefix cannot be used, it is `admin_session` with `Path=/admin/api` and no
+  `Secure`. No audit event, no session: if `admin_signed_in` cannot be written the answer is
+  `503`. A sign-in from a browser that holds a session ends that one.
 - A read with a session keeps it alive; `GET /admin/api/session` and the stream do not.
 - Sessions are held in memory: restarting `admin-api` signs everyone out.
 
@@ -995,16 +1001,20 @@ treats them as the same site, so it is no defence here; these rules are:
   `403`.
 - Signing in has no token yet: it needs that `Origin` and `Content-Type: application/json`, so a
   form posted from another page is refused (`403`) before the password is looked at.
-- A session is honoured only for a request from that origin or one without an `Origin` header
-  (a browser sends none on its own same-origin reads). A page of another origin that makes the
-  browser send the cookie is answered as signed out, so it cannot take the session's stream
-  either.
+- With `CONSOLE_ORIGIN` set, a session is honoured only for a request whose `Origin` is exactly
+  it; the console's requests are all cross-origin, so they always carry it. A request with
+  another `Origin` or none (a link, an image, a form of a sibling page) is answered as signed
+  out on every route and the stream: it reads nothing, keeps nothing alive and cannot take the
+  console's stream. Without `CONSOLE_ORIGIN` the console is the API's own origin, and a request
+  with that `Origin` or none (a browser's own same-origin read) is honoured.
 - `GET` changes nothing but its own audit event and the session's idle time.
 
 CORS: `CONSOLE_ORIGIN` is one exact origin (`https://console.example.org`: scheme, lower-case
-host, optional port; no path, no wildcard; `http` only with `APP_ENV=dev`). Requests from it
-get `Access-Control-Allow-Origin` with that origin (never `*`) and
-`Access-Control-Allow-Credentials: true`; preflights get the methods `GET, POST, DELETE`, the
+host, optional port but never the scheme's own (`:443`, `:80`: a browser leaves it out, so it
+would never match); no path, no wildcard; `http` only with `APP_ENV=dev`). Requests from it get
+`Access-Control-Allow-Origin` with that origin (never `*`),
+`Access-Control-Allow-Credentials: true` and `Access-Control-Expose-Headers: Retry-After` (when
+to try a refused sign-in again); preflights get the methods `GET, POST, DELETE`, the
 headers `Content-Type, X-CSRF-Token`, and `Access-Control-Max-Age: 600`. Every answer carries
 `Vary: Origin`. Any other origin gets no CORS header, and with `CONSOLE_ORIGIN` unset nobody
 does. The console reads the stream with `new EventSource(url, {withCredentials: true})` and the
@@ -1018,14 +1028,16 @@ The live calls stream:
   its own, with no audit event; `calls` is sent only when the list differs from the last one
   sent. A comment line every 15 seconds keeps proxies from closing it, and
   `X-Accel-Buffering: no` keeps nginx from holding it back.
-- A read that fails sends `paused` once; the next tick tries again, and the list is sent again
-  once a read works.
+- A read that fails sends `paused` once; the next tick tries again, and the first read that
+  works sends the list again, changed or not.
 - When the session ends (signed out, idle or 8 hours) the stream sends `signed_out` and
   closes. After 5 minutes it sends `renew` and closes, and the page opens a new one.
 - At most 5 streams are open per process and one per session: a newer stream of the session
-  closes the older (silently: `EventSource` then reconnects on its own, so two tabs of one
-  session take the stream from each other in turn). A sixth session gets `429`. A client that
-  takes no write for 10 seconds is dropped.
+  closes the older, which first sends `replaced` (`data: {}`); the page that held it closes
+  its `EventSource` and does not reconnect. A sixth session gets `429`.
+- A client that stops reading is dropped once the send buffer fills (a write then waits 10
+  seconds and gives up) or at the 5-minute renewal, whichever comes first; what is held for it
+  stays bounded.
 
 Roles: `APP_ROLE` picks what a process serves, from the same image and command
 (`app/server.py`).
@@ -1039,21 +1051,21 @@ Roles: `APP_ROLE` picks what a process serves, from the same image and command
 In Compose `app` runs `voice` and `admin-api` runs `admin`, each with only its own variables
 (Run with Docker). Each long-running service holds only some of the secrets, so the one-shot
 `startup` service is given all of them and its first step (`python -m app.config`) checks them
-together as `all` does: each strong, and the admin password different from every other, the
-database passwords included. A clash stops the deployment before `app` and `admin-api` start,
-naming both settings and no value.
+together as `all` does: each strong, and every secret different from every other (the admin
+password, both database passwords, the audit and identity keys, the TURN secret, the call
+access token and the vendors' keys). A clash stops the deployment before `app` and `admin-api`
+start, naming both settings and no value.
 
-Behind a proxy: the sign-in limit counts by client address, so behind the HTTPS proxy every
-browser and script shares the proxy's address and one limit (see Limits above); and the API's
-own origin is read from the request's scheme and `Host`, which a proxy that ends TLS changes,
-so set `CONSOLE_ORIGIN` there.
+Behind a proxy: the sign-in limit counts by client address, and the API's own origin is read
+from the request's scheme and `Host`. Compose gives `admin-api` one variable that is no
+setting, `FORWARDED_ALLOW_IPS` (default `127.0.0.1`), which uvicorn reads itself: the addresses
+whose `X-Forwarded-For` and `X-Forwarded-Proto` it trusts. When the API runs behind a proxy, set
+it to the proxy's network, in the shell like `APP_HOST_PORT` and not in `.env`; otherwise every
+caller shares the proxy's address and one limit. Set `CONSOLE_ORIGIN` there too.
 
 - Limits:
   - Sessions and stream places are per process and in memory: one `admin-api` process, no
     sharing between replicas.
-  - A request without credentials on a Basic route counts as a failed sign-in, as before. A page
-    on any site can make the admin's browser send five such requests and hold the admin's
-    address at the limit for a minute: a delay, not a way in.
 
 ### Output guard
 
@@ -1414,7 +1426,7 @@ its own variables, as follows.
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | every variable of `app` and `admin-api` but `APP_ROLE`, and `POSTGRES_USER`, `POSTGRES_PASSWORD`: the whole deployment, checked together, once |
 | `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
-| `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN` |
+| `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN`, and uvicorn's `FORWARDED_ALLOW_IPS` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the

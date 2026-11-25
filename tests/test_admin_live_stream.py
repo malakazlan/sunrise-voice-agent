@@ -150,12 +150,12 @@ class Exchange:
         return b"".join(self.chunks).decode()
 
 
-async def asgi_sign_in(app: Any) -> str:
+async def asgi_sign_in(app: Any, origin: str = OWN_ORIGIN) -> str:
     exchange = Exchange(
         app,
         "POST",
         SESSION_ROUTE,
-        {"origin": OWN_ORIGIN, "content-type": "application/json"},
+        {"origin": origin, "content-type": "application/json"},
         body=json.dumps({"user": ADMIN_USER, "password": PASSWORD}).encode(),
     )
     await exchange.run()
@@ -164,8 +164,11 @@ async def asgi_sign_in(app: Any) -> str:
     return cookie.split(";", 1)[0].split("=", 1)[1]
 
 
-def stream_of(app: Any, session_id: str, **options: Any) -> Exchange:
-    return Exchange(app, "GET", STREAM_ROUTE, {"cookie": f"{COOKIE}={session_id}"}, **options)
+def stream_of(app: Any, session_id: str, origin: str | None = None, **options: Any) -> Exchange:
+    headers = {"cookie": f"{COOKIE}={session_id}"}
+    if origin is not None:
+        headers["origin"] = origin
+    return Exchange(app, "GET", STREAM_ROUTE, headers, **options)
 
 
 async def yielding_sleep(_seconds: float) -> None:
@@ -278,7 +281,7 @@ def test_stream_bounds(
         assert [stream.status for stream in streams] == [200] * 5
 
         sixth = stream_of(app, sessions[5])
-        await sixth.run()
+        await asyncio.wait_for(sixth.run(), timeout=10)
         assert sixth.status == 429
         assert json.loads(sixth.text) == {"detail": "Too many live streams"}
 
@@ -288,10 +291,11 @@ def test_stream_bounds(
         assert again.status == 200
         await asyncio.wait_for(tasks[0], timeout=10)
         assert streams[0].ended
-        assert [event for event, _ in parsed(streams[0].text)] == ["calls"]
+        # The older is told why it ends, so its page does not reconnect and take it back.
+        assert parsed(streams[0].text) == [("calls", [WITH_TURN]), ("replaced", {})]
         # The older's place was the newer's: the sixth session still has none.
         refused = stream_of(app, sessions[5])
-        await refused.run()
+        await asyncio.wait_for(refused.run(), timeout=10)
         assert refused.status == 429
 
         # A client gone frees its place.
@@ -355,3 +359,98 @@ def test_stream_places() -> None:
     assert len(streams) == 5
     streams.close(bytes([0]), newer)
     assert len(streams) == 4
+
+
+async def failing_once(reads: list[int]) -> str:
+    reads.append(1)
+    if len(reads) == 2:
+        raise ConnectionError("the database is away")
+    return "[]"
+
+
+def test_the_first_read_after_a_pause_sends_the_list() -> None:
+    # The list did not change while the reads failed; the page shows it as paused all the
+    # same, so the first read that works sends it again.
+    async def scenario() -> list[str]:
+        streams = LiveStreams()
+        stop = streams.open(b"session")
+        assert stop is not None
+        clock = Clock()
+        reads: list[int] = []
+        stream = LiveStream(
+            "[]",
+            read=lambda: failing_once(reads),
+            signed_in=lambda: True,
+            stop=stop,
+            release=lambda: streams.close(b"session", stop),
+            clock=clock,
+            sleep=clock.sleep,
+        )
+        exchange = Exchange(stream, "GET", STREAM_ROUTE, {})
+        await asyncio.wait_for(exchange.run(), timeout=10)
+        return [event for event, _ in parsed(exchange.text) if event != "comment"]
+
+    events = asyncio.run(scenario(), loop_factory=asyncio.SelectorEventLoop)
+    assert events == ["calls", "paused", "calls", "renew"]
+
+
+def test_a_failed_opening_gives_its_place_back(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first list cannot be made into an event (a value of a type the admin is not shown):
+    # the opening fails, and its place in the process is free again.
+    broken = True
+    original = console.live_calls
+
+    async def unshowable(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        if broken:
+            return [{"call_id": object()}]
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(console, "live_calls", unshowable)
+
+    async def scenario() -> None:
+        nonlocal broken
+        app = admin_with_clock(admin_settings(database), Clock(), sleep=yielding_sleep)
+        sessions = [await asgi_sign_in(app) for _ in range(6)]
+        for session_id in sessions[:5]:
+            with pytest.raises(TypeError):
+                await asyncio.wait_for(stream_of(app, session_id).run(), timeout=10)
+        broken = False
+        opened = stream_of(app, sessions[5])
+        task = asyncio.create_task(opened.run())
+        await until(lambda: bool(opened.chunks))
+        assert opened.status == 200
+        opened.gone.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario(), loop_factory=asyncio.SelectorEventLoop)
+
+
+def test_a_request_without_the_console_origin_leaves_the_stream_alone(
+    database: StartupSettings, owner_engine: Engine
+) -> None:
+    # With CONSOLE_ORIGIN set, a request carrying the cookie but no Origin is refused before
+    # anything: it cannot take the console's open stream away, and writes no event.
+    console_origin = "http://console.test"
+
+    async def scenario() -> None:
+        app = admin_with_clock(
+            admin_settings(database, console_origin=console_origin), Clock(), sleep=yielding_sleep
+        )
+        session_id = await asgi_sign_in(app, console_origin)
+        open_stream = stream_of(app, session_id, console_origin)
+        task = asyncio.create_task(open_stream.run())
+        await until(lambda: bool(open_stream.chunks))
+        before = admin_events(owner_engine)
+        bare = stream_of(app, session_id)
+        await asyncio.wait_for(bare.run(), timeout=10)
+        assert bare.status == 401
+        await asyncio.sleep(0.05)
+        assert not open_stream.ended and not task.done()
+        assert admin_events(owner_engine) == before
+        open_stream.gone.set()
+        await asyncio.wait_for(task, timeout=10)
+        assert [event for event, _ in parsed(open_stream.text)] == ["calls"]
+
+    asyncio.run(scenario(), loop_factory=asyncio.SelectorEventLoop)

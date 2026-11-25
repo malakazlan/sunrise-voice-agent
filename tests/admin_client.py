@@ -26,6 +26,8 @@ ADMIN_USER = "clinic_admin"
 PASSWORD = "-".join(["admin", "pass", "not", "for", "logs"])
 ACTOR = f"admin:{ADMIN_USER}"
 COOKIE = "admin_session"
+# Outside dev, over HTTPS: a cookie no sibling host can plant or overwrite.
+HOST_COOKIE = "__Host-admin_session"
 SESSION_ROUTE = "/admin/api/session"
 STREAM_ROUTE = "/admin/api/calls/live/stream"
 # The API's own origin, as the test client reaches it.

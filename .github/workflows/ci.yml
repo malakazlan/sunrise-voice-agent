@@ -187,7 +187,7 @@ jobs:
             test "$status" = "$2"
           done
           # A browser's sign-in from the API's own origin, the password on stdin only: a
-          # session cookie, Secure outside dev.
+          # __Host- session cookie outside dev.
           admin_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' .env)
           test -n "$admin_pass"
           signed=$(printf '{"user": "ci_admin", "password": "%s"}' "$admin_pass" \
@@ -196,7 +196,7 @@ jobs:
               --data-binary @- http://127.0.0.1:8001/admin/api/session)
           echo "admin-api POST /admin/api/session -> $(echo "$signed" | tail -n 1)"
           test "$(echo "$signed" | tail -n 1)" = "200"
-          echo "$signed" | grep -qi '^set-cookie: admin_session=.*; HttpOnly; Path=/admin/api; SameSite=strict; Secure'
+          echo "$signed" | grep -qi '^set-cookie: __Host-admin_session=.*; HttpOnly; Path=/; SameSite=strict; Secure'
           admin=$($compose ps -q admin-api)
           health=none
           for _ in $(seq 1 30); do
@@ -296,7 +296,8 @@ jobs:
           from app.config import ADMIN_FIELDS, STARTUP_CHECK_FIELDS, VOICE_FIELDS
           expected = {
               "app": {name.upper() for name in VOICE_FIELDS},
-              "admin-api": {name.upper() for name in ADMIN_FIELDS},
+              # The one variable that is no setting: uvicorn's own, for the proxy's address.
+              "admin-api": {name.upper() for name in ADMIN_FIELDS} | {"FORWARDED_ALLOW_IPS"},
               "startup": {name.upper() for name in STARTUP_CHECK_FIELDS},
           }
           found = {}
@@ -437,7 +438,7 @@ jobs:
           failed = False
           for service, expected in (
               ("app", VOICE_FIELDS),
-              ("admin-api", ADMIN_FIELDS),
+              ("admin-api", ADMIN_FIELDS | {"forwarded_allow_ips"}),
               ("startup", STARTUP_CHECK_FIELDS),
           ):
               received = set(services[service]["environment"])
@@ -616,12 +617,9 @@ jobs:
           echo "$output" | tail -n 5
           echo "exit code: $code"
           test "$code" = "1"
-          echo "$output" | grep -q "1 validation error for StartupSettings"
+          # One error: the deployment's settings, all checked at once, break only this rule.
+          echo "$output" | grep -q "1 validation error for DeploymentSettings"
           echo "$output" | grep -q "postgres_user must differ from app_db_user"
-          if echo "$output" | grep -Eq "validation errors? for Settings"; then
-            echo "the application settings were refused too; only the start-up rule should be"
-            exit 1
-          fi
       - name: A failed start-up keeps the app from starting
         run: |
           . .github/ci-wait.sh
@@ -644,6 +642,10 @@ jobs:
           test "$(docker inspect --format '{{.State.ExitCode}}' "$startup")" = "1"
           state=$(docker inspect --format '{{.State.Status}}' "$app")
           echo "app container: $state"
+          test "$state" = "created"
+          admin=$($compose ps -a -q admin-api)
+          state=$(docker inspect --format '{{.State.Status}}' "$admin")
+          echo "admin-api container: $state"
           test "$state" = "created"
           status=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)
           echo "GET /health -> $status"

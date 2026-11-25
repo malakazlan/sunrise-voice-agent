@@ -10,9 +10,12 @@ no audit event. It sends:
     - `paused` when a read fails, once until a read works again; the next tick tries again;
     - `signed_out` when the session has ended, and closes;
     - `renew` after STREAM_SECONDS, and closes: the page opens a new stream;
+    - `replaced` when a newer stream of the same session opens, and closes: the page that
+      holds the older does not reconnect, so two pages do not take the stream in turn;
     - a comment line every COMMENT_SECONDS, so that proxies keep the connection.
 A process keeps at most MAX_STREAMS open, one per session: a newer stream of a session closes
-the older. A client that does not take a write within WRITE_SECONDS is dropped. Logs carry the
+the older. A write that does not complete within WRITE_SECONDS (the client stopped reading and
+the send buffer is full) drops the client. Logs carry the
 event names and exception class names; never a value.
 """
 
@@ -137,7 +140,8 @@ class LiveStream(StreamingResponse):
         next_comment = now + COMMENT_SECONDS
         while True:
             if await self._pause(min(next_tick, next_comment, end) - self._clock()):
-                logger.info("admin_stream_ended reason=replaced_or_gone")
+                logger.info("admin_stream_ended reason=replaced")
+                yield _event("replaced")
                 return
             now = self._clock()
             if now >= end:
