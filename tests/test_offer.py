@@ -2,12 +2,13 @@ import asyncio
 import hmac
 import json
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 import pytest
-from conftest import VOICE_SECRETS, close_unstarted, offline_settings
+from conftest import VOICE_SECRETS, offline_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -456,7 +457,6 @@ def test_offer_body_cap_boundary() -> None:
 
     assert len(padded_offer(BODY_LIMIT)) == BODY_LIMIT
     assert asyncio.run(main()) == (200, 413)
-    close_unstarted(app)
 
 
 def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -559,7 +559,6 @@ def test_slot_released_when_setup_is_cancelled() -> None:
         assert active_calls(app) == 0
 
     asyncio.run(main())
-    close_unstarted(app)
 
 
 async def post_offer(app: FastAPI) -> int:
@@ -621,6 +620,33 @@ def test_shutdown_drains_both_queues_within_one_limit(monkeypatch: pytest.Monkey
     took = asyncio.run(main())
     assert given == [5, 5]
     assert took < 6, took
+
+
+def test_worker_threads_are_started_before_the_first_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Work a call hands to the loop's default executor (the VAD's loading, a host's address)
+    # must find a worker running: a worker started then is started on the event loop's
+    # thread, which waits for it, and every call's audio with it.
+    calls = 3
+    app = offer_app(voice_settings(max_concurrent_calls=calls))
+    started: list[str] = []
+    start = threading.Thread.start
+
+    def spied(thread: threading.Thread) -> None:
+        started.append(thread.name)
+        start(thread)
+
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            with monkeypatch.context() as patched:
+                patched.setattr(threading.Thread, "start", spied)
+                # As many at once as there may be calls, each on a worker of its own.
+                together = threading.Barrier(calls)
+                await asyncio.gather(*(asyncio.to_thread(together.wait, 5) for _ in range(calls)))
+
+    asyncio.run(main())
+    assert started == []
 
 
 def test_shutdown_ends_active_calls() -> None:

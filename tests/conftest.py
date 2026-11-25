@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import importlib
 import os
 import secrets
@@ -12,7 +13,6 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
 from psycopg import errors
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, text
@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.agent.call_record import drain_call_records
+from app.agent.model import AnthropicModel
 from app.config import Settings, StartupSettings
 from app.db.roles import set_up_runtime_role
 from app.db.session import (
@@ -140,13 +141,33 @@ def offline_settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **values)
 
 
-def close_unstarted(app: FastAPI) -> None:
-    """Close what an application built and never started holds, which its lifespan would
-    have closed: the model's HTTP client. Left open, it is collected when the interpreter
-    exits, after the modules its clean-up needs are gone."""
-    model = app.state.model
-    if model is not None:
-        asyncio.run(model.close(), loop_factory=asyncio.SelectorEventLoop)
+@pytest.fixture(autouse=True)
+def close_model_clients(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every model client the code under test makes, closed at the test's teardown. Many
+    tests build an application and never start it, so its lifespan, which would close the
+    client, never runs; closing an already closed one does nothing."""
+    made: list[AnthropicModel] = []
+    make = AnthropicModel.__init__
+
+    def recorded(model: AnthropicModel, *args: Any, **kwargs: Any) -> None:
+        make(model, *args, **kwargs)
+        made.append(model)
+
+    monkeypatch.setattr(AnthropicModel, "__init__", recorded)
+    yield
+    for model in made:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(model.close())
+        finally:
+            loop.close()
+
+
+def pytest_sessionfinish() -> None:
+    # A client, closed or not, that lives on in a reference cycle until the interpreter's
+    # last collection runs its finalizer after the modules it reads are gone, and prints an
+    # error for each; collected here, while they are all still there, it goes quietly.
+    gc.collect()
 
 
 @pytest.fixture

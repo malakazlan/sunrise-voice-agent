@@ -67,8 +67,10 @@ def create_admin_app(settings: Settings) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # A coroutine, as every handler: a plain function would go to the thread pool, whose new
+    # threads hold the event loop while they start.
     @app.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     if settings.admin_password is None:

@@ -1144,7 +1144,6 @@ async def test_model_request_shape(model_id: str | None) -> None:
         )
         first_token = asyncio.Event()
         reply = await model.reply(request, first_token)
-        await model.close()
 
     (only,) = sent
     body = json.loads(only.content)

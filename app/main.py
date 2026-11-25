@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -38,6 +40,29 @@ CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 # queued: both are drained at once under this one limit, and what is left then is dropped, so a
 # stalled database cannot hold the stop past the container's grace period.
 QUEUES_WAIT_SECONDS = 5
+# The loop's default executor runs what a call hands it (the VAD's loading, a host's address,
+# aiortc's audio encoding): a worker for each call at once, and two to spare. How long its
+# workers may take to start, at start-up.
+SPARE_WORKERS = 2
+WORKERS_START_SECONDS = 10
+
+
+async def start_workers(count: int) -> None:
+    """Give the running loop a default executor of `count` workers, every one started now. A
+    worker started later would start on the event loop's thread, which waits for it, and every
+    call's audio with it. Each worker waits until all have started, so each is its own; a
+    worker that does not start in WORKERS_START_SECONDS stops the start-up."""
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="call_worker")
+    loop.set_default_executor(executor)
+    together = threading.Barrier(count)
+    await asyncio.gather(
+        *(
+            loop.run_in_executor(executor, together.wait, WORKERS_START_SECONDS)
+            for _ in range(count)
+        )
+    )
+    logger.info("call_workers_started workers=%d", count)
 
 
 def build_deps(settings: Settings, engine: AsyncEngine, config: LiveConfig) -> Deps:
@@ -102,6 +127,8 @@ def create_app(
         poll = ConfigPoll(deps.sessions, config)
         _app.state.poll = poll
         await poll.start()
+        # Before the first call, never during one.
+        await start_workers(settings.max_concurrent_calls + SPARE_WORKERS)
         yield
         await poll.stop()
         refusals.close()
@@ -135,7 +162,6 @@ def create_app(
     app.state.vocabulary = vocabulary
     app.state.turns = turns
     app.state.config = config
-    app.state.model = model
     page = CALL_PAGE.read_bytes()
 
     # Coroutines, so that nothing here runs in the thread pool, whose new threads hold the

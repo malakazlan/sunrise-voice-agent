@@ -76,8 +76,12 @@ REFUSED_EVENT = (None, "agent", "call_refused", "call", None, "refused", "calls_
 STALL_SECONDS = 2.0
 RETURN_BOUND_SECONDS = STALL_SECONDS / 4
 FAST_POLL_SECONDS = 0.05
-# How long a new thread takes to start on a machine that is very busy.
-SLOW_THREAD_START_SECONDS = 0.3
+# How long a new thread takes to start on a machine that is very busy; anything that held the
+# loop half as long fails the loop test, far above a busy runner's scheduling noise. The loop
+# probe's sleep, and how long the test waits for it to run.
+SLOW_THREAD_START_SECONDS = 0.5
+PROBE_SECONDS = 0.005
+SETTLE_SECONDS = 0.05
 # The functions that read config_changes.
 TABLE_READS = {"read_config", "read_config_bounded"}
 INSERT_CHANGE = text(
@@ -311,36 +315,45 @@ async def test_call_routes_never_hold_the_loop(
         admin_password=PASSWORD,
     )
     app = create_app(settings, open_call=Opener(), config=taking_calls())
-    worst = 0.0
+    # A probe that sleeps a few milliseconds at a time and keeps the longest it overslept:
+    # what anything else running on the loop held it for. It runs whenever this test waits.
+    ticks: list[float] = []
 
     async def probe() -> None:
-        nonlocal worst
         loop = asyncio.get_running_loop()
         while True:
             before = loop.time()
-            await asyncio.sleep(0.005)
-            worst = max(worst, loop.time() - before - 0.005)
+            await asyncio.sleep(PROBE_SECONDS)
+            ticks.append(loop.time() - before - PROBE_SECONDS)
 
     probing = asyncio.ensure_future(probe())
     token = {"Authorization": f"Bearer {VOICE_SECRETS['CALL_ACCESS_TOKEN']}"}
+    requests = [
+        ("GET", "/health", {}),
+        ("GET", "/", {}),
+        ("GET", "/ice-servers", token),
+        ("POST", "/offer", token),
+        ("GET", "/admin/api/session", {}),
+    ]
+    answers = []
     transport = httpx2.ASGITransport(app=app)
     try:
+        await asyncio.sleep(SETTLE_SECONDS)
         async with httpx2.AsyncClient(transport=transport, base_url=OWN_ORIGIN) as client:
-            answers = [
-                await client.get("/health"),
-                await client.get("/"),
-                await client.get("/ice-servers", headers=token),
-                await client.post("/offer", json=OFFER, headers=token),
-                await client.get("/admin/api/session"),
-            ]
+            for method, path, headers in requests:
+                body = OFFER if method == "POST" else None
+                answers.append(await client.request(method, path, json=body, headers=headers))
+                # The probe wakes now, and measures how long the request held the loop.
+                await asyncio.sleep(SETTLE_SECONDS)
     finally:
         probing.cancel()
-        # The app was never started: what its lifespan would close is closed here.
+        # The app was never started: the calls its lifespan would close are closed here.
         await app.state.calls.close()
-        await app.state.model.close()
     assert [answer.status_code for answer in answers] == [200, 200, 200, 200, 401]
     assert started == []
-    assert worst < SLOW_THREAD_START_SECONDS / 2, worst
+    # The probe ran between every two requests, and nothing held the loop for long.
+    assert len(ticks) > len(requests), ticks
+    assert max(ticks) < SLOW_THREAD_START_SECONDS / 2, max(ticks)
 
 
 # R9
