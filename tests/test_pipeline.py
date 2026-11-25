@@ -5,6 +5,7 @@ reaches a vendor: speech-to-text is replaced by a pass-through and the model is 
 import asyncio
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, date, datetime
 from typing import Any
@@ -51,7 +52,7 @@ from app.guard.output import OutputRule
 from app.main import create_app
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
-from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, open_agent_call
+from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, load_vad, open_agent_call
 from app.voice.speech import Playback
 from app.voice.speech_check import SpeechCheck
 from app.voice.vocabulary import Vocabulary, keyterms
@@ -124,6 +125,29 @@ def adapter(
 
 def turns(call: CallPipeline) -> list[dict[str, Any]]:
     return [m for m in call.messages() if m["type"] == "turn"]
+
+
+@pytest.mark.anyio
+async def test_the_vad_thread_starts_off_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pipecat gives each VAD a thread of its own for the model; started at the first
+    # analysis, it would start on the event loop's thread, which waits for it. A call's VAD
+    # comes with that thread running.
+    vad = await asyncio.to_thread(load_vad, 0.5)
+    vad.set_sample_rate(16000)
+    started: list[str] = []
+    start = threading.Thread.start
+
+    def spied(thread: threading.Thread) -> None:
+        started.append(thread.name)
+        start(thread)
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(threading.Thread, "start", spied)
+            await vad.analyze_audio(bytes(2 * vad.num_frames_required()))
+    finally:
+        await vad.cleanup()
+    assert started == []
 
 
 @pytest.mark.anyio

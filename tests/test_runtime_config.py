@@ -5,17 +5,22 @@ answer for calls that start after it."""
 
 import ast
 import asyncio
+import contextlib
+import json
 import logging
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 import pytest
 from admin_client import (
+    ADMIN_USER,
     OWN_ORIGIN,
+    PASSWORD,
     Clock,
     admin_settings,
     admin_with_clock,
@@ -23,8 +28,9 @@ from admin_client import (
     events,
     try_sign_in,
 )
-from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, offline_settings
-from fastapi import FastAPI
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, VOICE_SECRETS, offline_settings
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
@@ -49,6 +55,7 @@ from app.runtime_config import (
     LiveConfig,
     Values,
     read_config_bounded,
+    taking_calls,
 )
 from app.voice.calls import CallRegistry
 
@@ -63,12 +70,18 @@ CALL_PAGE_LINE = (
 )
 # The refusal's event: the agent refused a call, for the kill switch, naming nothing.
 REFUSED_EVENT = (None, "agent", "call_refused", "call", None, "refused", "calls_off")
-# A call site that reads memory only returns well within this.
-RETURN_BOUND_SECONDS = 0.2
-# How often the poll reads in the stalled-database test, and how long each read may take:
-# briefly and often, so that it fails many times within half a second.
+# In the stalled-database test a read of the database lasts STALL_SECONDS before it is given
+# up, and a call site that waited on one would take at least that long; one that waits on
+# nothing returns within a quarter of it, however busy the machine. The poll reads often.
+STALL_SECONDS = 2.0
+RETURN_BOUND_SECONDS = STALL_SECONDS / 4
 FAST_POLL_SECONDS = 0.05
-FAST_READ_SECONDS = 0.1
+# How long a new thread takes to start on a machine that is very busy; anything that held the
+# loop half as long fails the loop test, far above a busy runner's scheduling noise. The loop
+# probe's sleep, and how long the test waits for it to run.
+SLOW_THREAD_START_SECONDS = 0.5
+PROBE_SECONDS = 0.005
+SETTLE_SECONDS = 0.05
 # The functions that read config_changes.
 TABLE_READS = {"read_config", "read_config_bounded"}
 INSERT_CHANGE = text(
@@ -87,6 +100,29 @@ def wait_for(condition: Callable[[], bool], seconds: float) -> float:
 
 def change(key: str, value: str) -> dict[str, object]:
     return {"key": key, "value": value, "confirm": True}
+
+
+def without_waiting[Result](step: Coroutine[Any, Any, Result]) -> Result:
+    """What the coroutine returns, run in one step: it must end without suspending once, so
+    it never waited on anything, the database included."""
+    try:
+        step.send(None)
+    except StopIteration as ended:
+        return cast(Result, ended.value)
+    # Stopped mid-wait: a step that cleans up with another wait refuses to be closed.
+    with contextlib.suppress(RuntimeError):
+        step.close()
+    raise AssertionError("the call site waited")
+
+
+def route(router: APIRouter, path: str) -> APIRoute:
+    [found] = [each for each in router.routes if isinstance(each, APIRoute) and each.path == path]
+    return found
+
+
+def offer_request() -> Request:
+    """An offer as /offer's handler is given it; with calls off it is refused unread."""
+    return Request({"type": "http", "method": "POST", "path": "/offer", "headers": []})
 
 
 def next_read(client: TestClient, app: FastAPI) -> None:
@@ -167,31 +203,42 @@ async def test_calls_do_not_wait_for_config(
     opener = Opener()
 
     async def calls_go_on(engine: AsyncEngine) -> None:
-        """A call starts, and /offer answers, at once, on the values in memory, while the
-        poll's reads and the refusal's audit write go to the database `engine` reaches."""
+        """A call starts, and /offer answers, on the values in memory, without waiting on
+        anything, while the poll's reads and the refusal's audit write go to the database
+        `engine` reaches."""
         poll = ConfigPoll(
             create_session_factory(engine),
             live,
             every=FAST_POLL_SECONDS,
-            read_seconds=FAST_READ_SECONDS,
+            read_seconds=STALL_SECONDS,
         )
         refusals = AuditQueue(create_session_factory(engine), AUDIT, now=lambda: CLOSED_AT)
-        app = FastAPI()
-        registry = CallRegistry(max_calls=3, max_seconds=600)
-        app.include_router(
-            build_router(admin_settings(database), registry, opener, live, CallRefusals(refusals))
+        router = build_router(
+            admin_settings(database),
+            CallRegistry(max_calls=3, max_seconds=600),
+            opener,
+            live,
+            CallRefusals(refusals),
         )
+        app = FastAPI()
+        app.include_router(router)
         deps = deps_with(engine, live, now=lambda: CLOSED_AT)
         try:
             await poll.start()
-            # The poll's reads are given up, again and again, and the last good values stay.
-            await asyncio.sleep(0.5)
+            # A read is given up, and the last good values stay.
+            await asyncio.sleep(STALL_SECONDS + 0.5)
             assert live.values == Values(calls="off", office="open")
+            # The call sites never wait: each runs to its end in one step, without once
+            # handing the loop over, so it cannot have waited on the database or anything else.
             # A call starts on the values in memory: the office forced open at a closed hour.
+            state, script = without_waiting(start_call(new_call_id(), deps))
+            assert (state.office_open, script) == (True, ScriptId.GREETING)
+            refused = without_waiting(route(router, "/offer").endpoint(offer_request()))
+            assert (refused.status_code, json.loads(refused.body)) == (503, UNAVAILABLE)
+            # And through the whole stack, in less time than one wait on the database.
             (state, script), took = await timed(start_call(new_call_id(), deps))
             assert (state.office_open, script) == (True, ScriptId.GREETING)
             assert took < RETURN_BOUND_SECONDS, took
-            # /offer refuses at once, without waiting on the refusal's audit write.
             transport = httpx2.ASGITransport(app=app)
             async with httpx2.AsyncClient(transport=transport, base_url=OWN_ORIGIN) as client:
                 answer, took = await timed(client.post("/offer", json=OFFER))
@@ -242,6 +289,71 @@ async def test_calls_do_not_wait_for_config(
             if isinstance(node, ast.Name | ast.Attribute) and named & TABLE_READS:
                 readers.add(path.relative_to(REPO_ROOT).as_posix())
     assert readers == {"app/runtime_config.py", "app/api/admin.py", "app/api/writes.py"}
+
+
+@pytest.mark.anyio
+async def test_call_routes_never_hold_the_loop(
+    silent_server: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On a busy machine a new thread is slow to start, and the thread that starts it waits
+    # meanwhile. A route or a dependency handed to the thread pool would make the event loop
+    # wait so, and every running call's audio with it; with the database stalled as well.
+    started: list[str] = []
+    start = threading.Thread.start
+
+    def slow_start(thread: threading.Thread) -> None:
+        started.append(thread.name)
+        time.sleep(SLOW_THREAD_START_SECONDS)
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", slow_start)
+    settings = offline_settings(
+        postgres_host="127.0.0.1",
+        postgres_port=silent_server,
+        app_role="all",
+        admin_user=ADMIN_USER,
+        admin_password=PASSWORD,
+    )
+    app = create_app(settings, open_call=Opener(), config=taking_calls())
+    # A probe that sleeps a few milliseconds at a time and keeps the longest it overslept:
+    # what anything else running on the loop held it for. It runs whenever this test waits.
+    ticks: list[float] = []
+
+    async def probe() -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            before = loop.time()
+            await asyncio.sleep(PROBE_SECONDS)
+            ticks.append(loop.time() - before - PROBE_SECONDS)
+
+    probing = asyncio.ensure_future(probe())
+    token = {"Authorization": f"Bearer {VOICE_SECRETS['CALL_ACCESS_TOKEN']}"}
+    requests = [
+        ("GET", "/health", {}),
+        ("GET", "/", {}),
+        ("GET", "/ice-servers", token),
+        ("POST", "/offer", token),
+        ("GET", "/admin/api/session", {}),
+    ]
+    answers = []
+    transport = httpx2.ASGITransport(app=app)
+    try:
+        await asyncio.sleep(SETTLE_SECONDS)
+        async with httpx2.AsyncClient(transport=transport, base_url=OWN_ORIGIN) as client:
+            for method, path, headers in requests:
+                body = OFFER if method == "POST" else None
+                answers.append(await client.request(method, path, json=body, headers=headers))
+                # The probe wakes now, and measures how long the request held the loop.
+                await asyncio.sleep(SETTLE_SECONDS)
+    finally:
+        probing.cancel()
+        # The app was never started: the calls its lifespan would close are closed here.
+        await app.state.calls.close()
+    assert [answer.status_code for answer in answers] == [200, 200, 200, 200, 401]
+    assert started == []
+    # The probe ran between every two requests, and nothing held the loop for long.
+    assert len(ticks) > len(requests), ticks
+    assert max(ticks) < SLOW_THREAD_START_SECONDS / 2, max(ticks)
 
 
 # R9

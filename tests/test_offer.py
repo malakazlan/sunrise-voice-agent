@@ -2,6 +2,7 @@ import asyncio
 import hmac
 import json
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -16,7 +17,7 @@ from app.agent.turn_record import TurnRecorder
 from app.api.offer import OpenCall
 from app.audit.queue import AuditQueue
 from app.config import Settings
-from app.main import create_app
+from app.main import create_app, worker_count
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
@@ -619,6 +620,53 @@ def test_shutdown_drains_both_queues_within_one_limit(monkeypatch: pytest.Monkey
     took = asyncio.run(main())
     assert given == [5, 5]
     assert took < 6, took
+
+
+@pytest.mark.parametrize(
+    ("cpus", "calls", "workers"),
+    [
+        # Never fewer than Python's own default for the loop's executor, min(32, cpus + 4)...
+        (8, 3, 12),
+        (64, 1, 32),
+        (None, 1, 5),
+        (1, 1, 5),
+        # ...and two for each call at once (its audio's encoding and one lookup or load at
+        # set-up), and two to spare.
+        (2, 3, 8),
+        (4, 3, 8),
+        (16, 20, 42),
+        (64, 20, 42),
+    ],
+)
+def test_worker_count(cpus: int | None, calls: int, workers: int) -> None:
+    assert worker_count(cpus, calls) == workers
+
+
+def test_worker_threads_are_started_before_the_first_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Work a call hands to the loop's default executor (the VAD's loading, a host's address)
+    # must find a worker running: a worker started then is started on the event loop's
+    # thread, which waits for it, and every call's audio with it.
+    calls = 3
+    app = offer_app(voice_settings(max_concurrent_calls=calls))
+    started: list[str] = []
+    start = threading.Thread.start
+
+    def spied(thread: threading.Thread) -> None:
+        started.append(thread.name)
+        start(thread)
+
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            with monkeypatch.context() as patched:
+                patched.setattr(threading.Thread, "start", spied)
+                # As many at once as there may be calls, each on a worker of its own.
+                together = threading.Barrier(calls)
+                await asyncio.gather(*(asyncio.to_thread(together.wait, 5) for _ in range(calls)))
+
+    asyncio.run(main())
+    assert started == []
 
 
 def test_shutdown_ends_active_calls() -> None:

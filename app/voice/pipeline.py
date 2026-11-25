@@ -787,6 +787,16 @@ class VendorsNotConfiguredError(RuntimeError):
     refused."""
 
 
+def load_vad(stop_seconds: float) -> SileroVADAnalyzer:
+    """A call's VAD, its model loaded and the thread it runs the model on started. Run off
+    the event loop. Pipecat (1.17.0) gives each analyzer an executor of one thread, which
+    starts at the first analysis: on the event loop's thread, which would wait for it, and
+    every call's audio with it."""
+    vad = SileroVADAnalyzer(params=VADParams(stop_secs=stop_seconds))
+    vad._executor.submit(int).result()
+    return vad
+
+
 async def open_agent_call(
     settings: Settings,
     deps: Deps,
@@ -812,9 +822,7 @@ async def open_agent_call(
     stt = speech_to_text(settings.deepgram_api_key, vocabulary.terms)
     tts = text_to_speech(settings)
     # Loading the VAD's model reads a file; off the event loop, so other calls' audio flows.
-    vad = await asyncio.to_thread(
-        SileroVADAnalyzer, params=VADParams(stop_secs=settings.vad_stop_seconds)
-    )
+    vad = await asyncio.to_thread(load_vad, settings.vad_stop_seconds)
     ice_servers = server_ice_servers(settings, now=time.time())
     # Pipecat's own connect timeout closes the peer connection from inside the task it then
     # cancels (pipecat-ai 1.17.0), leaving the close unfinished when TURN is in use, so every

@@ -1,12 +1,15 @@
 import asyncio
 import logging
+import os
+import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.call_record import drain_call_records
@@ -38,6 +41,39 @@ CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 # queued: both are drained at once under this one limit, and what is left then is dropped, so a
 # stalled database cannot hold the stop past the container's grace period.
 QUEUES_WAIT_SECONDS = 5
+# The loop's default executor runs what a call hands it: aiortc's encoding of each audio frame
+# it sends, one at a time for the call's one track, and at set-up one load or lookup at a time
+# (the VAD's model, the STUN server's address); so two workers per call at once. Decoding runs
+# on aiortc's own thread for the call. Address lookups of the database's host share it, and
+# can take seconds: hence the spare workers. How long the workers may take to start, at
+# start-up.
+WORKERS_PER_CALL = 2
+SPARE_WORKERS = 2
+WORKERS_START_SECONDS = 10
+
+
+def worker_count(cpus: int | None, calls: int) -> int:
+    """How many workers the loop's default executor gets: never fewer than Python's own
+    default, min(32, cpus + 4), and enough for every call at once with some to spare."""
+    return max(min(32, (cpus or 1) + 4), WORKERS_PER_CALL * calls + SPARE_WORKERS)
+
+
+async def start_workers(count: int) -> None:
+    """Give the running loop a default executor of `count` workers, every one started now. A
+    worker started later would start on the event loop's thread, which waits for it, and every
+    call's audio with it. Each worker waits until all have started, so each is its own; a
+    worker that does not start in WORKERS_START_SECONDS stops the start-up."""
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="call_worker")
+    loop.set_default_executor(executor)
+    together = threading.Barrier(count)
+    await asyncio.gather(
+        *(
+            loop.run_in_executor(executor, together.wait, WORKERS_START_SECONDS)
+            for _ in range(count)
+        )
+    )
+    logger.info("call_workers_started workers=%d", count)
 
 
 def build_deps(settings: Settings, engine: AsyncEngine, config: LiveConfig) -> Deps:
@@ -102,6 +138,8 @@ def create_app(
         poll = ConfigPoll(deps.sessions, config)
         _app.state.poll = poll
         await poll.start()
+        # Before the first call, never during one.
+        await start_workers(worker_count(os.cpu_count(), settings.max_concurrent_calls))
         yield
         await poll.stop()
         refusals.close()
@@ -135,14 +173,17 @@ def create_app(
     app.state.vocabulary = vocabulary
     app.state.turns = turns
     app.state.config = config
+    page = CALL_PAGE.read_bytes()
 
+    # Coroutines, so that nothing here runs in the thread pool, whose new threads hold the
+    # event loop while they start (app/api/offer.py); the page is read once, here.
     @app.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/", include_in_schema=False)
-    def call_page() -> FileResponse:
-        return FileResponse(CALL_PAGE, media_type="text/html")
+    async def call_page() -> Response:
+        return Response(page, media_type="text/html")
 
     app.include_router(build_router(settings, calls, open_call, config, refusals))
 

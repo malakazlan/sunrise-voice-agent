@@ -1,18 +1,24 @@
 """APP_ROLE: one image, three ways to run it. `all` serves everything; `voice` the calls and no
 admin route; `admin` the admin API, and no call."""
 
+import inspect
 import json
 import logging
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from admin_client import ADMIN_USER, PASSWORD, SIGNED_IN, admin_settings, client_from
 from conftest import TEST_AUDIT_KEY, VOICE_SECRETS
+from fastapi.dependencies.models import Dependant
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
 
 from app import server
 from app.config import Settings, StartupSettings
@@ -190,6 +196,86 @@ def test_only_the_calls_poll_the_config(
             assert client.get("/health").status_code == 200
         polls[role] = len(started)
     assert polls == {"admin": 0, "voice": 1, "all": 1}
+
+
+def is_coroutine(handler: object) -> bool:
+    """Whether a route, dependency, exception handler or middleware runs on the event loop: a
+    coroutine function (or async generator), or an object whose call is one. Anything else
+    FastAPI and Starlette hand to a thread pool, whose new threads hold the loop as they
+    start."""
+    call = handler if inspect.isroutine(handler) else type(handler).__call__
+    return inspect.iscoroutinefunction(call) or inspect.isasyncgenfunction(call)
+
+
+def dependencies(dependant: Dependant) -> Iterator[object]:
+    for each in dependant.dependencies:
+        if each.call is not None:
+            yield each.call
+        yield from dependencies(each)
+
+
+def handlers(app: object) -> Iterator[tuple[str, object]]:
+    """Everything the app runs for a request, by where it is: the routes, the mounted apps'
+    routes, every dependency, the exception handlers and the middleware's dispatch. Wrappers
+    of an app (the admin API's headers and CORS) are looked through."""
+    while not isinstance(app, Starlette) and hasattr(app, "_app"):
+        app = app._app
+    if not isinstance(app, Starlette):
+        yield "asgi app", app
+        return
+    for handler in app.exception_handlers.values():
+        yield "exception handler", handler
+    for middleware in app.user_middleware:
+        if "dispatch" in middleware.kwargs:
+            yield "middleware", middleware.kwargs["dispatch"]
+    yield from routes("", app.routes)
+
+
+def routes(prefix: str, found: list[Any]) -> Iterator[tuple[str, object]]:
+    for route in found:
+        if isinstance(route, APIRoute):
+            yield prefix + route.path, route.endpoint
+            for call in dependencies(route.dependant):
+                yield f"{prefix}{route.path} dependency", call
+        elif isinstance(route, Mount):
+            yield from ((f"{prefix}{route.path}{path}", call) for path, call in handlers(route.app))
+        elif isinstance(route, Route):
+            yield prefix + route.path, route.endpoint
+        else:
+            # FastAPI 0.165 keeps an included router as one route of its own, with the
+            # dependencies given at inclusion.
+            context = route.include_context
+            for given in context.dependencies:
+                yield f"{prefix}{context.prefix} dependency", given.dependency
+            yield from routes(prefix + context.prefix, route.original_router.routes)
+
+
+def test_every_handler_is_a_coroutine(database: StartupSettings) -> None:
+    # Nothing a request runs goes to a thread pool: a plain function would, and starting a
+    # worker thread holds the event loop, the calls' audio with it, until the thread runs.
+    apps = {
+        "voice": create_app(
+            admin_settings(database, app_role="voice", admin_user=None, admin_password=None)
+        ),
+        "all": create_app(admin_settings(database)),
+        "admin": server.create_app(admin_role(database)),
+    }
+    checked = {}
+    for role, app in apps.items():
+        found = list(handlers(app))
+        checked[role] = {path for path, _handler in found}
+        plain = [path for path, handler in found if not is_coroutine(handler)]
+        assert plain == [], (role, plain)
+    # The walk reaches what matters: the calls' routes and their token check, the admin API
+    # mounted beside them or alone, its reads' and writes' dependencies.
+    assert {"/offer", "/offer dependency", "/ice-servers", "/health", "/"} <= checked["voice"]
+    assert {"/offer", "/admin/api/queue", "/admin/api/queue dependency"} <= checked["all"]
+    assert {
+        "/health",
+        "/admin/api/config",
+        "/admin/api/queue/{source}/{row_id}/callback",
+        "exception handler",
+    } <= checked["admin"]
 
 
 def test_all_role_serves_both(database: StartupSettings) -> None:
