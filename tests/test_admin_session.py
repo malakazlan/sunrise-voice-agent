@@ -301,6 +301,7 @@ def test_sign_in_rules(
             "user": ADMIN_USER,
             "csrf_token": token,
             "expires_in": 30 * 60,
+            "calls": "on",
             "office_open": True,
             "time_zone": "America/New_York",
         }
