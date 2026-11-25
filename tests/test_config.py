@@ -438,6 +438,31 @@ def test_ci_checks_each_service_against_its_role() -> None:
     assert '("console",' not in workflow
 
 
+def readme_configuration() -> str:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "\n## Configuration\n" in readme
+    return readme.split("\n## Configuration\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_readme_variable_tables_match_the_settings() -> None:
+    # R2: the README's table of variables is every setting, and its table of services gives
+    # each Python service exactly the fields CI checks it against.
+    section = readme_configuration()
+    variables = set(re.findall(r"^\| `([A-Z_]+)` \|", section, re.MULTILINE))
+    assert variables == every_variable()
+    services = {
+        service: set(re.findall(r"`([A-Z_]+)`", names))
+        for service, names in re.findall(r"^\| `([a-z-]+)` \| (.*) \|$", section, re.MULTILINE)
+    }
+    assert services["app"] == {name.upper() for name in VOICE_FIELDS}
+    assert services["admin-api"] == {name.upper() for name in ADMIN_FIELDS} | {
+        "FORWARDED_ALLOW_IPS"
+    }
+    assert services["coturn"] == {"TURN_HOST", "TURN_SHARED_SECRET", "MAX_CONCURRENT_CALLS"}
+    assert services["console"] == {"ADMIN_API_ORIGIN"}
+    assert services["db"] == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+
+
 def test_the_console_gets_only_the_admin_api_origin() -> None:
     # The admin console (console/) holds no secret: its one setting is the admin API's origin, and
     # neither that nor its host port reaches any other service.
