@@ -67,7 +67,11 @@ build time and there is no `NEXT_PUBLIC_*` value. Telemetry is off (`NEXT_TELEME
   The session cookie belongs to the API's origin and is `HttpOnly`; the console never sees it.
 - **Masked values stay masked.** Masks are shown as the API wrote them (set in a grey chip),
   never filled in or reformatted.
-- **Bounded reads.** Nothing polls. Live calls come from the API's stream, one per tab, closed
+- **Bounded reads.** One read is on a timer: the shell reads `GET /session` again every 60 s
+  while the tab is shown (the API does not audit it, and it does not extend the idle time), so
+  the office state and the calls banner follow a change someone else made. The Config page reads
+  the config when opened and after a change, never on window focus: each read is audited. Live
+  calls come from the API's stream, one per tab, closed
   while the tab is hidden and on leaving the page, and retried after a lost connection on a
   growing delay (2 s, 4 s, 8 s … at most 30 s). When another tab of the same session opens the
   stream, this one stops and offers "Use here". Every request has a timeout: 10 s, and 120 s for
@@ -82,19 +86,26 @@ build time and there is no `NEXT_PUBLIC_*` value. Telemetry is off (`NEXT_TELEME
   `base-uri 'none'`; `form-action 'self'`), `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer` and a `Permissions-Policy` denying camera, microphone and
   geolocation. No `X-Powered-By`. Fonts (IBM Plex, OFL) are bundled from `app/fonts`.
-- **Every write asks first.** Mark handled, Show callback details and the two settings go
-  through one confirmation dialog (`components/confirm-dialog.tsx`) or an explicit button; the
-  dialog's focus starts on Cancel, and Cancel sends nothing. A config change is sent as
-  `{key, value, confirm: true}` only after the dialog is confirmed. No write is retried. A row
-  shows "Handled" only once the API has answered; a refused write leaves the page as it was and
-  says why on the row (a 403 asks to sign in again; a 429 says when to try again).
+- **The writes.** Mark handled and the two settings go through one confirmation dialog
+  (`components/confirm-dialog.tsx`): its focus starts on Cancel, Cancel or Escape sends nothing,
+  and a click outside does nothing. Show callback details has no dialog: it is its own explicit
+  button, recorded in the audit log and limited by the API. A config change is sent as
+  `{key, value, confirm: true}` only after the dialog is confirmed. No write is retried. Each
+  row's write is awaited on its own, so two at once each get their answer. A row shows
+  "Handled" only once the API has answered; a refused write leaves the row as it was and says
+  why on it (a 403 asks to sign in again; a 429 says when to try again).
 - **Callback details are held in one place.** The revealed name and number live in the
-  Requests page's state only: fetched by a plain call through the fetch wrapper (never a query
-  or a mutation, so never in the query cache), never logged, never in a message, no copy button,
-  and cleared on Hide, on leaving the page, when the list is read again and after 60 seconds.
-- **The calls banner** reads `calls` from the session the shell already polls: switched off,
-  every page says new calls are refused; unknown (`null`), a neutral notice that the settings
-  could not be read. No page asks for the config to show it.
+  Requests page's state only, for one row at a time: fetched by a plain call through the fetch
+  wrapper (never a query or a mutation, so never in the query cache), never logged, never in a
+  message, no copy button, and cleared on Hide, on leaving the page, when the list is read again
+  and after 60 seconds. An answer that comes after another row was asked for, the list was read
+  again or the page was left is dropped. A ten-digit number is shown grouped (`555 201 3344`),
+  anything else as sent. Focus moves to the details when shown and back to the row's button when
+  they hide; a live region says "Callback details shown" or "hidden", never the values.
+  `next.config.ts` must not turn on `cacheComponents`: it keeps a left page alive, hidden.
+- **The calls banner** reads `calls` from the session the shell re-reads every 60 s: switched
+  off, every page says new calls are refused; unknown (`null`), a neutral notice that the
+  settings could not be read. No page asks for the config to show it.
 - **Times** are the clinic's, in the time zone the API names, said once in the top bar.
 - **Light theme only.** Status is never shown by colour alone; every control is at least 44 px
   tall on touch screens; motion is off when the system asks for reduced motion.
@@ -103,22 +114,25 @@ build time and there is no `NEXT_PUBLIC_*` value. Telemetry is off (`NEXT_TELEME
 
 ## Tests
 
-| Test                                              | What it holds                                                                                                                                                                          |
-| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lib/api/client.test.ts`                          | credentials, timeout, JSON only, the anti-forgery header, 401 to sign-in, the limiter's answer                                                                                         |
-| `app/providers.test.tsx`                          | a 401 anywhere sends the user to `/login`                                                                                                                                              |
-| `tests/no-stray-fetch.test.ts`                    | from each file's syntax tree: no file but the fetch wrapper names `fetch`; none but the stream client names `EventSource`                                                              |
-| `tests/no-browser-storage.test.ts`                | from each file's syntax tree: no browser storage, cookie, `console` or `dangerouslySetInnerHTML`, under any alias                                                                      |
-| `lib/api/schemas.test.ts`                         | an answer of the wrong shape is refused and ends in the error state                                                                                                                    |
-| `tests/fixtures-not-shipped.test.ts`              | nothing of the fixture layer is in the build                                                                                                                                           |
-| `tests/no-remote-origins.test.ts`                 | the browser's files load nothing from another origin                                                                                                                                   |
-| `app/(shell)/metrics/metrics.test.tsx`            | a figure the API left out reads "Not enough calls yet", never a number                                                                                                                 |
-| `lib/api/stream.test.ts`                          | one stream per tab, renew, paused, replaced, signed out, the retry delays, closed when hidden and on unmount                                                                           |
-| `app/(shell)/requests/requests-callback.test.tsx` | callback details shown in the row only; none in the query or mutation cache, storage, address or console; cleared on Hide, refetch, 60 s and unmount; a 429 or failure reveals nothing |
-| `lib/api/mutations.test.ts`                       | nothing is sent before the dialog is confirmed, Cancel sends nothing, and no write is retried even by a retrying client                                                                |
-| `app/(shell)/config/config.test.tsx`              | a config change is sent with `confirm: true` only after confirming; Cancel sends nothing; focus starts on Cancel                                                                       |
-| `app/(shell)/requests/requests-handled.test.tsx`  | a row reads "Handled" only once the API answers; a failure or 403 leaves it unchanged and says so                                                                                      |
-| `components/settings-banner.test.tsx`             | calls off: new calls are refused; unknown: a neutral notice; on: nothing                                                                                                               |
+| Test                                              | What it holds                                                                                                                                                                                                                                                         |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lib/api/client.test.ts`                          | credentials, timeout, JSON only, the anti-forgery header, 401 to sign-in, the limiter's answer                                                                                                                                                                        |
+| `app/providers.test.tsx`                          | a 401 anywhere sends the user to `/login`                                                                                                                                                                                                                             |
+| `tests/no-stray-fetch.test.ts`                    | from each file's syntax tree: no file but the fetch wrapper names `fetch`; none but the stream client names `EventSource`                                                                                                                                             |
+| `tests/no-browser-storage.test.ts`                | from each file's syntax tree: no browser storage, cookie, `console` or `dangerouslySetInnerHTML`, under any alias                                                                                                                                                     |
+| `lib/api/schemas.test.ts`                         | an answer of the wrong shape is refused and ends in the error state                                                                                                                                                                                                   |
+| `tests/fixtures-not-shipped.test.ts`              | nothing of the fixture layer is in the build                                                                                                                                                                                                                          |
+| `tests/no-remote-origins.test.ts`                 | the browser's files load nothing from another origin                                                                                                                                                                                                                  |
+| `app/(shell)/metrics/metrics.test.tsx`            | a figure the API left out reads "Not enough calls yet", never a number                                                                                                                                                                                                |
+| `lib/api/stream.test.ts`                          | one stream per tab, renew, paused, replaced, signed out, the retry delays, closed when hidden and on unmount                                                                                                                                                          |
+| `app/(shell)/requests/requests-callback.test.tsx` | callback details shown in the row only; none in the query or mutation cache, storage, address (decoded) or console; cleared on Hide, refetch, 60 s and unmount; a 429 or failure reveals nothing; one row at a time, a late answer dropped; focus and the live region |
+| `lib/api/mutations.test.ts`                       | nothing is sent before the dialog is confirmed, Cancel sends nothing, and no write is retried even by a retrying client                                                                                                                                               |
+| `app/(shell)/config/config.test.tsx`              | a config change is sent with `confirm: true` only after confirming; Cancel sends nothing; focus starts on Cancel; read on opening and after a change, not on focus                                                                                                    |
+| `app/(shell)/requests/requests-handled.test.tsx`  | a row reads "Handled" only once the API answers; a failure or 403 leaves it unchanged and says so; two at once each get their answer; focus never on a disabled button                                                                                                |
+| `components/settings-banner.test.tsx`             | calls off: new calls are refused; unknown: a neutral notice; on: nothing                                                                                                                                                                                              |
+| `components/app-shell.test.tsx`                   | the shell shows the calls-off banner; it re-reads the session every 60 s while shown, not while hidden                                                                                                                                                                |
+| `lib/format.test.ts`                              | a ten-digit callback number is grouped, anything else left as sent                                                                                                                                                                                                    |
+| `tests/no-cache-components.test.ts`               | `next.config.ts` does not turn on `cacheComponents`                                                                                                                                                                                                                   |
 
 The CI `docker` job builds the image and checks `/health`, every header, and the whole
 Content-Security-Policy against the expected one with the nonce replaced by a placeholder.

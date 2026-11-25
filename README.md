@@ -967,10 +967,12 @@ detail, requests, appointments and slots, the audit log with the chain check, gu
 metrics, config, and sign-in. How to run it, its rules and its tests are in `console/README.md`.
 
 - Its writes: mark a request handled, show a request's callback details, and switch the phone
-  assistant on or off or set the office open, closed or by the schedule. Each asks in a dialog
-  first and is never retried; the API decides and audits every one. Revealed callback details
-  stay in the page's state only, and are cleared on Hide, on leaving, on refetch and after 60 s.
-  While the assistant is off every page says so, from the session the console already reads.
+  assistant on or off or set the office open, closed or by the schedule. Marking handled and
+  each setting change ask in a dialog first; showing callback details is its own explicit
+  button, recorded in the audit log and limited by the API. None is retried; the API decides and
+  audits every one. Revealed callback details stay in the page's state only, and are cleared on
+  Hide, on leaving, on refetch and after 60 s. While the assistant is off every page says so,
+  from the session the console re-reads every 60 s.
 
 - One setting, `ADMIN_API_ORIGIN` (the admin API's exact origin), read when a request is served:
   one image for every environment. Without a valid one the console answers 503 to everything.
