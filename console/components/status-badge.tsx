@@ -16,7 +16,7 @@ import {
 import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
-import type { EndReason, Phase } from "@/lib/api/schemas";
+import type { AuditEvent, EndReason, Phase } from "@/lib/api/schemas";
 import { END_REASON_LABEL, PHASE_LABEL } from "@/lib/labels";
 
 // Every status is a word with an icon; colour only repeats what the word says. Orange means an
@@ -127,7 +127,14 @@ export function CallerBadge({
   );
 }
 
-export function OutcomeBadge({ outcome }: { outcome: "success" | "failure" | "refused" }) {
+export function OutcomeBadge({ outcome }: { outcome: AuditEvent["outcome"] }) {
+  if (outcome === "already" || outcome === "unchanged") {
+    return (
+      <StatusPill tone="neutral" icon={CircleDashed}>
+        {outcome}
+      </StatusPill>
+    );
+  }
   if (outcome === "success") {
     return (
       <StatusPill tone="good" icon={Check}>

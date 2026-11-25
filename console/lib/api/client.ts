@@ -15,6 +15,8 @@ export type ApiErrorKind =
   | "unauthorized"
   | "rate_limited"
   | "not_found"
+  // 403: the anti-forgery check or the origin rule refused it; the session is no longer this one.
+  | "forbidden"
   | "rejected"
   | "unavailable"
   | "invalid_answer"
@@ -64,6 +66,7 @@ function kindOf(status: number): ApiErrorKind {
   if (status === 401) return "unauthorized";
   if (status === 429) return "rate_limited";
   if (status === 404) return "not_found";
+  if (status === 403) return "forbidden";
   if (status >= 500) return "unavailable";
   return "rejected";
 }
@@ -125,6 +128,13 @@ export class ApiClient {
   async signOut(): Promise<void> {
     await this.exchange({ method: "DELETE", path: "/session" });
     this.csrfToken = null;
+  }
+
+  // A write: POST of a JSON body, with the anti-forgery token. `created` tells a new change
+  // (201) from one the API found already made (200).
+  async post<T>(path: string, schema: ZodType<T>, body: object): Promise<{ created: boolean; answer: T }> {
+    const response = await this.exchange({ method: "POST", path, body });
+    return { created: response.status === 201, answer: await this.parse(response, schema) };
   }
 
   private async exchange({
