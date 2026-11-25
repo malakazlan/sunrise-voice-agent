@@ -1,6 +1,46 @@
 # Development, Compose details and checks
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+Everything a change must pass runs in CI on every pull request, and the same commands run
+locally. Nothing is merged on a red check.
+
+```mermaid
+flowchart LR
+  PR["Pull request"] --> L["lint<br/>ruff"]
+  PR --> T["types<br/>mypy strict"]
+  PR --> U["test<br/>pytest against Postgres"]
+  PR --> C["console<br/>lint, types, build, tests"]
+  PR --> G["gitleaks<br/>secret scan"]
+  PR --> D["docker<br/>build and stack smoke test"]
+  L --> M["Merge"]
+  T --> M
+  U --> M
+  C --> M
+  G --> M
+  D --> M
+```
+
+## The checks
+
+| Check | Command | What it covers |
+|---|---|---|
+| Lint and format | `uv run ruff check .` and `uv run ruff format --check .` | Style and common mistakes |
+| Types | `uv run mypy --strict app tests scripts evals` | Strict typing across the service, the tests and the evals |
+| Tests | `uv run pytest` | Over 900 tests against a real Postgres |
+| Evals | `uv run python -m evals` | The 13 call scenarios, scripted |
+| Console | `npm run lint`, `npm run typecheck`, `npm run build`, `npm test` in `console/` | The staff web app |
+| Secret scan | gitleaks over the history | No secret ever committed |
+| Stack | Docker build and a Compose smoke test | Every service healthy, sign-in works, scripted WebRTC calls connect through the relay |
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Compose
 
@@ -86,3 +126,5 @@ and sets it up in every test database, so tests of the application run as that r
 schema checks, the seed and the tamper fixture use the owner. Roles belong to the whole
 server, so every run and every role test uses a name of its own, and the role is dropped when
 the run ends; one left behind by a crashed run never meets another run.
+
+</details>

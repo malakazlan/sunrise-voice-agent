@@ -1,6 +1,52 @@
 # Output guard
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+The model writes the answer, but code decides whether it is spoken. Every sentence of the
+model's reply is checked before it reaches text-to-speech. A sentence that breaks a rule is
+never said; a safe scripted line is said in its place, and the block is counted on the console's
+Guardrails page.
+
+```mermaid
+flowchart LR
+  M["Model's reply"] --> S["Split into sentences"]
+  S --> R{"Rules, in order"}
+  R -->|"no rule matches"| OK["Spoken to the caller"]
+  R -->|"a rule matches"| B["Sentence withheld"]
+  B --> L["Safe scripted line<br/>said instead"]
+  B --> A["Counted as a guard block"]
+```
+
+## The rules
+
+| Rule | What it stops | What is said instead |
+|---|---|---|
+| `ssn_last4` | The caller's own last four digits being read back, in numerals or words | The fallback line |
+| `ssn_shape` | Any nine digits in a row, unless they are digits the caller just gave (a phone number being read back) | The fallback line |
+| `phi_outside_gate` | A money amount, a lab status or a dosage said before verification or while the office is closed | The fallback line |
+| `medical_advice` | "You should take...", doses, starting or stopping a medication | "I'm not able to give medical advice. I can send a message to your doctor instead." |
+| `refill_promise` | Saying a refill is approved or ready | "I'm not able to confirm that a refill is approved. I can send the request to our team." |
+
+## Why it exists
+
+- The prompt tells the model not to give advice or promise a refill, but a prompt is a request,
+  not a guarantee. The guard is the guarantee.
+- Scripted lines are written by us and are said word for word, so they are not checked.
+- The guard is pure code with no database, network or clock, so it is fast and fully testable.
+
+## Known limit
+
+The rules are patterns. They cannot catch every possible phrasing of advice, which is why the
+tool gate, not this guard, is what keeps patient data from an unverified caller.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 Every sentence of the model's own answer is checked in code before it is returned
 (`app/guard/output.py`, pure: no database, network or clock). Scripted lines are code's and are
@@ -62,3 +108,5 @@ Limits of the output guard:
 - A verified caller's last four is only known when they gave it on this call; a sentence that
   says another patient's digits passes `ssn_last4` (the model never has them: tools act on the
   caller's own record only).
+
+</details>

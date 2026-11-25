@@ -1,6 +1,65 @@
 # Evals
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+An eval is one whole phone call, run as text. It goes through exactly the same turn loop a live
+call uses (the input guard, the model, the tool gate, the tools, the output guard), with only
+the microphone and the speaker removed. Thirteen scenarios cover the seven calls of the
+assignment and the edges around them.
+
+```mermaid
+flowchart LR
+  F["Scenario file<br/>caller turns and expectations"] --> R["Eval runner"]
+  R --> DB[("Fresh database<br/>for this run")]
+  R --> L["The live turn loop"]
+  L <--> M{"Model"}
+  M -->|"scripted mode"| S["Replies from the file"]
+  M -->|"real mode"| H["Claude Haiku"]
+  L --> X["Checks"]
+  X --> P["Pass or the first unmet expectation"]
+```
+
+## Two modes
+
+| Mode | The model's replies | Where it runs | What it proves |
+|---|---|---|---|
+| Scripted | Taken from the scenario file | In CI, on every change | The guards, the gate, the tools and the database rows behave as designed |
+| Real | The real Claude Haiku model | By hand, with a key | The model, given our prompt and tools, actually makes the right choices |
+
+Both matter. The scripted run cannot see how a real model behaves: the first real run passed 7
+of 13 scenarios and exposed six defects the scripted run had missed.
+
+## What each run checks
+
+- The scripted lines the agent said, such as the fail line or the 911 line.
+- The tools that were called, with which arguments, and what they returned.
+- The call's final phase and whether the caller ended up verified.
+- The rows written to the database, and the audit events, in order.
+- Text that must never appear: SSN digits in anything the model was sent, advice in anything
+  the caller heard.
+- The stored call record: masked, with stopped turns shown as markers.
+
+## Running them
+
+```sh
+uv run python -m evals                          # scripted
+uv run python -m evals --model real --runs 5    # real model; needs ANTHROPIC_API_KEY
+```
+
+## Known limit
+
+A scenario expects one exact path. A real model that reaches the same correct end by asking one
+extra confirming question fails the scenario, because the scripted caller cannot answer a
+question it did not expect.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 The demo calls, run as text through the turn loop a live call uses, in `evals/`. Each
 scenario file in `evals/scenarios/` holds the call's clock (`now`), the caller's turns, the
@@ -43,3 +102,5 @@ commands are in the README's "Testing and evals".
   another path to the same end, fails the scenario. Real mode has no judge of the model's
   wording beyond the strings a scenario forbids. `s09` forbids the phrasings of an approval,
   not the word: `refill_no_promise` itself says "a refill is approved" to deny it.
+
+</details>

@@ -1,6 +1,63 @@
 # Identity verification and the input guard
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+Before any patient information is shared, the caller must give a full name, a date of birth and
+the last four digits of their SSN, and all three must match the same single record. Code makes
+that decision. The model only passes on the name and the date; it never sees the digits and
+cannot mark anyone as verified.
+
+```mermaid
+flowchart TD
+  A["Caller gives full name<br/>and date of birth"] --> B["Model calls verify_identity"]
+  B --> C["Code says a fixed line:<br/>say only the last four digits"]
+  C --> D["Caller says the digits"]
+  D --> E{"Input guard<br/>stops the turn"}
+  E -->|"model, logs and transcript get nothing"| F["Code checks all three<br/>against one record"]
+  F -->|"match"| G["Verified:<br/>patient tools unlocked"]
+  F -->|"no match"| H["The same fail line,<br/>whatever was wrong"]
+  H -->|"try again"| A
+  H -->|"third failure on this call"| I["Locked: staff offered"]
+```
+
+## What the input guard does
+
+The input guard (`app/guard/input.py`) is plain code that reads every caller turn before the
+model does.
+
+| Check | When | What happens |
+|---|---|---|
+| Emergency | Every turn, every phase | The 911 line is said at once and the call ends; the model sees nothing of the turn |
+| SSN step | While the agent is waiting for the last four digits | Any turn with a number is stopped whole and its digits go to code |
+| Redaction | Every turn | SSN-shaped numbers and digits after a cue such as "social" are hidden from the model |
+| Override attempts | Every turn | "Ignore your instructions" is flagged for the audit log and the guardrail counts |
+| Third party | Every turn | A request about someone else is flagged; no tool can act on another record anyway |
+
+## Rules worth knowing
+
+- **One fail line.** A wrong name, a wrong date and wrong digits get the same words, so a
+  caller learns nothing about which part was wrong.
+- **Locks.** The third failure locks verification for the call and offers staff. Five failures
+  in an hour lock that identity across calls.
+- **Attempts are counted under a keyed hash**, never a name or a date.
+- **No way around it.** While a claim is pending or locked, the call cannot switch to a
+  new-patient booking, where numbers are allowed through.
+- **After the check** the model is told only that the digits were checked and whether the
+  caller is verified.
+
+## Known limit
+
+Four digits that read as a year (1900 to 2099), said before the agent asks for them and without
+a cue such as "SSN", reach the model.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 Before any patient information, the caller gives a full name, a date of birth and the last
 four digits of their SSN; all three must match one record, and the digits never reach the
@@ -90,3 +147,5 @@ Limits, stated plainly:
   the step.
 - `pydantic`'s `errors()` returns a rejected value when asked for its input; the error's text
   form does not. No application code reads `errors()` of a state.
+
+</details>

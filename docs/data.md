@@ -1,6 +1,68 @@
 # Data, database roles, audit log and logs
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+Everything is in one Postgres database. Two things about it matter most for a healthcare
+system: the application connects as a role that **cannot change the audit log**, and the audit
+log is **hash-chained**, so a change to any past event can be detected.
+
+```mermaid
+flowchart LR
+  subgraph chain["audit_events: each event's HMAC covers the event and the one before it"]
+    E1["Event 1"] --> E2["Event 2"] --> E3["Event 3"] --> E4["Event 4"]
+  end
+  owner["Database owner<br/>start-up steps only"] -->|"migrate, set up role, seed"| chain
+  runtime["Runtime role<br/>voice service and admin API"] -->|"insert and read only"| chain
+  check["Console: Check the chain now"] -->|"recomputes every HMAC"| chain
+```
+
+## The tables
+
+| Group | Tables | Holds |
+|---|---|---|
+| Clinic | `patients`, `medications`, `appointments`, `available_slots` | Synthetic patients (only the last four of an SSN), their medications, appointments and open slots |
+| What callers ask for | `requests`, `messages` | Refills, bookings, callbacks, doctor messages, transfers |
+| Identity | `verification_attempts` | Passed and failed checks, under a keyed hash |
+| Calls | `call_sessions`, `call_turns` | The masked call record and per-turn timings |
+| Staff | `handled_marks`, `config_changes` | What staff marked done, and changes to the kill switch and office hours |
+| Audit | `audit_events` | Every tool call and every staff read or write |
+
+## The audit log
+
+- **What an event holds.** Who acted, what they did, on which record, the outcome and when,
+  as fixed codes and ids. Never a name, a date of birth or any value.
+- **Written with the action.** An event is appended inside the same transaction as the work it
+  records, so the two commit together or not at all.
+- **Tamper-evident.** Events are chained with an HMAC under `AUDIT_HMAC_KEY`. Changing or
+  removing a past event breaks the chain from that point on.
+- **Append-only, twice over.** Database triggers refuse updates and deletes, and the runtime
+  role has no privilege to do either.
+- **Verifiable on demand.** "Check the chain now" on the console walks the whole chain and
+  reports the first breaks.
+
+## Two database identities
+
+| Identity | Used by | Can do |
+|---|---|---|
+| Owner | The one-shot start-up job only | Migrations, role set-up, the seed |
+| Runtime role | The voice service and the admin API | Read and write clinic rows; insert and read audit events; nothing else |
+
+No long-running process ever holds the owner's credentials.
+
+## Log masking
+
+Every log line passes a masking formatter before it is written. Logs carry event names, ids and
+counts; an SSN, a date, a phone number or an email that reaches a log line by mistake is masked
+by the same patterns that mask transcripts.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Tables and the seed
 
@@ -215,3 +277,5 @@ A generated slot never replaces an existing slot at the same doctor and time.
     banner through loguru's own sink when it is imported, before the configuration runs; a
     handler a library adds after the configuration is not covered. The repo's scans that
     keep log configuration in one module are lints against accidents.
+
+</details>

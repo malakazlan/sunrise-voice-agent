@@ -1,6 +1,77 @@
 # Call state, the tool gate and the tools
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+The model can only act through a small set of tools, and code decides which tools exist for it
+at each moment. That decision, the **tool gate**, depends on three facts about the call: its
+phase, whether the office is open, and whether the caller is verified. A tool the caller may not
+use is not offered, and is refused again if it is called anyway.
+
+```mermaid
+stateDiagram-v2
+  [*] --> greeting
+  greeting --> intake
+  intake --> serving: verified, by code only
+  intake --> booking: first-time patient
+  serving --> booking
+  booking --> serving: verified caller
+  intake --> closing
+  serving --> closing
+  booking --> closing
+  intake --> handoff: office open
+  serving --> handoff: office open
+  booking --> handoff: office open
+  closing --> ended
+  handoff --> ended
+  emergency --> ended
+  note right of emergency
+    Reached from every phase
+  end note
+```
+
+## The tools
+
+| Tool | Who it is for | What it does |
+|---|---|---|
+| `verify_identity` | A caller not yet verified, office open | Starts the identity check with a name and date of birth |
+| `get_next_appointment`, `get_lab_status`, `get_balance` | A verified caller | Each reads one thing from the caller's own record |
+| `request_refill` | A verified caller | Files a refill request after a read-back; with no refills left it goes to the doctor |
+| `send_message_to_doctor` | A verified caller | Sends a short message after a read-back |
+| `find_slots`, `book_appointment` | A verified caller | Offers up to three open slots and books one |
+| `start_new_patient`, `collect_new_patient`, `book_new_patient` | A first-time caller | Collects the details a booking needs and books a slot |
+| `take_message` | Any caller while the office is closed | Takes a callback message after a read-back |
+| `transfer_to_staff` | Any caller while the office is open | Hands the call to staff (simulated) |
+| `report_emergency` | Always | Triggers the 911 line and ends the call |
+| `close_call` | Always | Ends the call with a goodbye |
+
+## What happens when the model calls a tool
+
+1. **Gate check, again.** Dispatch re-checks that this tool is allowed right now.
+2. **Arguments are validated.** Unknown fields are refused. If details are missing, the model
+   is told which of the tool's own fields to ask the caller for.
+3. **The patient comes from the call, not the model.** No tool takes a patient id; the handler
+   uses the verified patient in the call's state, so the model cannot name another patient.
+4. **One transaction.** The tool's work and its audit event commit together or not at all.
+5. **Writes need a yes.** Refills, messages, bookings and transfers first return what would be
+   done, to read back; only a second call with the caller's confirmation writes.
+6. **Failures are generic.** The model gets fixed text for a failure, never an exception.
+   Repeated failures hand the call to staff.
+
+## Rules the registry enforces
+
+- A tool that touches patient data can only be offered to a verified caller with the office
+  open. Registering one that breaks this is refused when the service starts.
+- No tool argument may name a patient or a record owner.
+- Handlers are only ever run by dispatch; a structural test reads the source to prove it.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Decisions in `app/domain/`
 
@@ -329,3 +400,5 @@ Limits, stated plainly:
 - A call event that cannot be written within its 2 seconds is lost, and the log says so; the
   call goes on. The app's shutdown waits for the writes still running
   (`drain_call_events()`, after the calls are closed); a process killed outright loses them.
+
+</details>

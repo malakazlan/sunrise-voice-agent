@@ -1,6 +1,42 @@
 # Configuration rules
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+Every setting comes from the environment. The service refuses to start on a missing or invalid
+value, and each process is given only the settings its job needs, so a secret that a process
+does not use is a secret it does not hold.
+
+```mermaid
+flowchart LR
+  E["Environment variables"] --> S{"Start-up check<br/>every setting, together"}
+  S -->|"invalid: names the setting,<br/>never its value"| X["Start refused"]
+  S -->|"valid"| V["Voice service<br/>vendor keys, call token"]
+  S -->|"valid"| A["Admin API<br/>admin password, console origin"]
+  S -->|"valid"| C["Console<br/>the admin API's address only"]
+```
+
+## The principles
+
+| Principle | What it means |
+|---|---|
+| Fail at start, not mid-call | A wrong setting stops the deployment before any call can reach it |
+| Strict values | Each setting has an allowed shape; an unknown key in `.env` is refused |
+| Secrets are never logged | An error names the setting, never its value |
+| Every secret is different | The start-up check refuses a deployment where two secrets match |
+| Least privilege | The voice service never loads the admin password; the admin API never loads a vendor key |
+| Stricter outside development | Vendor keys, the call token and strong passwords are required unless `APP_ENV=dev` |
+
+The full table of variables is in the README's [Configuration](../README.md#configuration)
+section. The exact rule for each one follows.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 Settings come from the environment or `.env`. An invalid or missing value stops startup, and
 an empty value counts as unset. Environment variables take precedence over `.env`. The same
@@ -44,7 +80,7 @@ does not load `ADMIN_PASSWORD`; `APP_ROLE=admin` does not load `IDENTITY_HASH_KE
 hold none for them whatever the environment says, every rule sees them unset (so they are not
 checked either), and at start-up the service logs their names once, never a value:
 `other_role_settings_ignored names=ADMIN_PASSWORD`. Compose gives each service only its own
-variables; a platform that gives every container every variable (Coolify can) still puts the
+variables; a platform that gives every container every variable (some hosting panels do) still puts the
 values in each container's environment. The start-up check reads them all as role `all`, and
 every secret there must differ from every other, the database passwords included.
 
@@ -60,3 +96,5 @@ Anything else, such as a bare number or a date alone, stops startup. A value wit
 such as `2026-11-24T10:30:00`, is clinic time (America/New_York); a wall time that a clock
 change skips or repeats is refused, so give an offset for those. Startup stops if it is set
 and `APP_ENV` is `prod`.
+
+</details>

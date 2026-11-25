@@ -1,6 +1,67 @@
 # Admin API
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+The admin API is what the console talks to. It is the same codebase as the voice service,
+started in a different role with different secrets: it holds no vendor key and never touches a
+live call's audio path. Everything it returns is already masked, and every request is written
+to the audit log.
+
+```mermaid
+sequenceDiagram
+  participant B as Staff browser
+  participant C as Console (Next.js)
+  participant A as Admin API
+  participant D as Postgres
+  B->>C: load the page
+  B->>A: sign in
+  A-->>B: session cookie (HttpOnly, same-site)
+  B->>A: read a page of data (cookie, Origin)
+  A->>D: read and audit event, one transaction
+  D-->>A: rows
+  A-->>B: masked JSON
+  B->>A: write (cookie, Origin, anti-forgery token)
+  A->>D: change and audit event, one transaction
+  A-->>B: result
+```
+
+## How a request is protected
+
+| Protection | What it does |
+|---|---|
+| Session cookie | `HttpOnly`, `Secure`, `SameSite=Strict`, set only for the admin API's own host |
+| Origin check | Only the console's exact origin is answered; other origins get no CORS headers |
+| Anti-forgery token | Every write needs the session's token in a header as well as the cookie |
+| Sign-in rate limit | Counted per client address |
+| Audit | Every read and every write appends an event in the same transaction as the read or write |
+| Masking | Names, numbers and dates are masked before the response leaves the API |
+
+## What staff can do
+
+| Action | Notes |
+|---|---|
+| Watch live calls | A server-sent event stream: phase, verified or not, last tool, timings |
+| Read call history and one call's detail | Masked transcript, audit events, per-turn timings |
+| Work the request list | Refills, bookings, callbacks, messages, transfers; mark one handled |
+| Show callback details | The one place a full name and number are shown: an explicit action, audited, limited to 30 a minute, never cached |
+| Verify the audit chain | Recomputes every HMAC and reports breaks |
+| Turn the assistant off | The kill switch; the voice service picks the change up within seconds |
+| Override office hours | Force open or closed, for an incident or a demo |
+
+## How the kill switch reaches calls
+
+The voice service reads the configuration from the database every 3 seconds into memory. A
+call never waits on that read. With the assistant off, new calls are refused with a message to
+phone the front desk, or 911 in an emergency; calls already connected finish normally.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Reads
 
@@ -322,3 +383,5 @@ outage as `admin_config_read_failed`).
 - Office override: `open` or `closed` decides whether the office is open for calls that start
   after the change; a running call keeps the answer it started with. `schedule` is the
   office hours by the clinic's clock.
+
+</details>

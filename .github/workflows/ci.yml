@@ -666,7 +666,7 @@ jobs:
       - name: Every variable given to every service, each role ignores the other's secrets
         run: |
           . .github/ci-wait.sh
-          # As a platform that adds its env file to every service does (Coolify, some versions).
+          # As a platform that adds its env file to every service does (some hosting panels).
           # After the checks of each service's own variables above, which this stack would fail.
           echo "--- override used only by this step"
           cat deploy/docker-compose.every-variable.yml
