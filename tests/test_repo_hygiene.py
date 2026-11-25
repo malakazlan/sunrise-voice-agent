@@ -101,6 +101,76 @@ def test_no_ssn_shaped_literals_in_repo() -> None:
     assert offenders == []
 
 
+# R1: the call page's access token is CALL_ACCESS_TOKEN. Its old name is accepted nowhere, so
+# no tracked file names it, in any case and however it is joined. Assembled here so that this
+# file does not match its own scan.
+OLD_ACCESS_TOKEN_NAME = re.compile("demo" + r".?access", re.IGNORECASE)
+
+
+def test_old_access_token_name_is_gone() -> None:
+    for sample in (
+        "DEMO" + "_ACCESS_TOKEN=x",
+        "settings.demo" + "_access_token",
+        "Demo" + "AccessToken",
+        "demo" + "-access-token",
+        "the demo" + " access token",
+    ):
+        assert OLD_ACCESS_TOKEN_NAME.search(sample), sample
+    assert not OLD_ACCESS_TOKEN_NAME.search("CALL_ACCESS_TOKEN=x APP_ENV=demo")
+
+    assert files_matching(OLD_ACCESS_TOKEN_NAME) == []
+
+
+# R3: the README and docs/*.md point only at files that exist: every relative link and image,
+# and every repo path written in backticks, the README's "Rule in code" column of the seven calls
+# included. An absolute URL or an anchor in the same page is not a file.
+MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)")
+NOT_A_FILE = re.compile(r"[a-z][a-z0-9+.-]*:|#")
+REPO_PATH = re.compile(
+    r"`((?:app|evals|tests|deploy|scripts|console|web|docs|\.github)/[^`\s*{}<>]*)`"
+)
+SEVEN_CALLS = "## The seven calls"
+
+
+def relative_targets(markdown: str) -> list[str]:
+    return [target for target in MARKDOWN_LINK.findall(markdown) if not NOT_A_FILE.match(target)]
+
+
+def test_readme_points_at_real_files() -> None:
+    sample = (
+        "See [docs](docs/a.md#part), ![shot](docs/img/a.png), [site](https://example.org)"
+        " and [top](#top); `app/guard/input.py` and `/admin/api/requests`."
+    )
+    assert relative_targets(sample) == ["docs/a.md#part", "docs/img/a.png"]
+    assert REPO_PATH.findall(sample) == ["app/guard/input.py"]
+
+    readme = REPO_ROOT / "README.md"
+    pages = [readme, *sorted((REPO_ROOT / "docs").glob("*.md"))]
+    pointed_at: list[tuple[str, Path]] = []
+    for page in pages:
+        text = page.read_text(encoding="utf-8")
+        name = page.relative_to(REPO_ROOT).as_posix()
+        pointed_at += [
+            (f"{name}: {target}", page.parent / target.split("#", 1)[0])
+            for target in relative_targets(text)
+        ]
+        pointed_at += [(f"{name}: `{path}`", REPO_ROOT / path) for path in REPO_PATH.findall(text)]
+    missing = [
+        label
+        for label, path in pointed_at
+        if not path.resolve().is_relative_to(REPO_ROOT) or not path.resolve().exists()
+    ]
+    assert missing == []
+
+    # The README links its docs and screenshots, and names the code behind each of the calls.
+    text = readme.read_text(encoding="utf-8")
+    assert len([target for target in relative_targets(text) if target.startswith("docs/")]) >= 10
+    assert len([target for target in relative_targets(text) if target.endswith(".png")]) >= 4
+    assert SEVEN_CALLS in text
+    calls = text.split(SEVEN_CALLS, 1)[1].split("\n## ", 1)[0]
+    assert len(set(REPO_PATH.findall(calls))) >= 7
+
+
 def test_no_skip_or_xfail_markers() -> None:
     for sample in (
         f"@pytest.mark.{SKIP}",

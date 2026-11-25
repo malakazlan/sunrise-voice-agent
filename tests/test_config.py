@@ -49,7 +49,7 @@ APPLICATION_FIELDS = {
     "max_call_seconds",
     "turn_shared_secret",
     "turn_host",
-    "demo_access_token",
+    "call_access_token",
     "admin_password",
     "admin_user",
     "console_origin",
@@ -364,7 +364,7 @@ def test_shared_secrets_are_refused_at_startup() -> None:
         "audit_hmac_key": "-".join(["audit", "key", "of", "this", "test", "y" * 10]),
         "identity_hash_key": "-".join(["identity", "key", "of", "this", "test", "z" * 10]),
         "turn_shared_secret": "-".join(["turn", "secret", "of", "this", "test", "w" * 12]),
-        "demo_access_token": "-".join(["access", "token", "of", "this", "test", "v" * 12]),
+        "call_access_token": "-".join(["access", "token", "of", "this", "test", "v" * 12]),
         "anthropic_api_key": "-".join(["anthropic", "key", "of", "this", "test"]),
         "deepgram_api_key": "-".join(["deepgram", "key", "of", "this", "test"]),
         "elevenlabs_api_key": "-".join(["elevenlabs", "key", "of", "this", "test"]),
@@ -438,6 +438,31 @@ def test_ci_checks_each_service_against_its_role() -> None:
     assert '("console",' not in workflow
 
 
+def readme_configuration() -> str:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "\n## Configuration\n" in readme
+    return readme.split("\n## Configuration\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_readme_variable_tables_match_the_settings() -> None:
+    # R2: the README's table of variables is every setting, and its table of services gives
+    # each Python service exactly the fields CI checks it against.
+    section = readme_configuration()
+    variables = set(re.findall(r"^\| `([A-Z_]+)` \|", section, re.MULTILINE))
+    assert variables == every_variable()
+    services = {
+        service: set(re.findall(r"`([A-Z_]+)`", names))
+        for service, names in re.findall(r"^\| `([a-z-]+)` \| (.*) \|$", section, re.MULTILINE)
+    }
+    assert services["app"] == {name.upper() for name in VOICE_FIELDS}
+    assert services["admin-api"] == {name.upper() for name in ADMIN_FIELDS} | {
+        "FORWARDED_ALLOW_IPS"
+    }
+    assert services["coturn"] == {"TURN_HOST", "TURN_SHARED_SECRET", "MAX_CONCURRENT_CALLS"}
+    assert services["console"] == {"ADMIN_API_ORIGIN"}
+    assert services["db"] == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+
+
 def test_the_console_gets_only_the_admin_api_origin() -> None:
     # The admin console (console/) holds no secret: its one setting is the admin API's origin, and
     # neither that nor its host port reaches any other service.
@@ -507,6 +532,47 @@ def test_unknown_key_in_env_file_is_rejected(
         Settings()
 
     assert [error["type"] for error in excinfo.value.errors()] == ["extra_forbidden"]
+
+
+@pytest.mark.usefixtures("db_env")
+def test_old_access_token_name_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # R1: the call page's access token is CALL_ACCESS_TOKEN, and its old name is no alias. A .env
+    # that still sets the old name is refused as an unknown key by both settings classes, and
+    # the error for the token that is now missing names the new variable. The old name is
+    # assembled here so that no tracked file holds it.
+    old_name = "DEMO" + "_ACCESS_TOKEN"
+    token = "-".join(["call", "token", "of", "this", "test"] + ["u" * 4] * 3)
+    (tmp_path / ".env").write_text(f"{old_name}={token}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("APP_ENV", "prod")
+    for key, value in VOICE_SECRETS.items():
+        if not key.endswith("_ACCESS_TOKEN"):
+            monkeypatch.setenv(key, value)
+
+    with pytest.raises(ValidationError) as refused:
+        Settings()
+    assert [(error["type"], error["loc"], error["msg"]) for error in refused.value.errors()] == [
+        (
+            "value_error",
+            ("call_access_token",),
+            "Value error, call_access_token is required unless app_env is dev",
+        ),
+        ("extra_forbidden", (old_name.lower(),), "Extra inputs are not permitted"),
+    ]
+    assert token not in str(refused.value)
+
+    with pytest.raises(ValidationError) as refused:
+        StartupSettings()
+    assert [(error["type"], error["loc"]) for error in refused.value.errors()] == [
+        ("extra_forbidden", (old_name.lower(),))
+    ]
+
+    # Set in the environment instead, the old name is not read: the token is missing.
+    (tmp_path / ".env").unlink()
+    monkeypatch.setenv(old_name, token)
+    with pytest.raises(ValidationError) as refused:
+        Settings()
+    assert [error["loc"] for error in refused.value.errors()] == [("call_access_token",)]
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -752,7 +818,7 @@ def test_voice_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.max_concurrent_calls == 3
     assert settings.max_call_seconds == 600
-    assert settings.demo_access_token is None
+    assert settings.call_access_token is None
     assert settings.turn_host is None
     assert settings.turn_shared_secret is None
     assert settings.anthropic_api_key is None
@@ -764,7 +830,7 @@ def test_voice_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
 VOICE_FIELD_ORDER = [
     "TURN_SHARED_SECRET",
     "TURN_HOST",
-    "DEMO_ACCESS_TOKEN",
+    "CALL_ACCESS_TOKEN",
     "ANTHROPIC_API_KEY",
     "DEEPGRAM_API_KEY",
     "ELEVENLABS_API_KEY",
@@ -914,7 +980,7 @@ def test_llm_model_refuses_anything_else(monkeypatch: pytest.MonkeyPatch, model:
 @pytest.mark.parametrize("app_env", ["demo", "prod"])
 @pytest.mark.parametrize(
     "missing",
-    [["DEMO_ACCESS_TOKEN"], ["TURN_HOST"], ["TURN_SHARED_SECRET"], VOICE_FIELD_ORDER],
+    [["CALL_ACCESS_TOKEN"], ["TURN_HOST"], ["TURN_SHARED_SECRET"], VOICE_FIELD_ORDER],
     ids=["token", "turn_host", "turn_secret", "all"],
 )
 def test_voice_secrets_required_outside_dev(
@@ -947,7 +1013,7 @@ def test_app_will_not_start_without_voice_secrets_outside_dev(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("APP_ENV", "prod")
 
-    with pytest.raises(ValidationError, match="demo_access_token"):
+    with pytest.raises(ValidationError, match="call_access_token"):
         create_app()
 
 
@@ -964,7 +1030,7 @@ def test_turn_without_access_token_is_rejected_in_dev(monkeypatch: pytest.Monkey
     monkeypatch.setenv("TURN_HOST", VOICE_SECRETS["TURN_HOST"])
     monkeypatch.setenv("TURN_SHARED_SECRET", VOICE_SECRETS["TURN_SHARED_SECRET"])
 
-    with pytest.raises(ValidationError, match="demo_access_token") as excinfo:
+    with pytest.raises(ValidationError, match="call_access_token") as excinfo:
         Settings(_env_file=None)
 
     assert excinfo.value.error_count() == 1
@@ -974,7 +1040,7 @@ def test_turn_without_access_token_is_rejected_in_dev(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize("present", ["TURN_HOST", "TURN_SHARED_SECRET"])
 def test_turn_host_and_secret_come_together(monkeypatch: pytest.MonkeyPatch, present: str) -> None:
     monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setenv("DEMO_ACCESS_TOKEN", VOICE_SECRETS["DEMO_ACCESS_TOKEN"])
+    monkeypatch.setenv("CALL_ACCESS_TOKEN", VOICE_SECRETS["CALL_ACCESS_TOKEN"])
     monkeypatch.setenv(present, VOICE_SECRETS[present])
 
     with pytest.raises(ValidationError, match="turn_host") as excinfo:
@@ -1046,7 +1112,7 @@ def test_voice_secrets_are_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("db_env")
-@pytest.mark.parametrize("key", ["DEMO_ACCESS_TOKEN", "TURN_SHARED_SECRET"])
+@pytest.mark.parametrize("key", ["CALL_ACCESS_TOKEN", "TURN_SHARED_SECRET"])
 @pytest.mark.parametrize("app_env", ["dev", "demo", "prod"])
 def test_short_secrets_are_refused(monkeypatch: pytest.MonkeyPatch, key: str, app_env: str) -> None:
     for name, value in VOICE_SECRETS.items():
@@ -1101,7 +1167,7 @@ def test_empty_voice_values_in_dev_leave_voice_unconfigured(
     settings = Settings(_env_file=None)
 
     assert (
-        settings.demo_access_token,
+        settings.call_access_token,
         settings.turn_host,
         settings.turn_shared_secret,
         settings.anthropic_api_key,
@@ -1174,7 +1240,7 @@ TEN_DISTINCT = "abcdefghij" * 4
         ("POSTGRES_PASSWORD", StartupSettings),
         ("APP_DB_PASSWORD", Settings),
         ("APP_DB_PASSWORD", StartupSettings),
-        ("DEMO_ACCESS_TOKEN", Settings),
+        ("CALL_ACCESS_TOKEN", Settings),
         ("TURN_SHARED_SECRET", Settings),
         ("AUDIT_HMAC_KEY", Settings),
         ("IDENTITY_HASH_KEY", Settings),
@@ -1642,7 +1708,7 @@ def test_admin_password_differs_from_every_other_secret(monkeypatch: pytest.Monk
         "audit_hmac_key",
         "identity_hash_key",
         "turn_shared_secret",
-        "demo_access_token",
+        "call_access_token",
         "anthropic_api_key",
         "deepgram_api_key",
         "elevenlabs_api_key",
@@ -1655,7 +1721,7 @@ def test_admin_password_differs_from_every_other_secret(monkeypatch: pytest.Monk
             "AUDIT_HMAC_KEY",
             "IDENTITY_HASH_KEY",
             "TURN_SHARED_SECRET",
-            "DEMO_ACCESS_TOKEN",
+            "CALL_ACCESS_TOKEN",
             "ANTHROPIC_API_KEY",
             "DEEPGRAM_API_KEY",
         ):

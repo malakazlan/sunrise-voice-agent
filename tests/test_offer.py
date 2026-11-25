@@ -20,7 +20,7 @@ from app.main import create_app
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
-TOKEN = VOICE_SECRETS["DEMO_ACCESS_TOKEN"]
+TOKEN = VOICE_SECRETS["CALL_ACCESS_TOKEN"]
 OFFER = {"sdp": "v=0 fake-offer", "type": "offer"}
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 BAD_AUTH = [
@@ -352,7 +352,7 @@ def test_wrong_then_right_token_works() -> None:
 
 def test_dev_without_token_is_open() -> None:
     settings = offline_settings(
-        app_env="dev", demo_access_token=None, turn_host=None, turn_shared_secret=None
+        app_env="dev", call_access_token=None, turn_host=None, turn_shared_secret=None
     )
 
     with TestClient(offer_app(settings, open_call=Opener())) as client:
@@ -461,8 +461,8 @@ def test_offer_body_cap_boundary() -> None:
 def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     # Configured empty: the app will not start with it.
     with pytest.raises(ValidationError) as excinfo:
-        offline_settings(demo_access_token="")
-    assert [error["loc"] for error in excinfo.value.errors()] == [("demo_access_token",)]
+        offline_settings(call_access_token="")
+    assert [error["loc"] for error in excinfo.value.errors()] == [("call_access_token",)]
 
     # Supplied empty: refused before any comparison is made.
     compared: list[tuple[bytes, bytes]] = []
@@ -483,7 +483,7 @@ def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Both empty: there is no configuration in which an empty token opens a call.
     with pytest.raises(ValidationError):
-        offline_settings(app_env="dev", demo_access_token="")
+        offline_settings(app_env="dev", call_access_token="")
 
 
 def test_slot_released_when_stop_hangs(caplog: pytest.LogCaptureFixture) -> None:

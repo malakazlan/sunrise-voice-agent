@@ -9,8 +9,7 @@ name: sunrise-voice-agent
 # voice role's settings, which hold no part of the owner's identity and no admin sign-in;
 # admin-api the admin role's (the database as the runtime role, the audit key, the clock, the
 # calls' longest, the model and the most calls at once, the admin's sign-in and the console's
-# origin); coturn its own. The name
-# `console` is the console's own service, which runs elsewhere.
+# origin); coturn its own; console, the admin console (console/), only the admin API's origin.
 # Compose refuses to start without the owner's credentials or APP_ENV. The services check the
 # rest themselves and stop when a value they need is missing; an empty value counts as unset,
 # so the app's own defaults apply. CI checks each service's variables against app/config.py.
@@ -47,7 +46,7 @@ x-voice-settings: &voice-settings
   IDENTITY_HASH_KEY: ${IDENTITY_HASH_KEY:-}
   TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
   TURN_HOST: ${TURN_HOST:-}
-  DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
+  CALL_ACCESS_TOKEN: ${CALL_ACCESS_TOKEN:-}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
   ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
