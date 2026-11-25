@@ -1,6 +1,7 @@
-"""The config the voice service runs on: read from config_changes at start-up and every five
+"""The config the voice service runs on: read from config_changes at start-up and every three
 seconds into memory, and read by call handling from memory only. The kill switch refuses new
-calls; the office override changes the answer for calls that start after it."""
+calls, and audits the refusals at most once a minute per reason; the office override changes the
+answer for calls that start after it."""
 
 import ast
 import asyncio
@@ -9,6 +10,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import pytest
@@ -21,8 +23,9 @@ from admin_client import (
     events,
     try_sign_in,
 )
-from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, offline_settings
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -34,13 +37,19 @@ from app.agent.endings import drain_call_events, start_call
 from app.agent.scripts import ScriptId
 from app.agent.tool_registry import Deps
 from app.api import admin as admin_module
-from app.api.offer import build_router
+from app.api.offer import CallRefusals, build_router
 from app.audit.log import AuditLog
 from app.audit.queue import AuditQueue
 from app.config import StartupSettings
 from app.db.session import create_database_engine, create_session_factory
 from app.main import create_app
-from app.runtime_config import ConfigPoll, LiveConfig, Values
+from app.runtime_config import (
+    READ_SECONDS,
+    ConfigPoll,
+    LiveConfig,
+    Values,
+    read_config_bounded,
+)
 from app.voice.calls import CallRegistry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,8 +65,10 @@ CALL_PAGE_LINE = (
 REFUSED_EVENT = (None, "agent", "call_refused", "call", None, "refused", "calls_off")
 # A call site that reads memory only returns well within this.
 RETURN_BOUND_SECONDS = 0.2
-# How often the poll reads in the stalled-database test: often, so that it fails many times.
+# How often the poll reads in the stalled-database test, and how long each read may take:
+# briefly and often, so that it fails many times within half a second.
 FAST_POLL_SECONDS = 0.05
+FAST_READ_SECONDS = 0.1
 # The functions that read config_changes.
 TABLE_READS = {"read_config", "read_config_bounded"}
 INSERT_CHANGE = text(
@@ -76,6 +87,12 @@ def wait_for(condition: Callable[[], bool], seconds: float) -> float:
 
 def change(key: str, value: str) -> dict[str, object]:
     return {"key": key, "value": value, "confirm": True}
+
+
+def next_read(client: TestClient, app: FastAPI) -> None:
+    """The app's config poll's next read, made now, on the app's own loop."""
+    assert client.portal is not None
+    client.portal.call(app.state.poll.read)
 
 
 def deps_with(
@@ -108,9 +125,10 @@ def test_kill_switch_refuses_new_calls_only(
         off = client.post(CONFIG, json=change("calls", "off"), headers=write)
         assert off.status_code == 201
         assert off.json()["applies_within_seconds"] == 5
-        # Through the table and the poll, even in one process: within five seconds.
-        took = wait_for(lambda: config.values == Values(calls="off", office="schedule"), 7)
-        assert took <= 5.5, took
+        # Through the table and the poll, even in one process: the poll's next read applies it
+        # (its cadence is test_changes_apply_within_the_seconds_promised's).
+        next_read(client, app)
+        assert config.values == Values(calls="off", office="schedule")
 
         refused = client.post("/offer", json=OFFER)
         assert (refused.status_code, refused.json()) == (503, UNAVAILABLE)
@@ -127,7 +145,8 @@ def test_kill_switch_refuses_new_calls_only(
         assert 'reason === "unavailable"' in page
 
         assert client.post(CONFIG, json=change("calls", "on"), headers=write).status_code == 201
-        wait_for(lambda: config.values == Values(calls="on", office="schedule"), 7)
+        next_read(client, app)
+        assert config.values == Values(calls="on", office="schedule")
         assert client.post("/offer", json=OFFER).status_code == 200
         assert active_calls(app) == 2
     assert [row[1:] for row in events(owner_engine)].count(REFUSED_EVENT) == 1
@@ -150,16 +169,23 @@ async def test_calls_do_not_wait_for_config(
     async def calls_go_on(engine: AsyncEngine) -> None:
         """A call starts, and /offer answers, at once, on the values in memory, while the
         poll's reads and the refusal's audit write go to the database `engine` reaches."""
-        poll = ConfigPoll(create_session_factory(engine), live, every=FAST_POLL_SECONDS)
+        poll = ConfigPoll(
+            create_session_factory(engine),
+            live,
+            every=FAST_POLL_SECONDS,
+            read_seconds=FAST_READ_SECONDS,
+        )
         refusals = AuditQueue(create_session_factory(engine), AUDIT, now=lambda: CLOSED_AT)
         app = FastAPI()
         registry = CallRegistry(max_calls=3, max_seconds=600)
-        app.include_router(build_router(admin_settings(database), registry, opener, live, refusals))
+        app.include_router(
+            build_router(admin_settings(database), registry, opener, live, CallRefusals(refusals))
+        )
         deps = deps_with(engine, live, now=lambda: CLOSED_AT)
         try:
             await poll.start()
             # The poll's reads are given up, again and again, and the last good values stay.
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(0.5)
             assert live.values == Values(calls="off", office="open")
             # A call starts on the values in memory: the office forced open at a closed hour.
             (state, script), took = await timed(start_call(new_call_id(), deps))
@@ -253,25 +279,145 @@ async def test_office_override(runtime: AsyncEngine) -> None:
         await drain_call_events()
 
 
-def test_session_reports_the_effective_office(
-    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
+def test_session_reports_calls_and_the_effective_office(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     # The clinic's clock at a closed hour. The admin process has no poll: it reads the table
-    # when asked.
+    # when asked, in one short read for both keys.
     settings = admin_settings(database, simulated_now=CLOSED_AT.isoformat())
     app = admin_with_clock(settings, Clock())
+    limits: list[float] = []
+
+    async def timed_read(sessions: Any, seconds: float) -> Any:
+        limits.append(seconds)
+        return await read_config_bounded(sessions, seconds)
+
+    monkeypatch.setattr(admin_module, "read_config_bounded", timed_read)
+
+    def shown() -> tuple[object, object]:
+        answer = client.get("/admin/api/session")
+        assert answer.status_code == 200
+        return answer.json()["calls"], answer.json()["office_open"]
+
     with client_from(app) as client:
         signed = try_sign_in(client)
-        assert signed.json()["office_open"] is False
+        assert (signed.json()["calls"], signed.json()["office_open"]) == ("on", False)
+        assert set(signed.json()) == {
+            "user",
+            "csrf_token",
+            "expires_in",
+            "calls",
+            "office_open",
+            "time_zone",
+        }
         write = {"X-CSRF-Token": signed.json()["csrf_token"], "Origin": OWN_ORIGIN}
-        assert client.get("/admin/api/session").json()["office_open"] is False
+        assert shown() == ("on", False)
         assert client.post(CONFIG, json=change("office", "open"), headers=write).status_code == 201
-        assert client.get("/admin/api/session").json()["office_open"] is True
+        assert client.post(CONFIG, json=change("calls", "off"), headers=write).status_code == 201
+        assert shown() == ("off", True)
+        assert limits and set(limits) == {0.5}
 
-        # A read that fails still answers, with the schedule's answer.
+        # Reads that fail still answer: calls unknown, the office on its hours; and the outage
+        # is logged once, however many ask.
         async def fails(*_args: object, **_kwargs: object) -> None:
             raise OSError("down")
 
         monkeypatch.setattr(admin_module, "read_config_bounded", fails)
-        answer = client.get("/admin/api/session")
-        assert (answer.status_code, answer.json()["office_open"]) == (200, False)
+        caplog.clear()
+        assert [shown() for _ in range(5)] == [(None, False)] * 5
+        failed = [r for r in caplog.records if r.getMessage().startswith("admin_config_read")]
+        assert [r.getMessage() for r in failed] == ["admin_config_read_failed error=OSError"]
+
+        # Once it reads again, it says so once, and the next outage is logged again.
+        monkeypatch.setattr(admin_module, "read_config_bounded", timed_read)
+        assert [shown() for _ in range(2)] == [("off", True)] * 2
+        monkeypatch.setattr(admin_module, "read_config_bounded", fails)
+        assert shown() == (None, False)
+    messages = [r.getMessage() for r in caplog.records if "admin_config_read" in r.getMessage()]
+    assert messages == [
+        "admin_config_read_failed error=OSError",
+        "admin_config_read_recovered",
+        "admin_config_read_failed error=OSError",
+    ]
+
+
+# Item 1 of the rework: refused calls do not flood the audit log.
+@pytest.mark.anyio
+async def test_refused_calls_are_audited_once_a_minute_per_reason(
+    runtime: AsyncEngine, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    live = LiveConfig()
+    queue = AuditQueue(create_session_factory(runtime), AUDIT, now=lambda: CLOSED_AT)
+    refusals = CallRefusals(queue, clock=clock)
+    app = FastAPI()
+    settings = offline_settings(
+        app_env="dev", demo_access_token=None, turn_host=None, turn_shared_secret=None
+    )
+    app.include_router(
+        build_router(settings, CallRegistry(max_calls=3, max_seconds=600), Opener(), live, refusals)
+    )
+
+    def refused_rows() -> list[object]:
+        return [row[7] for row in events(owner_engine) if row[3] == "call_refused"]
+
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url=OWN_ORIGIN) as client:
+        # 1,000 refusals inside a minute, for two reasons: one event each, at once.
+        for _ in range(500):
+            assert (await client.post("/offer", json=OFFER)).status_code == 503
+        live.values = Values(calls="off", office="schedule")
+        for _ in range(500):
+            clock.now += 0.1
+            assert (await client.post("/offer", json=OFFER)).status_code == 503
+        await queue.drain()
+        assert refused_rows() == ["config_unknown", "calls_off"]
+        assert not [r for r in caplog.records if r.getMessage().startswith("calls_refused")]
+
+        # A minute after the last event of its reason, the next one is audited, and the ones in
+        # between are counted in one line.
+        clock.now += 60
+        assert (await client.post("/offer", json=OFFER)).status_code == 503
+        await queue.drain()
+    assert refused_rows() == ["config_unknown", "calls_off", "calls_off"]
+    refusals.close()
+    counted = [r.getMessage() for r in caplog.records if r.getMessage().startswith("calls_refused")]
+    assert counted == [
+        "calls_refused reason=calls_off count=499",
+        "calls_refused reason=config_unknown count=499",
+    ]
+
+
+# Item 5 of the rework: the promise in the answer holds.
+@pytest.mark.anyio
+async def test_changes_apply_within_the_seconds_promised(runtime: AsyncEngine) -> None:
+    slept: list[float] = []
+    reads = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == 3:
+            reads.set()
+            await asyncio.Event().wait()
+
+    poll = ConfigPoll(create_session_factory(runtime), LiveConfig(), sleep=sleep)
+    await poll.start()
+    await asyncio.wait_for(reads.wait(), timeout=5)
+    await poll.stop()
+    # A read every three seconds, each given up after one: a change written now is read within
+    # four, under the five the admin API promises (`applies_within_seconds`).
+    assert slept == [3, 3, 3]
+    assert max(slept) + READ_SECONDS <= 5
+
+
+# Item 6 of the rework: the config is never left out.
+def test_deps_need_the_config() -> None:
+    with pytest.raises(TypeError, match="config"):
+        Deps(  # type: ignore[call-arg]
+            sessions=None,  # type: ignore[arg-type]
+            audit=AUDIT,
+            now=lambda: OPEN_AT,
+            claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        )

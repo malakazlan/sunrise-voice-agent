@@ -10,7 +10,9 @@ shown, a config key changed. Each takes a browser session only, never Basic, wit
 anti-forgery token and from the console's origin, and a JSON body of at most MAX_BODY_BYTES
 with no field it does not know; each writes its audit event in the transaction of the change,
 and nothing is changed or returned without it. The callback's details are the one answer with
-values unmasked. A config change reaches the calls within POLL_SECONDS (app/runtime_config.py).
+values unmasked, at most REVEALS_PER_WINDOW times a session in REVEAL_WINDOW_SECONDS. A config
+change reaches the calls within APPLIES_WITHIN_SECONDS while the database answers
+(app/runtime_config.py).
 
 Two ways to sign in, one check (AdminAccess): HTTP Basic, for scripts, which reads only; or a
 browser session (POST /session, app/api/sessions.py), held in a cookie, whose state-changing
@@ -78,7 +80,7 @@ from app.api.security import (
     from_console,
     tokens_match,
 )
-from app.api.sessions import Session, SessionTable
+from app.api.sessions import MAX_SESSIONS, Session, SessionTable
 from app.audit import console
 from app.audit.log import (
     ADMIN_PREFIX,
@@ -98,7 +100,14 @@ from app.db import models
 from app.domain.clinic import CLINIC_TZ
 from app.domain.office_hours import SCHEDULE, clinic_now, office_open
 from app.guard.rate_limit import RateLimiter
-from app.runtime_config import POLL_SECONDS, read_config, read_config_bounded
+from app.runtime_config import (
+    APPLIES_WITHIN_SECONDS,
+    ReadOutage,
+    Values,
+    read_config,
+    read_config_bounded,
+    values_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +129,11 @@ MAX_TRACKED_ADDRESSES = 10_000
 CHALLENGE = 'Basic realm="admin", charset="UTF-8"'
 # A verification asked for while another runs is refused; this is when to ask again.
 VERIFY_RETRY_SECONDS = 5
+# A session is shown at most this many callbacks' details in a window of this many seconds.
+REVEALS_PER_WINDOW = 30
+REVEAL_WINDOW_SECONDS = 60
+# The session's answer reads the config in at most this long.
+SESSION_READ_SECONDS = 0.5
 ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # The days a summary or the slots cover: a week unless asked.
 DEFAULT_DAYS = 7
@@ -359,6 +373,14 @@ class AdminAccess:
         self._sessions = sessions
         self._audit = audit
         self._verifying = False
+        self._config_outage = ReadOutage("admin_config")
+        # The callback details each session has been shown in the last REVEAL_WINDOW_SECONDS.
+        self.reveals = RateLimiter(
+            limit=REVEALS_PER_WINDOW,
+            window_seconds=REVEAL_WINDOW_SECONDS,
+            max_addresses=MAX_SESSIONS,
+            clock=clock,
+        )
 
     def limited(self, address: str) -> bool:
         """Whether the address has failed too often to be let try again yet."""
@@ -433,15 +455,17 @@ class AdminAccess:
         nothing was written."""
         return await _audited(self._sessions, self._audit, event, write)
 
-    async def office(self) -> str:
-        """The office override as the table has it now, read in a transaction of its own
-        within READ_SECONDS; the schedule when it cannot be read: the office then follows its
-        hours, as the calls do before their config is read."""
+    async def config(self) -> Values | None:
+        """Calls on or off and the office override as the table has them now, in one read of
+        its own given up after SESSION_READ_SECONDS; None when it cannot be read. The first
+        failure of an outage is logged, not every one."""
         try:
-            return (await read_config_bounded(self._sessions))[models.OFFICE].value
+            found = await read_config_bounded(self._sessions, SESSION_READ_SECONDS)
         except Exception as error:
-            logger.warning("admin_office_read_failed error=%s", type(error).__name__)
-            return SCHEDULE
+            self._config_outage.failed(error)
+            return None
+        self._config_outage.ended()
+        return values_of(found)
 
     async def read_again[T](self, read: Reader[T]) -> T | None:
         """A read the audit event of an earlier read already covers (the live stream's ticks),
@@ -640,13 +664,17 @@ def build_admin_app(
 
     async def shown_session(session: Session) -> dict[str, Any]:
         """What a signed-in browser is told: who, the session's anti-forgery token, the seconds
-        left if it is not used, and whether the office is open for a call starting now: the
-        agent's clock, or the override staff set."""
+        left if it is not used, whether calls are on (None when the config cannot be read),
+        and whether the office is open for a call starting now: the agent's clock, or the
+        override staff set; the clock alone when the config cannot be read."""
+        config = await access.config()
+        office = SCHEDULE if config is None else config.office
         return {
             "user": session.user,
             "csrf_token": session.token,
             "expires_in": access.signed_in.seconds_left(session),
-            "office_open": office_open(clinic_now(settings), await access.office()),
+            "calls": None if config is None else config.calls,
+            "office_open": office_open(clinic_now(settings), office),
             "time_zone": CLINIC_TZ.key,
         }
 
@@ -798,7 +826,17 @@ def build_admin_app(
     async def reveal_callback(
         request: Request, source: str, row_id: str, _query: Annotated[NoQuery, Query()]
     ) -> dict[str, Any]:
-        writing_session(request)
+        session_id, _session = writing_session(request)
+        # Each session's reveals are counted by the digest that names it, never its id.
+        counted = access.signed_in.key(session_id).hex()
+        if access.reveals.blocked(counted):
+            logger.warning("admin_reveal_limited")
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests",
+                headers={"Retry-After": str(REVEAL_WINDOW_SECONDS)},
+            )
+        access.reveals.record_failure(counted)
         row = _queue_row(source, row_id)
         await _write_body(request, EmptyBody)
         callbacks = await write_and_audit(
@@ -830,7 +868,7 @@ def build_admin_app(
             {
                 "key": body.key,
                 **_json(asdict(change.setting)),
-                "applies_within_seconds": POLL_SECONDS,
+                "applies_within_seconds": APPLIES_WITHIN_SECONDS,
             },
             status_code=status.HTTP_201_CREATED if change.changed else status.HTTP_200_OK,
         )
@@ -842,7 +880,8 @@ def build_admin_app(
         found = await read_and_audit(Action.ADMIN_READ_CONFIG, ResourceType.CONFIG, read_config)
         return {
             "config": {key: _json(asdict(setting)) for key, setting in found.items()},
-            "applies_within_seconds": POLL_SECONDS,
+            "applies_within_seconds": APPLIES_WITHIN_SECONDS,
+            # The admin process's own settings: in Compose both processes are given the same.
             "facts": {
                 "environment": settings.app_env,
                 "model": settings.llm_model,

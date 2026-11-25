@@ -286,6 +286,34 @@ def test_callback_details_are_shown_once_and_only_there(
     assert "admin_revealed_callback" in caplog.text
 
 
+# Item 2 of the rework: reveals are limited per session.
+def test_reveals_are_limited_per_session(
+    database: StartupSettings, owner_engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    seed(owner_engine)
+    caplog.set_level(logging.INFO)
+    clock = Clock()
+    app = admin_with_clock(admin_settings(database), clock)
+    with client_from(app) as client, client_from(app, "203.0.113.6") as other:
+        write = signed_in(client)
+        for _ in range(30):
+            assert client.post(CALLBACK, json={}, headers=write).status_code == 200
+        # The 31st within the minute: no details, no event, one line.
+        limited = client.post(CALLBACK, json={}, headers=write)
+        assert (limited.status_code, limited.json()) == (429, {"detail": "Too many requests"})
+        assert limited.headers["retry-after"] == "60"
+        assert CALLER not in limited.text and NUMBER not in limited.text
+        # Another session is not held back by this one's reveals.
+        assert other.post(CALLBACK, json={}, headers=signed_in(other)).status_code == 200
+        # A minute later, the session may again.
+        clock.now += 60
+        assert client.post(CALLBACK, json={}, headers=write).status_code == 200
+    reveals = [row for row in admin_events(owner_engine) if row[0] == "admin_revealed_callback"]
+    assert len(reveals) == 32
+    lines = [r.getMessage() for r in caplog.records if "admin_reveal_limited" in r.getMessage()]
+    assert lines == ["admin_reveal_limited"]
+
+
 # R5
 def test_handled_once(database: StartupSettings, owner_engine: Engine) -> None:
     seed(owner_engine)

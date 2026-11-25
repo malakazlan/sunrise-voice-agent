@@ -58,6 +58,7 @@ from app.agent.tools import register_tools
 from app.audit.log import CHAIN_LOCK, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.config import StartupSettings
 from app.db.session import create_database_engine, create_session_factory
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -257,6 +258,7 @@ async def deps(runtime: AsyncEngine) -> AsyncIterator[Deps]:
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
         claim_keys=CLAIM_KEYS,
+        config=taking_calls(),
     )
 
 
@@ -568,6 +570,7 @@ async def test_handler_and_audit_commit_together(deps: Deps, owner_engine: Engin
                 audit=AuditThatFailsAfterWriting(SecretStr(TEST_AUDIT_KEY)),
                 now=deps.now,
                 claim_keys=CLAIM_KEYS,
+                config=taking_calls(),
             ),
         ),
         # A handler may not commit on its own.
@@ -1392,6 +1395,7 @@ async def test_unanswering_database_fails_within_a_bound(
             audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
             now=lambda: T0,
             claim_keys=CLAIM_KEYS,
+            config=taking_calls(),
         )
         calls: Calls = []
         registry = registry_of(declared("look_up", recording(calls), arguments=Topic))
@@ -1431,6 +1435,7 @@ async def test_database_down_fails_generically(
             audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
             now=lambda: T0,
             claim_keys=CLAIM_KEYS,
+            config=taking_calls(),
         )
         calls: Calls = []
         registry = registry_of(declared("look_up", recording(calls), arguments=Topic))

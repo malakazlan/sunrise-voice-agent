@@ -2,9 +2,10 @@
 
 A new call is taken only while the config in memory says calls are on (app/runtime_config.py):
 with calls off, or before the config has been read, an offer is refused with a fixed answer
-(UNAVAILABLE), before its body is read, and the refusal is audited by a background writer
-(app/audit/queue.py) that the answer does not wait for. Calls already connected are not
-touched."""
+(UNAVAILABLE), before its body is read. Calls already connected are not touched. Anyone with the
+call access token can ask, so the refusals are audited sparingly (CallRefusals): at most one
+event per reason every REFUSAL_WINDOW_SECONDS, handed to a background writer
+(app/audit/queue.py) the answer does not wait for, and the rest counted in memory."""
 
 import hmac
 import logging
@@ -33,6 +34,58 @@ MAX_BODY_BYTES = 32 * 1024
 # The answer to an offer while no call is taken; the call page (web/index.html) words it for
 # the caller.
 UNAVAILABLE = {"reason": "unavailable"}
+# A refused call is audited at most once per reason in this many seconds.
+REFUSAL_WINDOW_SECONDS = 60
+
+
+class CallRefusals:
+    """The audit events of refused calls, at most one per reason every `window` seconds: the
+    first at once, the ones after it within the window counted in memory. The count is logged
+    in one line by event name when the reason's next event is handed over, or at `close`. Plain
+    functions: nothing here waits."""
+
+    def __init__(
+        self,
+        events: AuditQueue,
+        *,
+        window: float = REFUSAL_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._events = events
+        self._window = window
+        self._clock = clock
+        # Each reason's last event, and the refusals counted since.
+        self._last: dict[Reason, float] = {}
+        self._counted: dict[Reason, int] = {}
+
+    def refused(self, reason: Reason) -> None:
+        now = self._clock()
+        last = self._last.get(reason)
+        if last is not None and now - last < self._window:
+            self._counted[reason] = self._counted.get(reason, 0) + 1
+            return
+        self._report(reason)
+        self._last[reason] = now
+        # A call refused before it began: no call id, nothing of the caller.
+        self._events.put(
+            Event(
+                actor=AGENT,
+                action=Action.CALL_REFUSED,
+                resource_type=ResourceType.CALL,
+                outcome=Outcome.REFUSED,
+                reason=reason,
+            )
+        )
+
+    def close(self) -> None:
+        """Log what is counted and not yet reported: at shutdown."""
+        for reason in list(self._counted):
+            self._report(reason)
+
+    def _report(self, reason: Reason) -> None:
+        count = self._counted.pop(reason, 0)
+        if count:
+            logger.info("calls_refused reason=%s count=%d", reason.value, count)
 
 
 class Offer(BaseModel):
@@ -76,23 +129,12 @@ async def _read_offer(request: Request) -> Offer:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid offer") from None
 
 
-def _refused(reason: Reason) -> Event:
-    """A call refused before it began: no call id, nothing of the caller."""
-    return Event(
-        actor=AGENT,
-        action=Action.CALL_REFUSED,
-        resource_type=ResourceType.CALL,
-        outcome=Outcome.REFUSED,
-        reason=reason,
-    )
-
-
 def build_router(
     settings: Settings,
     calls: CallRegistry,
     open_call: OpenCall,
     config: LiveConfig,
-    refusals: AuditQueue,
+    refusals: CallRefusals,
 ) -> APIRouter:
     def require_token(request: Request) -> None:
         # A dependency of every route here, and no route declares a body, so the token is
@@ -116,7 +158,7 @@ def build_router(
     async def offer(request: Request) -> dict[str, str] | JSONResponse:
         if not config.takes_calls():
             reason = Reason.CONFIG_UNKNOWN if config.values is None else Reason.CALLS_OFF
-            refusals.put(_refused(reason))
+            refusals.refused(reason)
             logger.info("call_refused reason=%s", reason.value)
             return JSONResponse(UNAVAILABLE, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         body = await _read_offer(request)

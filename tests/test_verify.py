@@ -30,6 +30,7 @@ from app.agent.tools import register_tools, submit_claim
 from app.audit.log import Action, AuditLog, Event
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardDecision, guard_input
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -124,6 +125,7 @@ def deps_with(runtime: AsyncEngine, clock: Clock, *, audit: AuditLog | None = No
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)) if audit is None else audit,
         now=clock,
         claim_keys=ClaimKeys(SecretStr(IDENTITY_KEY)),
+        config=taking_calls(),
     )
 
 
@@ -516,6 +518,7 @@ async def test_attempts_store_only_a_keyed_hash(
         audit=deps.audit,
         now=clock,
         claim_keys=ClaimKeys(SecretStr(other_key)),
+        config=taking_calls(),
     )
     second, outcome = await attempt(other, *SARAH, "00" + "00")
     assert outcome == FAIL

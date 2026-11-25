@@ -128,6 +128,7 @@ async def test_uninterruptible_lines(offline_deps: Deps, line: str) -> None:
             audit=offline_deps.audit,
             now=lambda: EVENING,
             claim_keys=offline_deps.claim_keys,
+            config=offline_deps.config,
         )
     model = ScriptedModel(says("How can I help?"))
     time = FakeTime()

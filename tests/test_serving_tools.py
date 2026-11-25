@@ -24,6 +24,7 @@ from app.agent.tools import register_tools
 from app.audit.log import AuditLog, Event, Outcome
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_session_factory
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -137,7 +138,11 @@ def offered(registry: Registry, state: CallState) -> list[str]:
 def clocked(deps: Deps, now: datetime) -> Deps:
     """The same dependencies with the call's clock reading `now`."""
     return Deps(
-        sessions=deps.sessions, audit=deps.audit, now=lambda: now, claim_keys=deps.claim_keys
+        sessions=deps.sessions,
+        audit=deps.audit,
+        now=lambda: now,
+        claim_keys=deps.claim_keys,
+        config=deps.config,
     )
 
 
@@ -171,6 +176,7 @@ async def deps(runtime: AsyncEngine) -> AsyncIterator[Deps]:
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
         claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        config=taking_calls(),
     )
 
 
@@ -703,6 +709,7 @@ async def test_tool_and_audit_commit_together(
         audit=AuditThatFailsAfterWriting(SecretStr(TEST_AUDIT_KEY)),
         now=deps.now,
         claim_keys=deps.claim_keys,
+        config=deps.config,
     )
     state = sarah()
     after, outcome = await registry.dispatch(state, REFILL, refill("lisinopril", True), failing)

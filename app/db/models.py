@@ -299,7 +299,12 @@ QUEUE_SOURCES = (QUEUE_REQUESTS,)
 
 class HandledMark(Base):
     """A row of the requests' queue that the staff marked handled: which, by whom and when. A
-    row is marked once; a mark is never changed or removed."""
+    row is marked once; a mark is never changed or removed.
+
+    `row_id` has no foreign key: a mark names its row by source and id, and a foreign key
+    names one table, while the sources are a set of tables. That the row exists is proved by
+    the insert itself (`mark_handled` in app/api/writes.py), which takes the id from a select
+    of the source's table in the same statement: a row that is not there inserts nothing."""
 
     __tablename__ = "handled_marks"
     __table_args__ = (

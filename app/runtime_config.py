@@ -8,7 +8,8 @@ service holds the values in memory (`LiveConfig`), and call handling reads only 
 after READ_SECONDS, its clean-up included. A read that fails or is given up keeps the last good
 values, and the first failure of an outage is logged; nothing is raised. Until the first read
 succeeds the values are unknown, and no new call is taken. A change made through the admin API
-therefore reaches the calls within POLL_SECONDS of being written.
+therefore reaches the calls within POLL_SECONDS + READ_SECONDS of being written while the
+database answers: within APPLIES_WITHIN_SECONDS, which the admin API says.
 
 The admin process runs no poll: it reads the table when asked (`read_config_bounded`).
 
@@ -37,8 +38,11 @@ from app.domain.office_hours import SCHEDULE, office_open
 
 logger = logging.getLogger(__name__)
 
-POLL_SECONDS = 5
+POLL_SECONDS = 3
 READ_SECONDS = 1.0
+# What the admin API promises for a change to reach the calls: a read every POLL_SECONDS, each
+# given up after READ_SECONDS, fits inside it.
+APPLIES_WITHIN_SECONDS = 5
 # A read given up is cancelled, then cancelled again every CANCEL_INTERVAL_SECONDS until it has
 # ended (the driver, interrupted a second time while it waits on the server, closes the
 # connection), as the turn recorder's writes are (app/agent/turn_record.py).
@@ -66,6 +70,14 @@ class Values:
             raise ValueError("a config value is not one of its key's values")
 
 
+def defaults() -> dict[str, Setting]:
+    """Every key's setting with no change made: its default."""
+    return {
+        key: Setting(value=CONFIG_DEFAULTS[key], changed_by=None, changed_at=None)
+        for key in CONFIG_VALUES
+    }
+
+
 async def read_config(session: AsyncSession) -> dict[str, Setting]:
     """Every key's setting: its newest change, or its default. A stored value outside its
     key's values is refused."""
@@ -80,14 +92,10 @@ async def read_config(session: AsyncSession) -> dict[str, Setting]:
         row.key: Setting(value=row.value, changed_by=row.changed_by, changed_at=row.changed_at)
         for row in await session.execute(newest)
     }
-    settings = {}
-    for key, values in CONFIG_VALUES.items():
-        setting = found.get(
-            key, Setting(value=CONFIG_DEFAULTS[key], changed_by=None, changed_at=None)
-        )
-        if setting.value not in values:
-            raise ValueError("a stored config value is not one of its key's values")
-        settings[key] = setting
+    settings = {**defaults(), **found}
+    for key, setting in settings.items():
+        if setting.value not in CONFIG_VALUES.get(key, ()):
+            raise ValueError("a stored config key or value is not a known one")
     return settings
 
 
@@ -114,6 +122,31 @@ async def read_config_bounded(
     return reading.result()
 
 
+def values_of(found: dict[str, Setting]) -> Values:
+    """What call handling runs on, from every key's setting."""
+    return Values(calls=found[CALLS].value, office=found[OFFICE].value)
+
+
+class ReadOutage:
+    """Says once that the config cannot be read, at the first failure of an outage, and once
+    that it can again: `<name>_read_failed` and `<name>_read_recovered`, by event name and
+    exception class."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._failing = False
+
+    def failed(self, error: BaseException) -> None:
+        if not self._failing:
+            self._failing = True
+            logger.warning("%s_read_failed error=%s", self._name, type(error).__name__)
+
+    def ended(self) -> None:
+        if self._failing:
+            self._failing = False
+            logger.info("%s_read_recovered", self._name)
+
+
 class LiveConfig:
     """The values in memory, which call handling reads; None until the first good read."""
 
@@ -129,6 +162,12 @@ class LiveConfig:
         """The office's answer for a call starting at `at` (`office_open` of
         app/domain/office_hours.py). Before the first read the clock decides."""
         return office_open(at, SCHEDULE if self.values is None else self.values.office)
+
+
+def taking_calls() -> LiveConfig:
+    """The config an empty table gives: calls on, the office on its hours. For calls run
+    outside the voice service, which have no poll: the evals (evals/runner.py)."""
+    return LiveConfig(values_of(defaults()))
 
 
 class ConfigPoll:
@@ -150,11 +189,11 @@ class ConfigPoll:
         self._read_seconds = read_seconds
         self._sleep = sleep
         self._task: asyncio.Task[None] | None = None
-        self._failing = False
+        self._outage = ReadOutage("runtime_config")
 
     async def start(self) -> None:
         """Read the values, then go on reading them in the background."""
-        await self._read()
+        await self.read()
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -168,22 +207,18 @@ class ConfigPoll:
     async def _run(self) -> None:
         while True:
             await self._sleep(self._every)
-            await self._read()
+            await self.read()
 
-    async def _read(self) -> None:
-        """One bounded read. The values on success; on any failure the last good values stay
-        and the first failure of an outage is logged. Never raises but on cancellation."""
+    async def read(self) -> None:
+        """One bounded read, as the task makes every `every` seconds. The values on success; on
+        any failure the last good values stay and the first failure of an outage is logged.
+        Never raises but on cancellation."""
         try:
-            found = await read_config_bounded(self._sessions, self._read_seconds)
-            values = Values(calls=found[CALLS].value, office=found[OFFICE].value)
+            values = values_of(await read_config_bounded(self._sessions, self._read_seconds))
         except Exception as error:
-            if not self._failing:
-                self._failing = True
-                logger.warning("runtime_config_read_failed error=%s", type(error).__name__)
+            self._outage.failed(error)
             return
-        if self._failing:
-            self._failing = False
-            logger.info("runtime_config_read_recovered")
+        self._outage.ended()
         if values != self._live.values:
             logger.info("runtime_config_applied calls=%s office=%s", values.calls, values.office)
         self._live.values = values

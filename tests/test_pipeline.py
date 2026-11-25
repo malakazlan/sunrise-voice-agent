@@ -31,7 +31,6 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pydantic import SecretStr
 from speech_fakes import CallPipeline, FakeTime, FakeVoice, until
-from test_offer import taking_calls
 from test_turn import ADVICE_REFUSAL, deps_on
 
 import app.voice.pipeline
@@ -50,6 +49,7 @@ from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
 from app.guard.output import OutputRule
 from app.main import create_app
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, open_agent_call
 from app.voice.speech import Playback

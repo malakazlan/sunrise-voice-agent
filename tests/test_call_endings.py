@@ -49,6 +49,7 @@ from app.config import StartupSettings
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction, guard_input
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 pytestmark = pytest.mark.anyio
@@ -215,6 +216,7 @@ def deps_with(runtime: AsyncEngine, clock: Clock, audit: AuditLog | None = None)
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)) if audit is None else audit,
         now=clock,
         claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        config=taking_calls(),
     )
 
 

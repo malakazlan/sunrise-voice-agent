@@ -2,6 +2,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
@@ -11,10 +12,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app.agent.turn_record import TurnRecorder
 from app.api.offer import OpenCall
+from app.audit.queue import AuditQueue
 from app.config import Settings
 from app.main import create_app
-from app.runtime_config import LiveConfig, Values
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 TOKEN = VOICE_SECRETS["DEMO_ACCESS_TOKEN"]
@@ -79,11 +82,6 @@ class Opener:
 
 def voice_settings(max_concurrent_calls: int = 3) -> Settings:
     return offline_settings(max_concurrent_calls=max_concurrent_calls)
-
-
-def taking_calls() -> LiveConfig:
-    """The config of a voice service that has read it: calls on, the office on its hours."""
-    return LiveConfig(Values(calls="on", office="schedule"))
 
 
 def offer_app(settings: Settings, open_call: OpenCall | None = None) -> FastAPI:
@@ -596,6 +594,31 @@ def test_offer_refused_until_the_config_is_read(caplog: pytest.LogCaptureFixture
     assert asyncio.run(post_stream(app, AUTH)) == (503, 0)
     assert opener.attempts == 0
     assert "call_refused reason=config_unknown" in caplog.text
+
+
+def test_shutdown_drains_both_queues_within_one_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The turn rows and the refused calls' events both stalled: each queue uses all the time
+    # it is given. Shutdown gives them one limit together, so the container's grace period
+    # holds.
+    given: list[float | None] = []
+
+    async def stalled(_queue: object, timeout: float | None = None) -> None:
+        given.append(timeout)
+        assert timeout is not None
+        await asyncio.sleep(timeout)
+
+    monkeypatch.setattr(TurnRecorder, "drain", stalled)
+    monkeypatch.setattr(AuditQueue, "drain", stalled)
+    app = offer_app(voice_settings())
+
+    async def main() -> float:
+        async with app.router.lifespan_context(app):
+            stopping = time.monotonic()
+        return time.monotonic() - stopping
+
+    took = asyncio.run(main())
+    assert given == [5, 5]
+    assert took < 6, took
 
 
 def test_shutdown_ends_active_calls() -> None:
