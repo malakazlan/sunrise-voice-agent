@@ -410,6 +410,7 @@ async def test_filler_rules(seeded_deps: Deps) -> None:
         audit=seeded_deps.audit,
         now=seeded_deps.now,
         claim_keys=seeded_deps.claim_keys,
+        config=seeded_deps.config,
     )
     model = ScriptedModel(calls(("close_call", {})))
     spoken, turn = await run(serving(new_call_id()), slow, model, time, "That's all.")
@@ -431,6 +432,7 @@ async def test_filler_rules(seeded_deps: Deps) -> None:
         audit=seeded_deps.audit,
         now=seeded_deps.now,
         claim_keys=seeded_deps.claim_keys,
+        config=seeded_deps.config,
     )
     armed = claim(
         move(new_call(call_id=new_call_id(), started_at=T0, office_open=True), Phase.INTAKE),

@@ -2,6 +2,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
@@ -11,8 +12,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app.agent.turn_record import TurnRecorder
+from app.api.offer import OpenCall
+from app.audit.queue import AuditQueue
 from app.config import Settings
 from app.main import create_app
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
 TOKEN = VOICE_SECRETS["DEMO_ACCESS_TOKEN"]
@@ -77,6 +82,12 @@ class Opener:
 
 def voice_settings(max_concurrent_calls: int = 3) -> Settings:
     return offline_settings(max_concurrent_calls=max_concurrent_calls)
+
+
+def offer_app(settings: Settings, open_call: OpenCall | None = None) -> FastAPI:
+    """The calls' application, with no database, its config already read: these tests run
+    without one, so its reads fail and it keeps these values."""
+    return create_app(settings, open_call=open_call, config=taking_calls())
 
 
 def active_calls(app: FastAPI) -> int:
@@ -156,7 +167,7 @@ TOKENLESS_BODIES = {
 @pytest.mark.parametrize("headers", BAD_AUTH)
 def test_offer_requires_access_token(headers: dict[str, str], body: str) -> None:
     opener = Opener()
-    app = create_app(voice_settings(), open_call=opener)
+    app = offer_app(voice_settings(), open_call=opener)
 
     with TestClient(app) as client:
         response = client.post(
@@ -178,7 +189,7 @@ def test_offer_requires_access_token(headers: dict[str, str], body: str) -> None
 
 @pytest.mark.parametrize("headers", BAD_AUTH)
 def test_ice_servers_require_access_token(headers: dict[str, str]) -> None:
-    with TestClient(create_app(voice_settings())) as client:
+    with TestClient(offer_app(voice_settings())) as client:
         refused = client.get("/ice-servers", headers=headers)
         allowed = client.get("/ice-servers", headers=AUTH)
 
@@ -194,7 +205,7 @@ def test_ice_servers_require_access_token(headers: dict[str, str]) -> None:
 
 def test_call_cap_is_enforced() -> None:
     opener = Opener()
-    app = create_app(voice_settings(max_concurrent_calls=2), open_call=opener)
+    app = offer_app(voice_settings(max_concurrent_calls=2), open_call=opener)
 
     with TestClient(app) as client:
         first = client.post("/offer", json=OFFER, headers=AUTH)
@@ -209,7 +220,7 @@ def test_call_cap_is_enforced() -> None:
 
 
 def test_offer_returns_the_answer() -> None:
-    with TestClient(create_app(voice_settings(), open_call=Opener())) as client:
+    with TestClient(offer_app(voice_settings(), open_call=Opener())) as client:
         response = client.post("/offer", json=OFFER, headers=AUTH)
 
     assert response.status_code == 200
@@ -241,7 +252,7 @@ def run_registry(
 def test_slot_released_on_end_and_on_failure() -> None:
     # Setup fails half-way: the slot taken for the call is given back.
     opener = Opener(fail_first=1)
-    app = create_app(voice_settings(max_concurrent_calls=1), open_call=opener)
+    app = offer_app(voice_settings(max_concurrent_calls=1), open_call=opener)
     with TestClient(app) as client:
         failed = client.post("/offer", json=OFFER, headers=AUTH)
         assert failed.status_code == 400
@@ -318,7 +329,7 @@ def test_token_compare_is_constant_time(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(hmac, "compare_digest", spy)
     opener = Opener()
 
-    with TestClient(create_app(voice_settings(), open_call=opener)) as client:
+    with TestClient(offer_app(voice_settings(), open_call=opener)) as client:
         # The right token is refused when the constant-time compare says no...
         assert client.post("/offer", json=OFFER, headers=AUTH).status_code == 401
         assert client.get("/ice-servers", headers=AUTH).status_code == 401
@@ -332,7 +343,7 @@ def test_token_compare_is_constant_time(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_wrong_then_right_token_works() -> None:
-    with TestClient(create_app(voice_settings(), open_call=Opener())) as client:
+    with TestClient(offer_app(voice_settings(), open_call=Opener())) as client:
         refused = client.post("/offer", json=OFFER, headers={"Authorization": "Bearer nope"})
         accepted = client.post("/offer", json=OFFER, headers=AUTH)
 
@@ -344,7 +355,7 @@ def test_dev_without_token_is_open() -> None:
         app_env="dev", demo_access_token=None, turn_host=None, turn_shared_secret=None
     )
 
-    with TestClient(create_app(settings, open_call=Opener())) as client:
+    with TestClient(offer_app(settings, open_call=Opener())) as client:
         offer = client.post("/offer", json=OFFER)
         ice = client.get("/ice-servers")
 
@@ -364,7 +375,7 @@ def test_dev_without_token_is_open() -> None:
 )
 def test_malformed_offer_is_rejected(body: dict[str, str]) -> None:
     opener = Opener()
-    app = create_app(voice_settings(), open_call=opener)
+    app = offer_app(voice_settings(), open_call=opener)
 
     with TestClient(app) as client:
         response = client.post("/offer", json=body, headers=AUTH)
@@ -374,7 +385,7 @@ def test_malformed_offer_is_rejected(body: dict[str, str]) -> None:
 
 
 def test_call_page_is_served() -> None:
-    with TestClient(create_app(voice_settings())) as client:
+    with TestClient(offer_app(voice_settings())) as client:
         response = client.get("/")
 
     assert response.status_code == 200
@@ -385,7 +396,7 @@ def test_call_page_is_served() -> None:
 
 def test_offer_body_is_capped() -> None:
     opener = Opener()
-    app = create_app(voice_settings(), open_call=opener)
+    app = offer_app(voice_settings(), open_call=opener)
 
     # A body over the limit is refused, whether it is sent whole or never ends.
     with TestClient(app) as client:
@@ -436,7 +447,7 @@ def padded_offer(size: int) -> bytes:
 
 
 def test_offer_body_cap_boundary() -> None:
-    app = create_app(voice_settings(max_concurrent_calls=1), open_call=Opener())
+    app = offer_app(voice_settings(max_concurrent_calls=1), open_call=Opener())
 
     async def main() -> tuple[int | None, int | None]:
         at_cap = await post_chunked(app, padded_offer(BODY_LIMIT))
@@ -462,7 +473,7 @@ def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(hmac, "compare_digest", spy)
     opener = Opener()
-    with TestClient(create_app(voice_settings(), open_call=opener)) as client:
+    with TestClient(offer_app(voice_settings(), open_call=opener)) as client:
         for empty in ("Bearer ", "Bearer", "Bearer  "):
             headers = {"Authorization": empty}
             assert client.post("/offer", json=OFFER, headers=headers).status_code == 401
@@ -523,7 +534,7 @@ def test_slot_released_when_setup_is_cancelled() -> None:
         await asyncio.Event().wait()
         raise AssertionError("never reached")
 
-    app = create_app(voice_settings(max_concurrent_calls=1), open_call=slow_open)
+    app = offer_app(voice_settings(max_concurrent_calls=1), open_call=slow_open)
     body = json.dumps(OFFER).encode()
 
     async def main() -> None:
@@ -570,9 +581,49 @@ async def post_offer(app: FastAPI) -> int:
     return starts[0]
 
 
-def test_shutdown_ends_active_calls() -> None:
+def test_offer_refused_until_the_config_is_read(caplog: pytest.LogCaptureFixture) -> None:
+    # No database, so the config is never read: an unknown config takes no call, and the
+    # offer is refused before any of its body is read.
+    caplog.set_level(logging.INFO)
     opener = Opener()
     app = create_app(voice_settings(), open_call=opener)
+    with TestClient(app) as client:
+        refused = client.post("/offer", json=OFFER, headers=AUTH)
+        assert client.post("/offer", json=OFFER).status_code == 401
+    assert (refused.status_code, refused.json()) == (503, {"reason": "unavailable"})
+    assert asyncio.run(post_stream(app, AUTH)) == (503, 0)
+    assert opener.attempts == 0
+    assert "call_refused reason=config_unknown" in caplog.text
+
+
+def test_shutdown_drains_both_queues_within_one_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The turn rows and the refused calls' events both stalled: each queue uses all the time
+    # it is given. Shutdown gives them one limit together, so the container's grace period
+    # holds.
+    given: list[float | None] = []
+
+    async def stalled(_queue: object, timeout: float | None = None) -> None:
+        given.append(timeout)
+        assert timeout is not None
+        await asyncio.sleep(timeout)
+
+    monkeypatch.setattr(TurnRecorder, "drain", stalled)
+    monkeypatch.setattr(AuditQueue, "drain", stalled)
+    app = offer_app(voice_settings())
+
+    async def main() -> float:
+        async with app.router.lifespan_context(app):
+            stopping = time.monotonic()
+        return time.monotonic() - stopping
+
+    took = asyncio.run(main())
+    assert given == [5, 5]
+    assert took < 6, took
+
+
+def test_shutdown_ends_active_calls() -> None:
+    opener = Opener()
+    app = offer_app(voice_settings(), open_call=opener)
 
     # The app's lifespan runs on this loop, which stays up after the shutdown, so only the
     # shutdown itself can have ended the calls.

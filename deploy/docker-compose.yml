@@ -7,8 +7,9 @@ name: sunrise-voice-agent
 # the start-up steps, every setting of the deployment, which its first step checks together
 # (each secret strong, and the admin password like no other) before the others start; app the
 # voice role's settings, which hold no part of the owner's identity and no admin sign-in;
-# admin-api the admin role's (the database as the runtime role, the audit key, the clock and
-# the calls' longest, the admin's sign-in and the console's origin); coturn its own. The name
+# admin-api the admin role's (the database as the runtime role, the audit key, the clock, the
+# calls' longest, the model and the most calls at once, the admin's sign-in and the console's
+# origin); coturn its own. The name
 # `console` is the console's own service, which runs elsewhere.
 # Compose refuses to start without the owner's credentials or APP_ENV. The services check the
 # rest themselves and stop when a value they need is missing; an empty value counts as unset,
@@ -32,22 +33,23 @@ x-runtime-database: &runtime-database
   APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
   APP_ENV: ${APP_ENV:?APP_ENV is not set; pass --env-file .env}
   LOG_LEVEL: ${LOG_LEVEL:-}
-# What the app and the admin API both hold: the clock, the audit key, and the calls' longest
-# (the admin API's live calls follow it).
+# What the app and the admin API both hold: the clock, the audit key, the calls' longest
+# (the admin API's live calls follow it); and the model and the most calls at once, which the
+# admin API's config page shows.
 x-clock-and-audit: &clock-and-audit
   SIMULATED_NOW: ${SIMULATED_NOW:-}
   AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
   MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
-# The calls' own: the identity key, the limits, TURN, the access token, the vendors.
+  MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+# The calls' own: the identity key, TURN, the access token, the vendors.
 x-voice-settings: &voice-settings
   IDENTITY_HASH_KEY: ${IDENTITY_HASH_KEY:-}
-  MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
   TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
   TURN_HOST: ${TURN_HOST:-}
   DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
-  LLM_MODEL: ${LLM_MODEL:-}
   ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
   ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
   TTS_MODEL: ${TTS_MODEL:-}

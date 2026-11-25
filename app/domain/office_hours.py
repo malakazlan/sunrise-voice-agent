@@ -8,6 +8,12 @@ CLOSES = time(17, 0)
 # Where the after-hours line's night ends.
 DAWN = time(5, 0)
 FRIDAY = 4
+# What staff may set the office to (the `office` key of config_changes in app/db/models.py): its
+# hours decide, or it is forced open or closed.
+SCHEDULE = "schedule"
+FORCED_OPEN = "open"
+FORCED_CLOSED = "closed"
+OFFICE_OVERRIDES = (SCHEDULE, FORCED_OPEN, FORCED_CLOSED)
 
 
 class ClockSettings(Protocol):
@@ -23,6 +29,19 @@ def is_open(at: datetime) -> bool:
         raise ValueError("is_open needs a timezone-aware datetime")
     local = at.astimezone(CLINIC_TZ)
     return local.weekday() <= FRIDAY and OPENS <= local.time() < CLOSES
+
+
+def office_open(at: datetime, override: str) -> bool:
+    """Whether the office is open for a call starting at `at`: as its hours say (`is_open`)
+    with the override `schedule`, and as the override says when forced. Anything else is
+    refused."""
+    if override == SCHEDULE:
+        return is_open(at)
+    if override == FORCED_OPEN:
+        return True
+    if override == FORCED_CLOSED:
+        return False
+    raise ValueError("the office override is not one of its values")
 
 
 def part_of_day(at: datetime) -> str:

@@ -62,6 +62,9 @@ HMAC_KEY_PLACEHOLDERS = {
     "audit_hmac_key": EXAMPLE_AUDIT_KEY,
     "identity_hash_key": EXAMPLE_IDENTITY_KEY,
 }
+# The speech vendors of a call, by name: the keys and voice below are theirs.
+SPEECH_TO_TEXT = "deepgram"
+TEXT_TO_SPEECH = "elevenlabs"
 # CONSOLE_ORIGIN: one exact origin, as a browser sends it: a scheme, a lower-case host name or
 # IPv4 address, and a port if not the scheme's own. No path, no wildcard, nothing else.
 HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -284,11 +287,11 @@ class Settings(DatabaseSettings):
     # and a session changes state from the API's own origin only.
     console_origin: str | None = None
     # The vendors of a call: the model (app/agent/model.py) and speech-to-text
-    # (app/voice/pipeline.py). Without both keys a call is refused at set-up.
+    # (app/voice/pipeline.py), SPEECH_TO_TEXT. Without both keys a call is refused at set-up.
     anthropic_api_key: SecretStr | None = Field(default=None, validate_default=True)
     deepgram_api_key: SecretStr | None = Field(default=None, validate_default=True)
     llm_model: str = Field(default="claude-haiku-5-5", pattern=CLAUDE_MODEL_ID)
-    # Speech out (app/voice/speech.py): ElevenLabs' key and the voice. No voice is guessed:
+    # Speech out (app/voice/speech.py), TEXT_TO_SPEECH: its key and the voice. No voice is guessed:
     # without both, a call is refused at set-up, and outside dev the app does not start.
     elevenlabs_api_key: SecretStr | None = Field(default=None, validate_default=True)
     elevenlabs_voice_id: str | None = Field(
@@ -546,9 +549,10 @@ _EVERY_SETTING = frozenset(Settings.model_fields) | frozenset(StartupSettings.mo
 # The settings each service's container is given, and no other (deploy/docker-compose.yml; CI
 # compares the running containers with these). The voice role: every application setting but
 # the admin's. The admin role: the database as the runtime role, the audit key, the clock and
-# the calls' longest (the live calls follow both), the admin's sign-in and the console's
-# origin; no key of a vendor, no TURN secret, no access token, no identity key. The start-up
-# service: every setting of the deployment but the role, which its check sets.
+# the calls' longest (the live calls follow both), the model and the most calls at once (the
+# config page shows them), the admin's sign-in and the console's origin; no key of a vendor, no
+# TURN secret, no access token, no identity key. The start-up service: every setting of the
+# deployment but the role, which its check sets.
 VOICE_FIELDS = frozenset(Settings.model_fields) - {"admin_user", "admin_password", "console_origin"}
 ADMIN_FIELDS = frozenset(
     {
@@ -563,6 +567,8 @@ ADMIN_FIELDS = frozenset(
         "audit_hmac_key",
         "simulated_now",
         "max_call_seconds",
+        "llm_model",
+        "max_concurrent_calls",
         "admin_user",
         "admin_password",
         "console_origin",

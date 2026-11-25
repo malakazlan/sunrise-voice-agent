@@ -997,12 +997,14 @@ def test_no_print_in_app() -> None:
     assert ("sys.stderr.write", "main") in found["app/config.py"]
 
 
-# The admin API only reads. Its one write is its own audit event, through the audit log's
-# append, so its modules name no write construct (SQLAlchemy's insert, update, delete, merge,
-# a session's add, raw SQL text) and hold no string with a writing SQL keyword; every other
-# `.append` call is refused, so the one there is is the audit log's. Docstrings are prose and
-# are not read. A route of the API's own app for the DELETE method (`@app.delete`, signing out)
-# is a route, not a write. Like the scans above, a lint against accidents.
+# The admin API's modules but one only read. Their one write is the audit event, through the
+# audit log's append, so they name no write construct (SQLAlchemy's insert, update, delete,
+# merge, a session's add, raw SQL text) and hold no string with a writing SQL keyword; every
+# other `.append` call is refused, so the one there is is the audit log's. Docstrings are prose
+# and are not read. A route of the API's own app for the DELETE method (`@app.delete`, signing
+# out) is a route, not a write. The admin's writes are in ADMIN_WRITES alone, and only add a
+# handled mark or a config change. Like the scans above, a lint against accidents.
+ADMIN_WRITES = "app/api/writes.py"
 ADMIN_MODULES = (
     "app/api/admin.py",
     "app/api/reads.py",
@@ -1142,6 +1144,20 @@ def test_admin_is_read_only() -> None:
         "app/audit/read.py": 0,
         "app/audit/console.py": 0,
     }
+
+
+def test_admin_writes_only_add_marks_and_changes() -> None:
+    source = (REPO_ROOT / ADMIN_WRITES).read_text(encoding="utf-8")
+    inserted = sorted(
+        ast.unparse(node.args[0])
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "insert"
+    )
+    assert inserted == ["ConfigChange", "HandledMark"]
+    # Nothing else that writes: no update, delete, add, merge or SQL text.
+    assert sorted(admin_write_uses(source)) == ["import insert", "insert", "insert"]
 
 
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last

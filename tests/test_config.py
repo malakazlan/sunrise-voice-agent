@@ -95,6 +95,8 @@ ADMIN_ROLE_FIELDS = {
     "audit_hmac_key",
     "simulated_now",
     "max_call_seconds",
+    "llm_model",
+    "max_concurrent_calls",
     "admin_user",
     "admin_password",
     "console_origin",

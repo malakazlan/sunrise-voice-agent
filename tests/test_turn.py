@@ -37,6 +37,7 @@ from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
 from app.main import create_app
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 from evals.scripted import ScriptedModel, Step, calls, says
 
@@ -202,6 +203,7 @@ def deps_on(engine: AsyncEngine, at: datetime = T0) -> Deps:
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: at,
         claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        config=taking_calls(),
     )
 
 
@@ -441,6 +443,7 @@ async def test_a_closed_office_offers_only_the_message_flow(
         audit=offline_deps.audit,
         now=lambda: EVENING,
         claim_keys=offline_deps.claim_keys,
+        config=offline_deps.config,
     )
     model = ScriptedModel(says("We open at nine tomorrow morning."))
     agent, opening = await start_call(new_call_id(), closed, model, registry)
@@ -863,6 +866,7 @@ async def test_the_hand_off_with_the_office_closed(
         audit=offline_deps.audit,
         now=lambda: EVENING,
         claim_keys=offline_deps.claim_keys,
+        config=offline_deps.config,
     )
     state = move(
         new_call(call_id=new_call_id(), started_at=EVENING, office_open=False), Phase.INTAKE
@@ -997,6 +1001,7 @@ def test_shutdown_waits_for_guard_audits(registry: Registry) -> None:
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
         claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        config=taking_calls(),
     )
     state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
     app = create_app(offline_settings())
@@ -1022,6 +1027,7 @@ async def test_guard_audit_failures_are_logged(
         audit=AuditLog(SecretStr(TEST_AUDIT_KEY)),
         now=lambda: T0,
         claim_keys=ClaimKeys(SecretStr(TEST_IDENTITY_KEY)),
+        config=taking_calls(),
     )
     state = move(new_call(call_id=FIXED_CALL_ID, started_at=T0, office_open=True), Phase.INTAKE)
     agent = CallAgent(state, deps, ScriptedModel(says("It's probably just a cold.")), registry)

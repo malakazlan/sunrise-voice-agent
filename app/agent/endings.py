@@ -8,7 +8,8 @@ office closed it is all the call can do, besides the emergency line and the good
 message closes the call. `transfer_to_staff` needs the office open; the transfer is simulated:
 the request row and the event are real, there is no phone system behind them.
 
-`start_call` creates the call, deciding once from the call's clock whether the office is open,
+`start_call` creates the call, deciding once from the call's clock, or from the office override
+staff set (read from memory, app/runtime_config.py), whether the office is open,
 and `end_call` is the one way it ends; `emergency` is the one way to the emergency line, for the
 input guard and for the model's report alike (`call_tool` in app/agent/tools.py). Each returns
 the state and the line before any database work: its event (`call_started`, `call_ended`,
@@ -48,7 +49,7 @@ from app.agent.state import (
 from app.agent.tool_registry import Deps, HandlerContext, NoArguments, Tool, ToolResult
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.db.models import MAX_MESSAGE_BODY, MESSAGE_KEY, Message, Request
-from app.domain.office_hours import is_open, part_of_day
+from app.domain.office_hours import part_of_day
 
 logger = logging.getLogger(__name__)
 
@@ -410,12 +411,15 @@ async def drain_call_events() -> None:
 
 
 async def start_call(call_id: str, deps: Deps) -> tuple[CallState, ScriptId]:
-    """The call's first state, with the office open or closed as the call's clock says now, and
-    its first line: the greeting, or the closed line."""
+    """The call's first state, with the office open or closed as the call's clock says now or
+    as staff forced it (the config in memory, never the database), and its first line: the
+    greeting, or the closed line. The call keeps that answer to its end."""
     if call_id in _LIVE_CALLS:
         raise ValueError("the call has already started")
     started_at = deps.now()
-    state = new_call(call_id=call_id, started_at=started_at, office_open=is_open(started_at))
+    state = new_call(
+        call_id=call_id, started_at=started_at, office_open=deps.config.office_open(started_at)
+    )
     if len(_LIVE_CALLS) >= MAX_LIVE_CALLS:
         oldest = next(iter(_LIVE_CALLS))
         del _LIVE_CALLS[oldest]

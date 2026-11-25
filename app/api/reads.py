@@ -14,10 +14,10 @@ shown at all.
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import ColumnElement, select, tuple_
+from sqlalchemy import ColumnElement, and_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -29,6 +29,12 @@ from app.guard.mask import hide_names, mask
 DEFAULT_PAGE = 50
 # The largest value of a Postgres integer, the type of request, message and call ids.
 MAX_ROW_ID = 2**31 - 1
+# The queue's pages: the requests still to do, those marked handled, or all.
+type QueueState = Literal["todo", "handled", "all"]
+TODO: Final = "todo"
+HANDLED: Final = "handled"
+ALL: Final = "all"
+QUEUE_STATES = (TODO, HANDLED, ALL)
 DIGIT = re.compile(r"\d")
 # Why a call's transcript is not shown: the call record's own masking of names did not run.
 NAMES_NOT_MASKED = "names_not_masked"
@@ -248,18 +254,33 @@ async def call_detail(session: AsyncSession, call_id: str) -> dict[str, Any] | N
     return {"call": shown, "events": [masked(event) for event in reversed(events)]}
 
 
+def shown_mark(by: str, at: datetime) -> dict[str, str]:
+    """A handled mark as the admin API shows it: who marked the row, and when."""
+    return {"by": by, "at": at.isoformat()}
+
+
 async def request_queue(
-    session: AsyncSession, page: Page, request_type: str | None
+    session: AsyncSession, page: Page, request_type: str | None, state: QueueState
 ) -> list[dict[str, Any]]:
     """A page of the requests, newest received first (the higher id first between two received
-    at the same moment), of `request_type` if one is given; `page.before` is the id of the last
-    request of the page before, and an id that is not a request's gives an empty page. A
-    callback or a doctor's message carries the masked numbers of the messages it was left with
-    (`callbacks`) and whether one was left after hours; never the caller's name."""
+    at the same moment), of `request_type` if one is given, of those still to do, those marked
+    handled, or all (`state`); `page.before` is the id of the last request of the page before,
+    and an id that is not a request's gives an empty page. Each carries its mark (`handled`),
+    or None. A callback or a doctor's message carries the masked numbers of the messages it was
+    left with (`callbacks`) and whether one was left after hours; never the caller's name."""
     if request_type is not None and request_type not in models.REQUEST_TYPES:
         raise ValueError("request_type is not a type of request")
+    if state not in QUEUE_STATES:
+        raise ValueError("state is not a state of the queue")
     received, row_id = models.Request.created_at, models.Request.id
-    statement = select(*REQUEST_COLUMNS)
+    mark = models.HandledMark
+    statement = select(*REQUEST_COLUMNS, mark.marked_by, mark.marked_at).outerjoin(
+        mark, and_(mark.source == models.QUEUE_REQUESTS, mark.row_id == row_id)
+    )
+    if state == TODO:
+        statement = statement.where(mark.id.is_(None))
+    elif state == HANDLED:
+        statement = statement.where(mark.id.is_not(None))
     if request_type is not None:
         statement = statement.where(models.Request.type == request_type)
     if page.before is not None:
@@ -284,14 +305,17 @@ async def request_queue(
 
 
 def _queued(row: Mapping[str, Any], found: Sequence[Any], names: list[str]) -> dict[str, Any]:
-    """A request as the queue shows it, with what the messages it was left with add."""
+    """A request as the queue shows it, with what the messages it was left with add, and its
+    mark."""
+    request = dict(row)
+    by, at = request.pop("marked_by"), request.pop("marked_at")
     left = [
         message
         for message in found
         if (message.call_id, message.kind, message.body)
-        == (row["call_id"], row["type"], row["summary"])
+        == (request["call_id"], request["type"], request["summary"])
     ]
-    shown = masked(row)
+    shown = masked(request)
     shown["summary"] = hide_names(shown["summary"], names)
     shown["callbacks"] = sorted(
         {
@@ -301,4 +325,5 @@ def _queued(row: Mapping[str, Any], found: Sequence[Any], names: list[str]) -> d
         }
     )
     shown["after_hours"] = any(message.after_hours for message in left)
+    shown["handled"] = None if by is None else shown_mark(by, at)
     return shown
