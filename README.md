@@ -802,14 +802,15 @@ number of caller turns, and the transcript. Audio is never stored.
 A read-only JSON API for staff and graders, in `app/api/admin.py`, so the requests, messages,
 call records and audit log can be read and the chain checked without opening the database. It
 is off unless `ADMIN_PASSWORD` is set: then it is mounted under `/admin/api`; without it those paths
-answer `404` and the app logs `admin_api_off` once at start.
+answer `404` and the app logs `admin_api_off` once at start. The console signs in to the same
+API with a browser session (below, "Admin API for the console").
 
 | Route (all `GET`) | Returns |
 |---|---|
 | `/admin/api/requests` | `{"requests": [...]}`: id, created_at, call_id, type, summary, patient_id |
-| `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name, callback_number, body, patient_id |
+| `/admin/api/messages` | `{"messages": [...]}`: id, created_at, call_id, kind, name (hidden), callback_number, body, patient_id |
 | `/admin/api/calls` | `{"calls": [...]}`: id, call_id, started_at, ended_at, office_open, verified, patient_id, end_reason, turn_count; no transcript |
-| `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript, transcript_truncated and names_masked; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
+| `/admin/api/calls/{call_id}` | `{"call": {...}}`: the same fields with transcript, transcript_truncated, names_masked and transcript_withheld; an unknown call or an id that is not a call id gets `404` with the same body as an unknown path |
 | `/admin/api/audit` | `{"events": [...]}`: seq, ts, call_id, actor, action, resource_type, resource_id, outcome, reason; filters `call_id`, `action` |
 | `/admin/api/audit/verify` | `{"ok", "checked", "breaks": [{"seq", "kind"}], "truncated"}`, as `AuditLog.verify` reports it (at most 100 breaks) |
 
@@ -817,11 +818,20 @@ answer `404` and the app logs `admin_api_off` once at start.
 curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?limit=20'
 ```
 
-- Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`. The user name and the password
-  are each compared as a SHA-256 digest in constant time, both always. Anything else (no
-  header, a wrong part, a malformed or non-UTF-8 header, an `Authorization` header over 1024
-  characters) gets the same `401` and `WWW-Authenticate` challenge, and is logged as
-  `admin_sign_in_failed failures=<n>`, never the name or password tried.
+Under Compose the admin API is its own service, `admin-api`, on `127.0.0.1:8001`; the app on
+8000 serves no admin route there:
+
+```sh
+curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8001/admin/api/requests?limit=20'
+```
+
+- Sign-in: HTTP Basic with `ADMIN_USER` and `ADMIN_PASSWORD`, or a browser session. The user
+  name and the password are each compared as a SHA-256 digest in constant time, both always.
+  Anything else (no header, a wrong part, a malformed or non-UTF-8 header, an `Authorization`
+  header over 1024 characters) gets the same `401`, and is logged as
+  `admin_sign_in_failed failures=<n>`, never the name or password tried. The `401` carries the
+  `WWW-Authenticate` challenge only for a request without an `Origin` header: a browser sends
+  one, and must never show the Basic prompt.
 - Failed sign-ins are limited per client address (`app/guard/rate_limit.py`): after five
   inside a sliding minute the address gets `429`, before its credentials are looked at, until
   the oldest of them is a minute old. A correct sign-in is not counted. Failed sign-ins are
@@ -844,11 +854,18 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
 - Every text value from the database passes the log masking (`mask`): SSNs, dates and email
   addresses in a summary, body or transcript are hidden. Patient ids and call ids come out as stored.
   Timestamps are ISO 8601.
+- Names the records know are hidden too (`<PERSON>`), in the requests' summaries, the messages'
+  bodies, a call's transcript and the queue: each caller name the calls' messages hold, and the
+  first and last name of each patient they name. A message's own `name` is shown hidden. A
+  transcript whose names were not masked when it was stored (`names_masked` false) is not shown:
+  `transcript` is null and `transcript_withheld` is `names_not_masked`.
 - A callback number shows as `***-***-` and its last four digits, whatever its shape
   (`+44 20 7946 0958` shows as `***-***-0958`); with fewer than four digits it shows as
   `***-***-****`.
-- Every admin response, errors included, carries `Cache-Control: no-store`. The routes are not
-  in the API schema, and `/docs` stays off outside dev.
+- Every admin response, errors and preflights included, carries `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The routes are not in
+  the API schema, and `/docs` stays off outside dev.
 - The runtime role needs no privilege for the API beyond what the calls use: it reads these
   tables and appends events.
 - Limits:
@@ -862,8 +879,9 @@ curl -u "$ADMIN_USER:$ADMIN_PASSWORD" 'http://127.0.0.1:8000/admin/api/requests?
     most 10,000 addresses, dropping the one that failed longest ago.
   - A real console would reveal a callback number only on an explicit, audited action; this
     API never reveals one, it shows the masked form with the last four digits.
-  - Masking hides identifiers by their shape, as in the logs: names are not masked, and a
-    number written another way (spelled out without a cue, for example) is shown as written.
+  - Masking hides identifiers by their shape, as in the logs, and names only where the records
+    know them: a name no message or patient record holds is shown as written, and so is a
+    number written another way (spelled out without a cue, for example).
   - A read event records which list was read, not which rows.
 
 ### Console data: turn timings and the console's reads
@@ -935,6 +953,107 @@ and demo when set).
     counted and logged (`call_turns_dropped_at_shutdown`).
   - The summaries count events and rows, not their causes: a guard block's reason is its rule
     name, nothing of what was said.
+
+### Admin API for the console
+
+The console is a separate web app at its own origin; it reads only `/admin/api/*`. For it the
+admin API has a browser sign-in, takes requests from exactly one other origin, streams the live
+calls, and runs in a process of its own (`app/api/security.py`, `sessions.py`, `live.py`,
+`service.py`).
+
+| Route | Does | Audit action |
+|---|---|---|
+| `POST /admin/api/session` | body `{"user", "password"}` (JSON, at most 1 KiB): signs in and answers as `GET` does, with the session cookie | `admin_signed_in` |
+| `GET /admin/api/session` | `{"user", "csrf_token", "expires_in", "office_open", "time_zone"}`: who is signed in, the session's anti-forgery token, the seconds left if it is not used, and the office open or closed by the agent's clock (simulated when set) with the clinic's zone; `401` when not signed in | none (reads no patient data) |
+| `DELETE /admin/api/session` | ends the session and clears the cookie; `204` | `admin_signed_out` |
+| `GET /admin/api/queue?type=&before=` | `{"requests": [...]}`: the Requests page's rows, newest received first (the higher id first at the same instant), 50 a page; each with id, created_at, call_id, type, summary (masked, names hidden), patient_id, `callbacks` (the masked numbers of the messages it was left with) and `after_hours`; never the caller's name. `before=<id>` is the last request of the page before | `admin_read_queue` |
+| `GET /admin/api/calls/{call_id}/detail` | `{"call": {...}, "events": [...]}`: the call as `/admin/api/calls/{call_id}` shows it, and its audit events oldest first (the latest 100) | `admin_read_call_detail` |
+| `GET /admin/api/calls/live/stream` | `text/event-stream` of the live calls, session only | `admin_read_live_calls`, once per stream |
+
+Two ways to sign in, one check (`AdminAccess`):
+
+- HTTP Basic stays as it was, for scripts, and reads only: a state-changing request with Basic
+  alone is refused. The stream refuses Basic.
+- A browser session: `POST /admin/api/session` checks the user and password as Basic does, in
+  constant time, against the same failed-sign-in limit (failures of either kind count for the
+  address), and answers every failure the same way (`401 {"detail": "Sign-in failed"}`). On
+  success it opens a new session: 32 random bytes, of which the server keeps only the SHA-256;
+  8 hours at most, 30 minutes idle; at most 32 sessions, the one used longest ago ending first.
+  The id goes in the cookie `admin_session`: `HttpOnly`, `SameSite=Strict`, `Path=/admin/api`,
+  no `Domain` (this host only), no expiry (it ends with the browser), and `Secure` unless
+  `APP_ENV=dev`. No audit event, no session: if `admin_signed_in` cannot be written the answer
+  is `503`. A sign-in from a browser that holds a session ends that one.
+- A read with a session keeps it alive; `GET /admin/api/session` and the stream do not.
+- Sessions are held in memory: restarting `admin-api` signs everyone out.
+
+Anti-forgery. Other apps live on sibling hosts of the same site, and a cookie's `SameSite` rule
+treats them as the same site, so it is no defence here; these rules are:
+
+- Every state-changing request under a session (`POST`, `DELETE`, and any `PUT` or `PATCH` to
+  come) needs `X-CSRF-Token` equal to the session's token (compared in constant time) and an
+  `Origin` equal to `CONSOLE_ORIGIN`, or to the API's own origin when that is not set. Else
+  `403`.
+- Signing in has no token yet: it needs that `Origin` and `Content-Type: application/json`, so a
+  form posted from another page is refused (`403`) before the password is looked at.
+- A session is honoured only for a request from that origin or one without an `Origin` header
+  (a browser sends none on its own same-origin reads). A page of another origin that makes the
+  browser send the cookie is answered as signed out, so it cannot take the session's stream
+  either.
+- `GET` changes nothing but its own audit event and the session's idle time.
+
+CORS: `CONSOLE_ORIGIN` is one exact origin (`https://console.example.org`: scheme, lower-case
+host, optional port; no path, no wildcard; `http` only with `APP_ENV=dev`). Requests from it
+get `Access-Control-Allow-Origin` with that origin (never `*`) and
+`Access-Control-Allow-Credentials: true`; preflights get the methods `GET, POST, DELETE`, the
+headers `Content-Type, X-CSRF-Token`, and `Access-Control-Max-Age: 600`. Every answer carries
+`Vary: Origin`. Any other origin gets no CORS header, and with `CONSOLE_ORIGIN` unset nobody
+does. The console reads the stream with `new EventSource(url, {withCredentials: true})` and the
+rest with `fetch(url, {credentials: "include"})`.
+
+The live calls stream:
+
+- At the opening one audited read of the live calls, sent as an event `calls` (the JSON list,
+  as `/admin/api/calls/live` gives it); no event, no stream. Then every 2 seconds the session
+  is looked at (without keeping it alive) and the live calls read again in a transaction of
+  its own, with no audit event; `calls` is sent only when the list differs from the last one
+  sent. A comment line every 15 seconds keeps proxies from closing it, and
+  `X-Accel-Buffering: no` keeps nginx from holding it back.
+- A read that fails sends `paused` once; the next tick tries again, and the list is sent again
+  once a read works.
+- When the session ends (signed out, idle or 8 hours) the stream sends `signed_out` and
+  closes. After 5 minutes it sends `renew` and closes, and the page opens a new one.
+- At most 5 streams are open per process and one per session: a newer stream of the session
+  closes the older (silently: `EventSource` then reconnects on its own, so two tabs of one
+  session take the stream from each other in turn). A sixth session gets `429`. A client that
+  takes no write for 10 seconds is dropped.
+
+Roles: `APP_ROLE` picks what a process serves, from the same image and command
+(`app/server.py`).
+
+| `APP_ROLE` | Serves |
+|---|---|
+| `all` (default) | the calls, and the admin API when `ADMIN_PASSWORD` is set: for development and tests |
+| `voice` | the calls only: no admin route, and no admin sign-in may be set |
+| `admin` | the admin API and `/health` only. No call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` and the vendors' keys, and starts without them. Without `ADMIN_PASSWORD` it still starts, answers `/health`, answers `404` to everything under `/admin`, and logs `admin_off_no_password` once |
+
+In Compose `app` runs `voice` and `admin-api` runs `admin`, each with only its own variables
+(Run with Docker). Each long-running service holds only some of the secrets, so the one-shot
+`startup` service is given all of them and its first step (`python -m app.config`) checks them
+together as `all` does: each strong, and the admin password different from every other, the
+database passwords included. A clash stops the deployment before `app` and `admin-api` start,
+naming both settings and no value.
+
+Behind a proxy: the sign-in limit counts by client address, so behind the HTTPS proxy every
+browser and script shares the proxy's address and one limit (see Limits above); and the API's
+own origin is read from the request's scheme and `Host`, which a proxy that ends TLS changes,
+so set `CONSOLE_ORIGIN` there.
+
+- Limits:
+  - Sessions and stream places are per process and in memory: one `admin-api` process, no
+    sharing between replicas.
+  - A request without credentials on a Basic route counts as a failed sign-in, as before. A page
+    on any site can make the admin's browser send five such requests and hold the admin's
+    address at the limit for a minute: a delay, not a way in.
 
 ### Output guard
 
@@ -1181,6 +1300,7 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | Variable            | Allowed values                      | Default        |
 |---------------------|-------------------------------------|----------------|
 | `APP_ENV`           | `dev`, `demo`, `prod`               | none, required |
+| `APP_ROLE`          | `all`, `voice`, `admin` (see Admin API for the console) | `all` |
 | `LOG_LEVEL`         | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO`         |
 | `SIMULATED_NOW`     | ISO date and time, or empty         | empty (unset)  |
 | `POSTGRES_HOST`     | host name                           | none, required |
@@ -1191,14 +1311,15 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | `APP_DB_USER`       | runtime role: `a-z 0-9 _`, up to 63, not `pg_...`, not `POSTGRES_USER` | none, required |
 | `APP_DB_PASSWORD`   | runtime role's password, never logged, not `POSTGRES_PASSWORD` | none, required |
 | `AUDIT_HMAC_KEY`    | audit chain key, never logged       | none, required |
-| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required |
+| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required; refused by the admin role |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only             | `3`            |
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
 | `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
-| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off) |
+| `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off); refused by the voice role |
+| `CONSOLE_ORIGIN`    | one origin: `https://host[:port]` (`http` in dev only), no path or wildcard | empty (no other origin answered) |
 | `ANTHROPIC_API_KEY` | the model's API key, never logged    | required unless dev |
 | `DEEPGRAM_API_KEY`  | speech-to-text's API key, never logged | required unless dev |
 | `LLM_MODEL`         | a Claude model id (`claude-` and up to 60 of `a-z 0-9 . -`) | `claude-haiku-5-5` |
@@ -1217,8 +1338,9 @@ database credentials.
 `APP_ENV=dev` at least 16 characters and not a placeholder from `.env.example`; startup stops
 otherwise. In every environment the start-up steps refuse a `POSTGRES_PASSWORD` equal to
 `APP_DB_PASSWORD` and a `POSTGRES_USER` equal to `APP_DB_USER`. The start-up service checks
-its settings before it touches the database (`python -m app.config`); the app checks its own
-when it starts.
+every setting of the deployment, its own and the application's, together and as role `all`,
+before it touches the database (`python -m app.config`); each running process checks its own
+again when it starts.
 
 Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
@@ -1237,10 +1359,11 @@ the hashes under which failed identity checks are counted across calls; choose o
 from the audit key. Changing it starts every count again.
 
 `ADMIN_PASSWORD`, when set, needs `ADMIN_USER`, in every environment, and unless `APP_ENV=dev`
-at least 16 characters. In every environment it must differ from every other secret of the
-application's settings: every secret field of `Settings`, found from the class, so a secret
-added later is covered too. A clash is reported by field name only. The owner's
-`POSTGRES_PASSWORD` never reaches the app, so it cannot be compared there: choose another.
+at least 16 characters. In every environment it must differ from every other secret: every
+secret field of the settings, found from the class, so a secret added later is covered too. A
+clash is reported by field name only. No long-running process holds every secret, so the
+comparison that covers them all, the owner's `POSTGRES_PASSWORD` included, is the start-up
+service's.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
@@ -1263,13 +1386,17 @@ docker compose --env-file .env -f deploy/docker-compose.yml up --build
 curl http://127.0.0.1:8000/health
 ```
 
-Four services start: `db`; `startup`, a one-shot run from the app's image that checks its
-settings (`python -m app.config`), then, as the owner, runs `alembic upgrade head`, the role
-set-up (`python -m app.db.roles`) and the seed, and exits; `app`, the server, which starts only
-after `startup` has exited with 0 and connects as the runtime role; and `coturn`. A failure in
-any start-up step ends `startup` with a non-zero code and `app` is not started (`docker
+Five services start: `db`; `startup`, a one-shot run from the app's image that checks every
+setting of the deployment together (`python -m app.config`), then, as the owner, runs `alembic
+upgrade head`, the role set-up (`python -m app.db.roles`) and the seed, and exits; `app`, the
+server of the calls (`APP_ROLE=voice`), which starts only after `startup` has exited with 0 and
+connects as the runtime role; `admin-api`, the admin API (`APP_ROLE=admin`), from the same image,
+started the same way and published on `127.0.0.1:8001`; and `coturn`. A failure in any start-up
+step ends `startup` with a non-zero code and neither `app` nor `admin-api` is started (`docker
 compose up` reports it and exits non-zero). `startup` shows as exited once it is done; that is
-its normal state. The database is not published to the host.
+its normal state. The database is not published to the host. Without `ADMIN_PASSWORD`,
+`admin-api` still starts and answers `/health`, with the admin API off. The service name
+`console` is left for the console itself.
 
 Restarts: `docker compose up -d` after `stop` runs `startup` again before `app`; on a running
 stack it runs `startup` again and recreates `app` only if its configuration
@@ -1285,8 +1412,9 @@ its own variables, as follows.
 | Service   | Variables |
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
-| `startup` | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD` |
-| `app`     | `APP_ENV`, `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD` |
+| `startup` | every variable of `app` and `admin-api` but `APP_ROLE`, and `POSTGRES_USER`, `POSTGRES_PASSWORD`: the whole deployment, checked together, once |
+| `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
+| `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
 coturn checks its three by the
@@ -1301,7 +1429,8 @@ When port 8000 is taken on the host, as on a server whose own dashboard uses it,
 `APP_HOST_PORT` in the shell: `APP_HOST_PORT=8100 docker compose --env-file .env -f
 deploy/docker-compose.yml up --build` publishes the app on `127.0.0.1:8100`. It is a Compose
 variable only, not an application setting, and no container receives it, so it does not go in
-`.env`, whose unknown keys the app refuses.
+`.env`, whose unknown keys the app refuses. `ADMIN_API_HOST_PORT` (default 8001) does the same
+for `admin-api`.
 
 ## Run locally with uv
 

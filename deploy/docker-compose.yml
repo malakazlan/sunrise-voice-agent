@@ -4,8 +4,12 @@ name: sunrise-voice-agent
 #
 # Every value is interpolated from --env-file .env (or the shell), and each container receives
 # only the variables it needs: db its three credentials (the owner); startup, a one-shot run of
-# the start-up steps, the start-up settings (the owner and the runtime role it sets up); app
-# the application's settings, which hold no part of the owner's identity; coturn its own.
+# the start-up steps, every setting of the deployment, which its first step checks together
+# (each secret strong, and the admin password like no other) before the others start; app the
+# voice role's settings, which hold no part of the owner's identity and no admin sign-in;
+# admin-api the admin role's (the database as the runtime role, the audit key, the clock and
+# the calls' longest, the admin's sign-in and the console's origin); coturn its own. The name
+# `console` is the console's own service, which runs elsewhere.
 # Compose refuses to start without the owner's credentials or APP_ENV. The services check the
 # rest themselves and stop when a value they need is missing; an empty value counts as unset,
 # so the app's own defaults apply. CI checks each service's variables against app/config.py.
@@ -14,6 +18,7 @@ name: sunrise-voice-agent
 # (a server's own dashboard, for one). It is Compose's alone, reaches no container and is not an
 # application setting, so set it in the shell, not in .env, whose unknown keys the app refuses:
 #   APP_HOST_PORT=8100 docker compose --env-file .env -f deploy/docker-compose.yml up --build
+# ADMIN_API_HOST_PORT (default 8001) is the admin API's, in the same way.
 x-database-credentials: &database-credentials
   POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
   POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set; pass --env-file .env}
@@ -27,6 +32,32 @@ x-runtime-database: &runtime-database
   APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
   APP_ENV: ${APP_ENV:?APP_ENV is not set; pass --env-file .env}
   LOG_LEVEL: ${LOG_LEVEL:-}
+# What the app and the admin API both hold: the clock, the audit key, and the calls' longest
+# (the admin API's live calls follow it).
+x-clock-and-audit: &clock-and-audit
+  SIMULATED_NOW: ${SIMULATED_NOW:-}
+  AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
+  MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
+# The calls' own: the identity key, the limits, TURN, the access token, the vendors.
+x-voice-settings: &voice-settings
+  IDENTITY_HASH_KEY: ${IDENTITY_HASH_KEY:-}
+  MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
+  TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
+  TURN_HOST: ${TURN_HOST:-}
+  DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+  LLM_MODEL: ${LLM_MODEL:-}
+  ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+  ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+  TTS_MODEL: ${TTS_MODEL:-}
+  VAD_STOP_SECONDS: ${VAD_STOP_SECONDS:-}
+  IDLE_SECONDS: ${IDLE_SECONDS:-}
+# The admin API's own: the admin's sign-in and the console's origin.
+x-admin-settings: &admin-settings
+  ADMIN_USER: ${ADMIN_USER:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  CONSOLE_ORIGIN: ${CONSOLE_ORIGIN:-}
 x-app-image: &app-image
   context: ..
   dockerfile: Dockerfile
@@ -55,9 +86,9 @@ services:
       timeout: 5s
       retries: 30
 
-  # The start-up steps, as the owner, once per start of the stack: check the settings, migrate,
-  # set up the runtime role, seed. It exits when done; a failure in any step ends it with a
-  # non-zero code, and then app does not start.
+  # The start-up steps, as the owner, once per start of the stack: check every setting of the
+  # deployment together, migrate, set up the runtime role, seed. It exits when done; a failure in
+  # any step ends it with a non-zero code, and then neither app nor admin-api starts.
   startup:
     build: *app-image
     command: ["sh", "-c", "python -m app.config && alembic upgrade head && python -m app.db.roles && python -m app.db.seed"]
@@ -65,9 +96,10 @@ services:
     # The image's HEALTHCHECK asks the server, which this container never runs.
     healthcheck:
       disable: true
-    # Exactly the start-up settings' fields (StartupSettings in app/config.py).
+    # Exactly the start-up check's fields (STARTUP_CHECK_FIELDS in app/config.py): every
+    # setting but the role, which the check sets.
     environment:
-      <<: [*database-credentials, *runtime-database]
+      <<: [*database-credentials, *runtime-database, *clock-and-audit, *voice-settings, *admin-settings]
     depends_on:
       db:
         condition: service_healthy
@@ -77,29 +109,32 @@ services:
     # Loopback only: on a server the app is reached through the HTTPS proxy, not this port.
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-8000}:8000"
-    # Exactly the application settings' fields (Settings in app/config.py): the runtime role,
-    # never the owner.
+    # Exactly the voice role's fields (VOICE_FIELDS in app/config.py): the runtime role, never
+    # the owner, and not the admin's sign-in, which only the admin API holds.
     environment:
-      <<: *runtime-database
+      <<: [*runtime-database, *clock-and-audit, *voice-settings]
+      APP_ROLE: voice
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
-      SIMULATED_NOW: ${SIMULATED_NOW:-}
-      AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-}
-      IDENTITY_HASH_KEY: ${IDENTITY_HASH_KEY:-}
-      MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
-      MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
-      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
-      TURN_HOST: ${TURN_HOST:-}
-      DEMO_ACCESS_TOKEN: ${DEMO_ACCESS_TOKEN:-}
-      ADMIN_USER: ${ADMIN_USER:-}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-}
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
-      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
-      TTS_MODEL: ${TTS_MODEL:-}
-      VAD_STOP_SECONDS: ${VAD_STOP_SECONDS:-}
-      IDLE_SECONDS: ${IDLE_SECONDS:-}
+    depends_on:
+      startup:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+
+  # The admin API, from the same image, in a process of its own: no call route, no voice
+  # pipeline, and no key of a vendor, TURN secret, access token or identity key, so it starts
+  # without them. Without ADMIN_PASSWORD it still starts, answers /health, and serves nothing
+  # under /admin. Loopback only, like the app: on a server it is reached through the HTTPS
+  # proxy, on a host of its own beside the console's.
+  admin-api:
+    build: *app-image
+    ports:
+      - "127.0.0.1:${ADMIN_API_HOST_PORT:-8001}:8000"
+    # Exactly the admin role's fields (ADMIN_FIELDS in app/config.py).
+    environment:
+      <<: [*runtime-database, *clock-and-audit, *admin-settings]
+      APP_ROLE: admin
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set; pass --env-file .env}
     depends_on:
       startup:
         condition: service_completed_successfully

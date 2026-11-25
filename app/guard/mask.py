@@ -11,6 +11,7 @@ of any script count as digits; words and separators are matched in ASCII.
 """
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 MAX_LENGTH = 10_000
@@ -543,3 +544,31 @@ def mask_known_digits(text: str, digits: str) -> str:
                     break
         lines.append(_replaced(line, spans))
     return "\n".join(lines)
+
+
+# A word of a name: letters, with an apostrophe inside (O'Brien). Shorter words are not hidden.
+NAME_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
+MIN_NAME_LETTERS = 2
+# What goes between the letters of a name spelled out: S A R A H, j-o-h-n-s-o-n, s.a.r.a.h.
+SPELLED_GAP = r"[\s.,-]+"
+PERSON = "<PERSON>"
+
+
+def hide_names(text: str, names: Iterable[str]) -> str:
+    """The text with each word of the names, of MIN_NAME_LETTERS or more, replaced by PERSON
+    wherever it stands as a whole word, in any case, as it is or spelled out: one compiled
+    alternation, so one pass over the text. Only names the caller knows are hidden; `mask`
+    finds none by itself."""
+    words = {
+        word.lower()
+        for name in names
+        for word in NAME_WORD.findall(name)
+        if len(word) >= MIN_NAME_LETTERS
+    }
+    if not words:
+        return text
+    forms = {re.escape(word) for word in words} | {
+        SPELLED_GAP.join(re.escape(letter) for letter in word if letter != "'") for word in words
+    }
+    alternation = "|".join(sorted(forms, key=len, reverse=True))
+    return re.sub(rf"(?<!\w)(?:{alternation})(?!\w)", PERSON, text, flags=re.IGNORECASE)
