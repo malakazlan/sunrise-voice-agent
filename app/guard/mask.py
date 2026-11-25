@@ -229,7 +229,7 @@ _DIGIT_TOKEN = re.compile(
 )
 _JOINS = re.compile(r"[ \t.-]{0,3}|[ \t]{0,3}dash[ \t]{0,3}", re.IGNORECASE)
 _JOINS_SINGLE_DIGITS = re.compile(r"[ \t-]{0,2},[ \t-]{0,2}")
-# What the output guard reads (`says_digits`, `reads_as_nine_digits`): numerals and number
+# What the output guard reads (`says_digits`, `nine_digit_readings`): numerals and number
 # words without the homophones, so "ten thirty to eleven thirty" is two times. For the caller's
 # last four, tokens also join across commas, brackets, en and em dashes, "and", and um or uh.
 _SPOKEN_TOKEN = re.compile(
@@ -469,11 +469,6 @@ def nine_digit_readings(text: str) -> tuple[str, ...]:
         for group in _groups(run)
         if len(_digits(group)) == 9
     )
-
-
-def reads_as_nine_digits(text: str) -> bool:
-    """Whether the text holds any run `nine_digit_readings` gives."""
-    return bool(nine_digit_readings(text))
 
 
 def _says_in_run(line: str, run: list[_Token], digits: str) -> bool:
