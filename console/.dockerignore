@@ -1,0 +1,14 @@
+# What the image build needs: the app's sources and its lockfile. Never local builds, modules,
+# env files, the fixture layer or the tests.
+node_modules
+.next
+.env*
+mock
+tests
+scripts
+**/*.test.ts
+**/*.test.tsx
+vitest.config.mts
+Dockerfile
+.dockerignore
+README.md

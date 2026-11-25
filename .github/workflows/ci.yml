@@ -75,6 +75,30 @@ jobs:
             | sudo tee -a /etc/hosts
       - run: uv run pytest
 
+  # The admin console (console/): lint, format, the production build, types, then the tests,
+  # some of which read the build's output.
+  console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: console
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.5"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
   gitleaks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -234,6 +258,76 @@ jobs:
           started=$(docker inspect --format '{{.State.StartedAt}}' "$app")
           echo "start-up finished $finished, app started $started"
           test "$(date -d "$started" +%s%N)" -gt "$(date -d "$finished" +%s%N)"
+      - name: The console serves /health and its security headers, and nothing without its setting
+        run: |
+          . .github/ci-wait.sh
+          compose="docker compose --env-file .env -f deploy/docker-compose.yml"
+          # The whole Content-Security-Policy, compared exactly, with the nonce replaced by NONCE.
+          # One nonce per answer, the same in script-src and style-src.
+          policy() {
+            csp=$(grep -i '^content-security-policy: ' "$1" | cut -d' ' -f2- | tr -d '\r')
+            nonces=$(echo "$csp" | grep -o "'nonce-[^']*'" | sort -u | wc -l)
+            test "$nonces" = "1" || { echo "expected one nonce, found $nonces: $csp" >&2; return 1; }
+            echo "$csp" | sed "s/'nonce-[A-Za-z0-9+/=]*'/'nonce-NONCE'/g"
+          }
+          expected_policy() {
+            echo "default-src 'self'; script-src 'self' 'nonce-NONCE' 'strict-dynamic'; style-src 'self' 'nonce-NONCE'; connect-src 'self'$1; img-src 'self' data:; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+          }
+          # Started above without ADMIN_API_ORIGIN: every answer is 503, headers included.
+          wait_for_status 120 http://127.0.0.1:3000/health 503 "the console to refuse without its setting"
+          curl -s -m 10 -D "$RUNNER_TEMP/console-unset" -o /dev/null http://127.0.0.1:3000/login
+          head -n 1 "$RUNNER_TEMP/console-unset"
+          head -n 1 "$RUNNER_TEMP/console-unset" | grep -q ' 503'
+          found=$(policy "$RUNNER_TEMP/console-unset")
+          echo "$found"
+          test "$found" = "$(expected_policy "")"
+          # With its one setting it serves.
+          export ADMIN_API_ORIGIN=http://127.0.0.1:8000
+          bounded 120 "the console to restart with its setting" $compose up -d console
+          wait_for_status 120 http://127.0.0.1:3000/health 200 "the console to answer /health"
+          page=$(curl -s -m 10 http://127.0.0.1:3000/login)
+          asset=$(echo "$page" | grep -o '/_next/static/[^"]*\.js' | head -n 1)
+          test -n "$asset"
+          for path in /health /login "$asset" /no-such-page; do
+            curl -s -m 10 -D "$RUNNER_TEMP/console-headers" -o /dev/null "http://127.0.0.1:3000$path"
+            echo "--- GET $path: $(head -n 1 "$RUNNER_TEMP/console-headers")"
+            header() { grep -i "^$1: " "$RUNNER_TEMP/console-headers" | cut -d' ' -f2- | tr -d '\r'; }
+            found=$(policy "$RUNNER_TEMP/console-headers")
+            echo "$found"
+            test "$found" = "$(expected_policy " http://127.0.0.1:8000")"
+            test "$(header x-content-type-options)" = "nosniff"
+            test "$(header referrer-policy)" = "no-referrer"
+            test "$(header permissions-policy)" = "camera=(), microphone=(), geolocation=()"
+            if grep -qi '^x-powered-by:' "$RUNNER_TEMP/console-headers"; then
+              echo "x-powered-by is set"
+              exit 1
+            fi
+          done
+          # A new nonce on every request.
+          first=$(curl -s -m 10 -D - -o /dev/null http://127.0.0.1:3000/login | grep -io "'nonce-[^']*'" | head -n 1)
+          second=$(curl -s -m 10 -D - -o /dev/null http://127.0.0.1:3000/login | grep -io "'nonce-[^']*'" | head -n 1)
+          test -n "$first"
+          test "$first" != "$second"
+          uid=$(bounded 30 "id -u in the console container" $compose exec -T console id -u)
+          echo "console uid: $uid"
+          test "$uid" != "0"
+          console=$($compose ps -q console)
+          health=none
+          for _ in $(seq 1 30); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' "$console")
+            [ "$health" = "healthy" ] && break
+            sleep 1
+          done
+          echo "console HEALTHCHECK -> $health"
+          test "$health" = "healthy"
+          # Exactly its one setting, less what the image sets itself.
+          image=$(docker inspect --format '{{.Config.Image}}' "$console")
+          docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image" \
+            | cut -d= -f1 | sed '/^$/d' | sort -u > "$RUNNER_TEMP/console-image-env"
+          received=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$console" \
+            | cut -d= -f1 | sed '/^$/d' | sort -u | comm -23 - "$RUNNER_TEMP/console-image-env" | tr '\n' ' ')
+          echo "console environment names: $received"
+          test "$received" = "ADMIN_API_ORIGIN "
       - name: The app connects as the runtime role the start-up set up
         run: |
           set -o pipefail

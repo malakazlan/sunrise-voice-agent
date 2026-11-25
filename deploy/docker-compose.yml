@@ -161,5 +161,18 @@ services:
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
       MAX_CONCURRENT_CALLS: ${MAX_CONCURRENT_CALLS:-}
 
+  # The admin console (console/): a Next.js app served at its own origin. It holds no secret and
+  # talks only to the admin API, whose exact origin is its one setting; without a valid one it
+  # answers 503 to everything. It depends on nothing and nothing depends on it. ADMIN_API_ORIGIN is
+  # no application setting and CONSOLE_HOST_PORT (default 3000) is Compose's alone, like
+  # APP_HOST_PORT: set both in the shell, not in .env, whose unknown keys the app refuses.
+  console:
+    build:
+      context: ../console
+    ports:
+      - "127.0.0.1:${CONSOLE_HOST_PORT:-3000}:3000"
+    environment:
+      ADMIN_API_ORIGIN: ${ADMIN_API_ORIGIN:-}
+
 volumes:
   db-data:

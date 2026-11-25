@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 import pytest
+import yaml  # type: ignore[import-untyped]  # PyYAML ships no type information
 from conftest import OFFLINE_DB_ENV, VOICE_SECRETS
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
@@ -243,7 +244,10 @@ def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
     published = admin[admin.index("ports:") + 1 :]
     entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
     assert entries == ['- "127.0.0.1:${ADMIN_API_HOST_PORT:-8001}:8000"']
-    assert "  console:" not in COMPOSE.read_text(encoding="utf-8").splitlines()
+    # The service named console is the Next.js app (console/), never the API's image.
+    console = compose_service("console")
+    assert "context: ../console" in console
+    assert not any("app-image" in line for line in console)
 
 
 def compose_service_lines(name: str) -> list[str]:
@@ -430,6 +434,22 @@ def test_ci_checks_each_service_against_its_role() -> None:
     assert "model_fields" not in workflow
     assert "configured console" not in workflow
     assert '("console",' not in workflow
+
+
+def test_the_console_gets_only_the_admin_api_origin() -> None:
+    # The admin console (console/) holds no secret: its one setting is the admin API's origin, and
+    # neither that nor its host port reaches any other service.
+    assert compose_environment("console") == {"ADMIN_API_ORIGIN"}
+    console = compose_service("console")
+    assert console[console.index("ports:") + 1] == '- "127.0.0.1:${CONSOLE_HOST_PORT:-3000}:3000"'
+    assert not any(line.startswith(("depends_on", "env_file")) for line in console)
+    for service in ("db", "startup", "app", "coturn"):
+        assert not {"ADMIN_API_ORIGIN", "CONSOLE_HOST_PORT"} & compose_environment(service), service
+    # Nothing depends on it, in either form Compose takes depends_on (a list or a mapping).
+    services = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    assert "console" in services
+    for service, definition in services.items():
+        assert "console" not in (definition.get("depends_on") or []), service
 
 
 @pytest.mark.usefixtures("offline_env")
