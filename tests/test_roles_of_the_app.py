@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app import server
 from app.config import Settings, StartupSettings
 from app.main import create_app
+from app.runtime_config import ConfigPoll
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_PATHS = [
@@ -29,6 +30,9 @@ ADMIN_PATHS = [
     "/admin/api/queue",
     "/admin/api/audit/verify",
     "/admin/api/calls/live/stream",
+    "/admin/api/config",
+    "/admin/api/queue/requests/1/handled",
+    "/admin/api/queue/requests/1/callback",
 ]
 CALL_PATHS = ["/", "/ice-servers"]
 ADMIN_HEADERS = {
@@ -121,6 +125,7 @@ def test_voice_role_serves_no_admin(database: StartupSettings) -> None:
         with client_from(app) as client:
             for path in ADMIN_PATHS:
                 assert client.get(path, headers=SIGNED_IN).status_code == 404, path
+                assert client.post(path, json={}, headers=SIGNED_IN).status_code == 404, path
             assert client.get("/health").status_code == 200
             assert client.get("/").status_code == 200
 
@@ -158,6 +163,33 @@ def test_admin_role_without_admin_password_is_off(
                     assert response.headers.get(header) == value, (path, header)
     messages = [record.getMessage() for record in caplog.records]
     assert messages.count("admin_off_no_password") == 1
+
+
+def test_only_the_calls_poll_the_config(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The admin process starts no poll of the config; the voice and the all roles start one
+    # each, when they start.
+    started: list[str] = []
+
+    async def start(poll: ConfigPoll) -> None:
+        started.append(type(poll).__name__)
+
+    monkeypatch.setattr(ConfigPoll, "start", start)
+    apps = {
+        "admin": server.create_app(admin_role(database)),
+        "voice": server.create_app(
+            admin_settings(database, app_role="voice", admin_user=None, admin_password=None)
+        ),
+        "all": server.create_app(admin_settings(database)),
+    }
+    polls = {}
+    for role, app in apps.items():
+        started.clear()
+        with client_from(app) as client:
+            assert client.get("/health").status_code == 200
+        polls[role] = len(started)
+    assert polls == {"admin": 0, "voice": 1, "all": 1}
 
 
 def test_all_role_serves_both(database: StartupSettings) -> None:

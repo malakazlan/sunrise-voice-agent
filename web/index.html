@@ -61,6 +61,20 @@
       return `${what} failed (HTTP ${response.status})`;
     };
 
+    // What the caller is told when the clinic has switched the assistant off.
+    const UNAVAILABLE = "The clinic's phone assistant is unavailable right now. Please call the front desk. If this is an emergency, call 911.";
+
+    // Whether the offer was refused because the assistant is off: a 503 whose body says so.
+    const switchedOff = async (response) => {
+      if (response.status !== 503) return false;
+      try {
+        const body = await response.json();
+        return body !== null && body.reason === "unavailable";
+      } catch {
+        return false;
+      }
+    };
+
     // The offer is sent once candidate gathering is complete (no trickle ICE).
     const gatheringComplete = (connection, limitMs) => new Promise((resolve) => {
       if (connection.iceGatheringState === "complete") return resolve();
@@ -222,6 +236,11 @@
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
         });
+        if (await switchedOff(response)) {
+          hangUp();
+          show("state", UNAVAILABLE);
+          return;
+        }
         if (!response.ok) throw new Error(refusal(response, "Call"));
         const answer = await response.json();
         await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });

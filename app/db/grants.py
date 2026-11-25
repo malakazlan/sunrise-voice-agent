@@ -16,7 +16,9 @@ SequencePrivilege = Literal["USAGE"]
 
 SCHEMA = "public"
 
-# New patients and appointments are added, never changed: no table is updated as a whole.
+# New patients and appointments are added, never changed: no table is updated as a whole. The
+# admin's marks of handled requests and changes of config are added the same way: a mark is
+# never taken back, and a key's value is its newest change.
 TABLE_PRIVILEGES: dict[str, frozenset[TablePrivilege]] = {
     "patients": frozenset({"SELECT", "INSERT"}),
     "medications": frozenset({"SELECT"}),
@@ -28,6 +30,8 @@ TABLE_PRIVILEGES: dict[str, frozenset[TablePrivilege]] = {
     "messages": frozenset({"SELECT", "INSERT"}),
     "call_sessions": frozenset({"SELECT", "INSERT"}),
     "call_turns": frozenset({"SELECT", "INSERT"}),
+    "handled_marks": frozenset({"SELECT", "INSERT"}),
+    "config_changes": frozenset({"SELECT", "INSERT"}),
     "alembic_version": frozenset(),
 }
 
@@ -38,8 +42,8 @@ COLUMN_PRIVILEGES: dict[tuple[str, str], frozenset[ColumnPrivilege]] = {
 }
 
 # Only the sequences the inserts above draw numbers from: appointment, verification attempt,
-# request, message, call session and call turn ids. Patients have text ids and the audit log
-# numbers its own events.
+# request, message, call session, call turn, handled mark and config change ids. Patients have
+# text ids and the audit log numbers its own events.
 SEQUENCE_PRIVILEGES: dict[str, frozenset[SequencePrivilege]] = {
     "appointments_id_seq": frozenset({"USAGE"}),
     "verification_attempts_id_seq": frozenset({"USAGE"}),
@@ -49,6 +53,8 @@ SEQUENCE_PRIVILEGES: dict[str, frozenset[SequencePrivilege]] = {
     "messages_id_seq": frozenset({"USAGE"}),
     "call_sessions_id_seq": frozenset({"USAGE"}),
     "call_turns_id_seq": frozenset({"USAGE"}),
+    "handled_marks_id_seq": frozenset({"USAGE"}),
+    "config_changes_id_seq": frozenset({"USAGE"}),
 }
 
 # By SQL signature: every function in the schema, and the catalog's functions that create a

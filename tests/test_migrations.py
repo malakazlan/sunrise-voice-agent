@@ -25,6 +25,8 @@ TABLES = {
     "messages",
     "call_sessions",
     "call_turns",
+    "handled_marks",
+    "config_changes",
 }
 
 Alembic = Callable[..., subprocess.CompletedProcess[str]]
@@ -143,7 +145,7 @@ def test_migration_matches_models(
         engine.dispose()
 
     migrated_constraints = constraint_definitions(migrated)
-    assert len(migrated_constraints) == 59
+    assert len(migrated_constraints) == 67
     assert migrated_constraints == constraint_definitions(from_models)
     assert (
         "audit_events",
@@ -238,6 +240,35 @@ def test_migration_matches_models(
         ("call_turns", "ck_call_turns_dropped_before", "CHECK ((dropped_before >= 0))"),
     } <= migrated_constraints
 
+    # A queue row is marked handled once, by an admin, and only a row of a known source; a
+    # config change holds a known key with one of its values, made by an admin.
+    assert {
+        ("handled_marks", "uq_handled_marks_source_row_id", "UNIQUE (source, row_id)"),
+        (
+            "handled_marks",
+            "ck_handled_marks_source",
+            "CHECK ((source = 'requests'::text))",
+        ),
+        ("handled_marks", "ck_handled_marks_row_id", "CHECK ((row_id >= 1))"),
+        (
+            "handled_marks",
+            "ck_handled_marks_marked_by",
+            "CHECK ((marked_by ~ '^[A-Za-z][A-Za-z_]{0,31}$'::text))",
+        ),
+        (
+            "config_changes",
+            "ck_config_changes_setting",
+            "CHECK ((((key = 'calls'::text) AND (value = ANY (ARRAY['on'::text, 'off'::text])))"
+            " OR ((key = 'office'::text) AND (value = ANY (ARRAY['schedule'::text,"
+            " 'open'::text, 'closed'::text])))))",
+        ),
+        (
+            "config_changes",
+            "ck_config_changes_changed_by",
+            "CHECK ((changed_by ~ '^[A-Za-z][A-Za-z_]{0,31}$'::text))",
+        ),
+    } <= migrated_constraints
+
     # The indexes the console's reads use: the audit log by action and time, the attempts and
     # the turns by time.
     assert definitions(migrated, CONSOLE_INDEXES) == {
@@ -256,7 +287,7 @@ def test_migration_matches_models(
     assert definitions(from_models, CONSOLE_INDEXES) == definitions(migrated, CONSOLE_INDEXES)
 
     migrated_columns = column_definitions(migrated)
-    assert len(migrated_columns) == 95
+    assert len(migrated_columns) == 105
     assert (
         "messages",
         "after_hours",

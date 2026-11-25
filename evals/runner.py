@@ -68,6 +68,7 @@ from app.guard.input import Flag, guard_input
 from app.guard.logging import configure_logging
 from app.guard.mask import spoken_digits
 from app.guard.output import OutputRule
+from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 from evals.database import EvalServer, eval_server, eval_settings
 from evals.scenario import (
@@ -467,6 +468,7 @@ async def run_scenario(
             audit=AuditLog(SecretStr(secrets.token_urlsafe(32))),
             now=lambda: scenario.now,
             claim_keys=ClaimKeys(SecretStr(secrets.token_urlsafe(32))),
+            config=taking_calls(),
         )
         call_id = CallRegistry(max_calls=1, max_seconds=CALL_SECONDS).reserve()
         if call_id is None:

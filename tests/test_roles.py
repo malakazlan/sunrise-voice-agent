@@ -60,13 +60,16 @@ EXPECTED_TABLES = {
     "messages": {"SELECT", "INSERT"},
     "call_sessions": {"SELECT", "INSERT"},
     "call_turns": {"SELECT", "INSERT"},
+    # The admin's marks and config changes are added, never changed or removed.
+    "handled_marks": {"SELECT", "INSERT"},
+    "config_changes": {"SELECT", "INSERT"},
     "alembic_version": set(),
 }
 # Beyond its table's privileges, a column's own: booking takes a slot by changing this one.
 EXPECTED_COLUMNS = {("available_slots", "is_available"): {"UPDATE"}}
-# Only the appointments, verification attempts, requests, messages, call sessions and call turns
-# inserts take a number from a sequence; patients have text ids and audit_events numbers its own
-# rows.
+# Only the appointments, verification attempts, requests, messages, call sessions, call turns,
+# handled marks and config changes inserts take a number from a sequence; patients have text ids
+# and audit_events numbers its own rows.
 EXPECTED_SEQUENCES = {
     "appointments_id_seq": {"USAGE"},
     "verification_attempts_id_seq": {"USAGE"},
@@ -76,6 +79,8 @@ EXPECTED_SEQUENCES = {
     "messages_id_seq": {"USAGE"},
     "call_sessions_id_seq": {"USAGE"},
     "call_turns_id_seq": {"USAGE"},
+    "handled_marks_id_seq": {"USAGE"},
+    "config_changes_id_seq": {"USAGE"},
 }
 # The trigger functions of audit_events run as triggers whoever may call them; nobody needs
 # EXECUTE, which Postgres gives everyone by default. Nor the catalog's large-object creators:
@@ -442,6 +447,8 @@ FIRST_COLUMN = {
     "messages": "name",
     "call_sessions": "patient_id",
     "call_turns": "patient_id",
+    "handled_marks": "marked_by",
+    "config_changes": "value",
     "alembic_version": "version_num",
 }
 

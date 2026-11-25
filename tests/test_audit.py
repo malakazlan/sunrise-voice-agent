@@ -1392,6 +1392,11 @@ def test_only_registry_members_are_accepted() -> None:
         "admin_read_slots",
         "admin_read_guardrails",
         "admin_read_metrics",
+        "admin_marked_handled",
+        "admin_revealed_callback",
+        "admin_read_config",
+        "admin_changed_config",
+        "call_refused",
         "refill_previewed",
         "refill_not_found",
         "doctor_message_previewed",
@@ -1422,8 +1427,15 @@ def test_only_registry_members_are_accepted() -> None:
         "message",
         "audit_event",
         "session",
+        "config",
     }
-    assert {member.value for member in Outcome} == {"success", "failure", "refused"}
+    assert {member.value for member in Outcome} == {
+        "success",
+        "failure",
+        "refused",
+        "already",
+        "unchanged",
+    }
     assert {member.value for member in Reason} == {
         "caller_hung_up",
         "completed",
@@ -1444,6 +1456,13 @@ def test_only_registry_members_are_accepted() -> None:
         "phi_outside_gate",
         "medical_advice",
         "refill_promise",
+        # A config change, and why a call is refused.
+        "calls_on",
+        "calls_off",
+        "office_schedule",
+        "office_open",
+        "office_closed",
+        "config_unknown",
     }
     for registry in (Action, ResourceType, Outcome, Reason):
         for member in registry:

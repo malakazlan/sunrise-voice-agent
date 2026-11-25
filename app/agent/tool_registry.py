@@ -72,6 +72,7 @@ from app.agent.state import (
 from app.audit.log import AGENT, TOOL_NAME, Action, AuditLog, Event, Outcome, Reason, ResourceType
 from app.domain.clinic import CLINIC_TZ
 from app.guard.text import plain_text
+from app.runtime_config import LiveConfig
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,11 @@ RESERVED_ACTIONS = frozenset(
         Action.ADMIN_SIGNED_OUT,
         Action.ADMIN_READ_CALL_DETAIL,
         Action.ADMIN_READ_QUEUE,
+        Action.ADMIN_MARKED_HANDLED,
+        Action.ADMIN_REVEALED_CALLBACK,
+        Action.ADMIN_READ_CONFIG,
+        Action.ADMIN_CHANGED_CONFIG,
+        Action.CALL_REFUSED,
     }
 )
 
@@ -311,12 +317,15 @@ class DeclarationError(ValueError):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Deps:
     """What dispatch needs to run a tool: sessions as the runtime role, the audit log, the
-    clock (aware datetimes) and the hasher of identity claims."""
+    clock (aware datetimes) and the hasher of identity claims; and the config in memory, which
+    the start of a call reads (app/runtime_config.py). Every field must be given, the config
+    too, so no call runs on a config nobody reads."""
 
     sessions: async_sessionmaker[AsyncSession]
     audit: AuditLog
     now: Callable[[], datetime]
     claim_keys: ClaimKeys
+    config: LiveConfig
 
 
 def _key(name: str) -> str:

@@ -579,8 +579,8 @@ async def test_shutdown_does_not_outlast_its_limit(
 ) -> None:
     # The app's database stalls: shutdown waits for the turn rows at most its limit (5 s; 1 s
     # here, to keep the test short).
-    assert main_module.TURN_ROWS_WAIT_SECONDS == 5
-    monkeypatch.setattr(main_module, "TURN_ROWS_WAIT_SECONDS", 1)
+    assert main_module.QUEUES_WAIT_SECONDS == 5
+    monkeypatch.setattr(main_module, "QUEUES_WAIT_SECONDS", 1)
     app = create_app(offline_settings(postgres_host="127.0.0.1", postgres_port=silent_server))
     async with app.router.lifespan_context(app):
         recorder: TurnRecorder = app.state.turns
