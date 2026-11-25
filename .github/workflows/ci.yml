@@ -172,7 +172,7 @@ jobs:
             POSTGRES_PASSWORD=ci-compose-only-password-0001 \
             APP_DB_USER=sunrise_app APP_DB_PASSWORD=ci-compose-only-app-password-0001 \
             TURN_HOST=127.0.0.1 TURN_SHARED_SECRET=ci-compose-only-turn-secret-00000001 \
-            DEMO_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
+            CALL_ACCESS_TOKEN=ci-compose-only-access-token-000000001 MAX_CONCURRENT_CALLS=3 \
             AUDIT_HMAC_KEY=ci-compose-only-audit-key-000000000001 \
             IDENTITY_HASH_KEY=ci-compose-only-identity-hash-key-0000001 \
             ANTHROPIC_API_KEY=ci-compose-only-fake-anthropic-key-0001 \
@@ -633,7 +633,7 @@ jobs:
           diff "$RUNNER_TEMP/coturn-settings" "$RUNNER_TEMP/relay-settings" || true
           diff <(grep -v '^realm=' "$RUNNER_TEMP/coturn-settings") \
             <(grep -v '^realm=' "$RUNNER_TEMP/relay-settings")
-          token=$(sed -n 's/^DEMO_ACCESS_TOKEN=//p' .env)
+          token=$(sed -n 's/^CALL_ACCESS_TOKEN=//p' .env)
           # The probe bounds each of its own steps; this bounds each probe run as a whole.
           probe() {
             name=$1
@@ -683,7 +683,7 @@ jobs:
           echo "exit code: $code"
           test "$code" = "1"
           for name in postgres_host postgres_db app_db_user app_db_password audit_hmac_key \
-            identity_hash_key turn_shared_secret turn_host demo_access_token anthropic_api_key \
+            identity_hash_key turn_shared_secret turn_host call_access_token anthropic_api_key \
             deepgram_api_key elevenlabs_api_key elevenlabs_voice_id; do
             echo "$output" | grep -q "$name"
           done

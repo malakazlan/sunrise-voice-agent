@@ -91,7 +91,7 @@ def test_roles_are_settings() -> None:
     voice_secrets = {
         "identity_hash_key": "-".join(["identity", "key", "of", "the", "role", "test", "y" * 8]),
         "turn_shared_secret": VOICE_SECRETS["TURN_SHARED_SECRET"],
-        "demo_access_token": VOICE_SECRETS["DEMO_ACCESS_TOKEN"],
+        "call_access_token": VOICE_SECRETS["CALL_ACCESS_TOKEN"],
         "anthropic_api_key": VOICE_SECRETS["ANTHROPIC_API_KEY"],
         "deepgram_api_key": VOICE_SECRETS["DEEPGRAM_API_KEY"],
         "elevenlabs_api_key": VOICE_SECRETS["ELEVENLABS_API_KEY"],

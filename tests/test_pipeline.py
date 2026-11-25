@@ -467,7 +467,7 @@ def no_speech_out(_settings: Settings) -> FrameProcessor:
 
 DEV_WITHOUT_VOICE: dict[str, Any] = {
     "app_env": "dev",
-    "demo_access_token": None,
+    "call_access_token": None,
     "turn_host": None,
     "turn_shared_secret": None,
 }

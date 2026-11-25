@@ -12,7 +12,7 @@ from app.voice.transport import server_ice_servers
 from app.voice.turn import TurnCredential, browser_ice_servers, derive_credential, issue_credential
 
 FAKE_SECRET = "-".join(["fake", "turn", "shared", "secret", "for", "unit", "tests"])
-TOKEN = VOICE_SECRETS["DEMO_ACCESS_TOKEN"]
+TOKEN = VOICE_SECRETS["CALL_ACCESS_TOKEN"]
 
 # A fixed credential id, given to the code in place of its random one.
 CREDENTIAL_ID = "a1b2c3d4e5f60718"
@@ -120,7 +120,7 @@ def test_browser_ice_servers_point_at_turn_host() -> None:
 
 def test_no_ice_servers_without_turn() -> None:
     settings = offline_settings(
-        app_env="dev", demo_access_token=None, turn_host=None, turn_shared_secret=None
+        app_env="dev", call_access_token=None, turn_host=None, turn_shared_secret=None
     )
 
     assert browser_ice_servers(settings, now=1700000000) == []

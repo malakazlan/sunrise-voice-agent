@@ -254,7 +254,7 @@ over the data channel.
 - `GET /ice-servers` returns the ICE server list with short-lived TURN credentials (coturn's
   shared-secret scheme; they expire `MAX_CALL_SECONDS` plus 60 seconds after they are issued).
 - `POST /offer` takes an SDP offer (a JSON body of at most 32 KiB) and returns the answer.
-- Both need `Authorization: Bearer <DEMO_ACCESS_TOKEN>`. The token is checked before any of
+- Both need `Authorization: Bearer <CALL_ACCESS_TOKEN>`. The token is checked before any of
   the body is read. When no token is configured (only allowed in dev without TURN) the two
   endpoints are open.
 - At most `MAX_CONCURRENT_CALLS` calls at once (more get 503). How a call ends is in "Voice
@@ -1068,7 +1068,7 @@ Roles: `APP_ROLE` picks what a process serves, from the same image and command
 |---|---|
 | `all` (default) | the calls, and the admin API when `ADMIN_PASSWORD` is set: for development and tests |
 | `voice` | the calls only: no admin route, and no admin sign-in may be set |
-| `admin` | the admin API and `/health` only. No call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN` and the vendors' keys, and starts without them. Without `ADMIN_PASSWORD` it still starts, answers `/health`, answers `404` to everything under `/admin`, and logs `admin_off_no_password` once |
+| `admin` | the admin API and `/health` only. No call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `CALL_ACCESS_TOKEN` and the vendors' keys, and starts without them. Without `ADMIN_PASSWORD` it still starts, answers `/health`, answers `404` to everything under `/admin`, and logs `admin_off_no_password` once |
 
 In Compose `app` runs `voice` and `admin-api` runs `admin`, each with only its own variables
 (Run with Docker). Each long-running service holds only some of the secrets, so the one-shot
@@ -1394,7 +1394,7 @@ uv run python -m evals --model real --runs 3    # the real model, by hand, with 
 | `MAX_CALL_SECONDS`  | 1 to 3600                           | `600`          |
 | `TURN_HOST`         | host name, no scheme or port        | required unless dev |
 | `TURN_SHARED_SECRET`| 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
-| `DEMO_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
+| `CALL_ACCESS_TOKEN` | at least 32 characters, never logged | required unless dev |
 | `ADMIN_USER`        | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
 | `ADMIN_PASSWORD`    | admin API password, never logged    | empty (admin API off); refused by the voice role |
 | `CONSOLE_ORIGIN`    | one origin: `https://host[:port]` (`http` in dev only), no path or wildcard | empty (no other origin answered) |
@@ -1420,7 +1420,7 @@ every setting of the deployment, its own and the application's, together and as 
 before it touches the database (`python -m app.config`); each running process checks its own
 again when it starts.
 
-Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `DEMO_ACCESS_TOKEN`,
+Unless `APP_ENV=dev`, every secret (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `CALL_ACCESS_TOKEN`,
 `TURN_SHARED_SECRET`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `ANTHROPIC_API_KEY`,
 `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ADMIN_PASSWORD`) must also not start or end with whitespace and must
 contain at least 10 different characters, on top of its own rules. coturn's entrypoint
@@ -1444,7 +1444,7 @@ comparison that covers them all, the owner's `POSTGRES_PASSWORD` included, is th
 service's.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
-`DEMO_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
+`CALL_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the
 token. Generate the two secrets with `openssl rand -hex 32`.
 
 `SIMULATED_NOW` fixes the clinic clock for dev and demo, for example to show the office
@@ -1491,7 +1491,7 @@ its own variables, as follows.
 |-----------|-----------|
 | `db`      | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
 | `startup` | every variable of `app` and `admin-api` but `APP_ROLE`, and `POSTGRES_USER`, `POSTGRES_PASSWORD`: the whole deployment, checked together, once |
-| `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `DEMO_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
+| `app`     | `APP_ENV`, `APP_ROLE` (`voice`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `IDENTITY_HASH_KEY`, `SIMULATED_NOW`, `MAX_CONCURRENT_CALLS`, `MAX_CALL_SECONDS`, `TURN_HOST`, `TURN_SHARED_SECRET`, `CALL_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `LLM_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `TTS_MODEL`, `VAD_STOP_SECONDS`, `IDLE_SECONDS` |
 | `admin-api` | `APP_ENV`, `APP_ROLE` (`admin`), `LOG_LEVEL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `APP_DB_USER`, `APP_DB_PASSWORD`, `AUDIT_HMAC_KEY`, `SIMULATED_NOW`, `MAX_CALL_SECONDS`, `MAX_CONCURRENT_CALLS`, `LLM_MODEL`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CONSOLE_ORIGIN`, and uvicorn's `FORWARDED_ALLOW_IPS` |
 | `coturn`  | `TURN_HOST`, `TURN_SHARED_SECRET`, `MAX_CONCURRENT_CALLS` |
 
