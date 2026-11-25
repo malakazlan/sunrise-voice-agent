@@ -1,33 +1,45 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 
-import { filesUsing } from "./source-files";
+import { filesUsing, namesUsed, shippedSources } from "./source-files";
 
-// Only the fetch wrapper talks to the network, and only the stream client opens a stream.
-const FETCH = /\bfetch\s*\(|\b(?:globalThis|window|self)\s*\.\s*fetch\b/;
-const EVENT_SOURCE = /\bEventSource\b/;
-const OTHER_NETWORK = /\bXMLHttpRequest\b|\bWebSocket\b|\bsendBeacon\b|\bimportScripts\b/;
+// Only the fetch wrapper talks to the network, and only the stream client opens a stream. Each
+// allowed file is named; any other file that so much as names `fetch` or `EventSource` fails.
+const ALLOWED: Record<string, string[]> = {
+  fetch: ["lib/api/client.ts"],
+  EventSource: ["lib/api/stream.ts"],
+  XMLHttpRequest: [],
+  WebSocket: [],
+  sendBeacon: [],
+  importScripts: [],
+};
 
 describe("network access", () => {
-  it("the patterns see what they are looking for", () => {
-    const sources = (code: string) => new Map([["sample.ts", code]]);
-    for (const code of ["await fetch(url)", "await globalThis.fetch(url)", "const call = window.fetch"]) {
-      expect(filesUsing(FETCH, sources(code)), code).toEqual(["sample.ts"]);
+  it("the scan sees a use however it is written", () => {
+    for (const code of [
+      "await fetch(url)",
+      "const get = fetch;\nget(url)",
+      "const { fetch: get } = globalThis",
+      'window["fetch"](url)',
+      "export default async () => (await globalThis.fetch(url)).json()",
+    ]) {
+      expect(namesUsed(code).has("fetch"), code).toBe(true);
     }
-    expect(filesUsing(FETCH, sources("// fetch(url) in a comment\nconst x = 1"))).toEqual([]);
-    expect(filesUsing(EVENT_SOURCE, sources("new EventSource(url)"))).toEqual(["sample.ts"]);
-    expect(filesUsing(OTHER_NETWORK, sources("navigator.sendBeacon(url)"))).toEqual(["sample.ts"]);
+    expect(namesUsed("const Source = EventSource;\nnew Source(url)").has("EventSource")).toBe(true);
+    expect(namesUsed("// fetch(url) in a comment\nconst x = 1").has("fetch")).toBe(false);
+    expect(namesUsed("export const P = () => <p>fetch the console</p>").has("fetch")).toBe(false);
   });
 
-  it("fetch is called only by the fetch wrapper", () => {
-    expect(filesUsing(FETCH)).toEqual(["lib/api/client.ts"]);
+  it("the scan reads every kind of code file in every folder that ships", () => {
+    const files = [...shippedSources().keys()];
+    expect(files).toEqual(expect.arrayContaining(["proxy.ts", "next.config.ts", "eslint.config.mjs"]));
+    expect(files.some((file) => /^(?:node_modules|\.next|mock|tests|scripts)\//.test(file))).toBe(false);
+    expect(files.some((file) => /\.test\./.test(file))).toBe(false);
   });
 
-  it("EventSource is used only by the stream client", () => {
-    expect(filesUsing(EVENT_SOURCE)).toEqual(["lib/api/stream.ts"]);
-  });
-
-  it("no other way to reach the network is used", () => {
-    expect(filesUsing(OTHER_NETWORK)).toEqual([]);
-  });
+  for (const [name, allowed] of Object.entries(ALLOWED)) {
+    it(`${name} is named only in ${allowed.length === 0 ? "no file" : allowed.join(", ")}`, () => {
+      expect(filesUsing(name)).toEqual(allowed);
+    });
+  }
 });

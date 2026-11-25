@@ -8,6 +8,10 @@ import { ROOT, walkFiles } from "./source-files";
 export const NEXT = join(ROOT, ".next");
 // The build's caches and records of how it ran are not served or shipped.
 const NOT_SHIPPED = ["cache", "trace", "trace-build", "diagnostics", "types", "dev"];
+// The standalone server's copies of installed packages (31 MB of third-party code, and most of
+// the read): the console's own code, the fixture layer included if it ever leaked, is traced
+// into .next/server and .next/standalone/.next, never into these.
+const PACKAGE_COPIES = "standalone/node_modules/";
 
 export function builtFiles(under = ""): Map<string, string> {
   const directory = join(NEXT, under);
@@ -15,8 +19,8 @@ export function builtFiles(under = ""): Map<string, string> {
     throw new Error("no build output: run `npm run build` before these tests");
   }
   const files = walkFiles(directory).filter((path) => {
-    const top = relative(NEXT, path).split(sep)[0];
-    return !NOT_SHIPPED.includes(top);
+    const name = relative(NEXT, path).split(sep).join("/");
+    return !NOT_SHIPPED.includes(name.split("/")[0]) && !name.startsWith(PACKAGE_COPIES);
   });
   return new Map(
     files.map((path) => [relative(NEXT, path).split(sep).join("/"), readFileSync(path, "latin1")]),
