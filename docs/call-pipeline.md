@@ -59,7 +59,10 @@ over the data channel.
   caller's turns one after another and says how many of ten it has; where the input guard
   hides digits from the model (a caller who is not verified) the note gives the count
   alone until the pieces make a whole number. A date and an SSN are never a piece. An open
-  office before verification gets no note: a run of digits there may be the last four.
+  office before verification gets no note: a run of digits there may be the last four,
+  and what the mask leaves of a number is not digits the caller gave. A piece is three
+  digits or more, or fewer said alone while a number is being given: "the first one"
+  and a time of day ("9:30 AM") are no piece.
   The stored transcript keeps the caller's words without the notes. The model's part is
   the talking: say what it has so far, ask for the rest, read the whole number back.
 - Vocabulary hints (`app/voice/vocabulary.py`): Nova-3's keyterm prompting, one `keyterm`
@@ -79,7 +82,11 @@ over the data channel.
   one model turn with the guard's text. Turns run one at a time.
 - A model turn sends the system prompt (`app/agent/prompts.py`: fixed text, no patient data,
   written for speech), the conversation so far and the tools `tools_for` allows right now,
-  each with its argument model's JSON schema and a fixed description. Every tool call goes
+  each with its argument model's JSON schema and a fixed description. The request allows
+  one tool call in a reply (`disable_parallel_tool_use`): with more, the real model asked
+  for the same tool twice in one breath, and a call a reply repeats is answered as the
+  first was. After code has checked the last four digits, which the model never sees, the
+  model is given a fixed note that they were checked and whether the caller is verified. Every tool call goes
   through `call_tool` ([tools](tools.md): a report of an emergency first, then `dispatch` and the
   automatic hand-off), and its outcome goes back to the model, unless it carries a scripted
   line: that line, with its values, is the reply, word for word, the model is told it was

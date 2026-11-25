@@ -300,7 +300,8 @@ async def _add_request(
 async def start_new_patient(
     session: AsyncSession, state: CallState, arguments: NoArguments, context: HandlerContext
 ) -> ToolResult:
-    return ToolResult(transition=Move(to=Phase.BOOKING))
+    # The model is told plainly that it worked: with nothing returned it has asked again.
+    return ToolResult(data={"status": "started"}, transition=Move(to=Phase.BOOKING))
 
 
 async def collect_new_patient(

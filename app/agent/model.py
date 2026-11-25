@@ -11,13 +11,14 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, omit
 from anthropic.types import (
     ContentBlock,
     Message,
     MessageParam,
     OutputConfigParam,
     ThinkingConfigParam,
+    ToolChoiceAutoParam,
     ToolParam,
 )
 from httpx2 import AsyncClient
@@ -32,6 +33,10 @@ MAX_TOKENS = 300
 THINKING: ThinkingConfigParam = {"type": "disabled"}
 # The lowest effort level, for the least time to the first word.
 OUTPUT_CONFIG: OutputConfigParam = {"effort": "low"}
+# One tool call in a reply. With more allowed the model has asked for the same tool twice in one
+# breath, and for a second it had no reason for (a transfer beside the start of a booking); each
+# tool's result is then read before the next is asked for.
+TOOL_CHOICE: ToolChoiceAutoParam = {"type": "auto", "disable_parallel_tool_use": True}
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +117,7 @@ class AnthropicModel:
             system=request.system,
             messages=cast("list[MessageParam]", request.messages),
             tools=cast("list[ToolParam]", request.tools),
+            tool_choice=TOOL_CHOICE if request.tools else omit,
             thinking=THINKING,
             output_config=OUTPUT_CONFIG,
         ) as stream:

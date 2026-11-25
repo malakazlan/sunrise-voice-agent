@@ -799,6 +799,27 @@ def given(model: ScriptedModel) -> str:
     return content
 
 
+async def test_a_call_repeated_in_one_reply_runs_once(
+    deps: Deps, registry: Registry, owner_engine: Engine
+) -> None:
+    # The model asks for the same thing twice in one reply. It runs once, and the second is
+    # answered as the first was: not refused, which the model would tell the caller.
+    model = ScriptedModel(
+        calls(("start_new_patient", {}), ("start_new_patient", {})),
+        says("What is your full name?"),
+    )
+    agent = await agent_for(model, deps, registry)
+
+    result = await agent.handle("This is my first visit.")
+
+    assert result.lines == ("What is your full name?",)
+    assert (agent.state.phase, agent.state.tool_refusals) == (Phase.BOOKING, 0)
+    first, second = tool_results(model.requests[1])
+    assert first["content"] == second["content"]
+    assert (first["is_error"], second["is_error"]) == (False, False)
+    assert rows(owner_engine) == [("new_patient_started", "tool", "start_new_patient", "success")]
+
+
 async def test_a_number_given_in_pieces_is_kept_by_code(deps: Deps, registry: Registry) -> None:
     so_far = "So far I have five five four, three two one, two three four."
     model = ScriptedModel()
@@ -811,15 +832,12 @@ async def test_a_number_given_in_pieces_is_kept_by_code(deps: Deps, registry: Re
     first = await agent.handle("It's five five four, three two one.")
     assert first.shown == "It's five five four, three two one."
     assert given(model) == (
-        "It's five five four, three two one."
-        "\n[digits heard so far: 554321 (6); a telephone number has ten]"
+        "It's five five four, three two one.\n[digits heard so far: 554321 (6)]"
     )
     # Nine of the caller's own digits may be read back to them: they are no SSN.
     model.then(says(so_far))
     second = await agent.handle("two three four")
-    assert given(model).endswith(
-        f"\n[digits heard so far: {'554321' + '234'} (9); a telephone number has ten]"
-    )
+    assert given(model).endswith(f"\n[digits heard so far: {'554321' + '234'} (9)]")
     assert (second.lines, second.withheld) == ((so_far,), None)
     # The last digit makes ten: the number is whole.
     model.then(says("Thank you."))
@@ -828,15 +846,20 @@ async def test_a_number_given_in_pieces_is_kept_by_code(deps: Deps, registry: Re
     # A new number starts afresh, and is whole however speech-to-text wrote it.
     model.then(says("Okay."), says("Okay."))
     await agent.handle("five five six")
-    assert given(model).endswith("\n[digits heard so far: 556 (3); a telephone number has ten]")
+    assert given(model).endswith("\n[digits heard so far: 556 (3)]")
     await agent.handle("No, it is (554) 321-2342.")
     assert given(model) == "No, it is (554) 321-2342.\n[number heard, 10 digits: 5543212342]"
     # More digits than a number has are not one: the model is told how many, and none is kept.
     model.then(says("Sorry?"), says("Okay."))
     await agent.handle("05/05/1964... Three two, one, nine, four six.")
-    assert given(model).endswith("\n[digits heard: 14; a telephone number has ten]")
+    assert given(model).endswith("\n[digits heard: 14]")
     await agent.handle("five five six")
-    assert given(model).endswith("\n[digits heard so far: 556 (3); a telephone number has ten]")
+    assert given(model).endswith("\n[digits heard so far: 556 (3)]")
+    # A word that is a digit in a sentence, and a time, are no piece of a number.
+    model.then(says("Sure."), says("Sure."), says("Sure."))
+    for words in ("The first one, please.", "Monday at 9:30 AM works.", "I want to book."):
+        await agent.handle(words)
+        assert given(model) == words
     # A date alone is a date, and an SSN is never a piece of a number.
     model.then(says("Thanks."), says("Thanks."))
     await agent.handle("January 10, 2003.")
@@ -848,7 +871,7 @@ async def test_a_number_given_in_pieces_is_kept_by_code(deps: Deps, registry: Re
     # A turn without a digit ended the number: the three before the date are not counted.
     model.then(says("Go on."))
     await agent.handle("two three four")
-    assert given(model).endswith("\n[digits heard so far: 234 (3); a telephone number has ten]")
+    assert given(model).endswith("\n[digits heard so far: 234 (3)]")
     # The call's record keeps the caller's words as the guard passed them, without the notes.
     assert "heard" not in str(agent.history)
 
@@ -872,9 +895,7 @@ async def test_a_closed_office_keeps_a_callback_number_from_the_model_until_whol
     # whole number is hidden from the model. Code keeps the pieces and says only how many.
     first = await agent.handle("It's five five four, three two one.")
     assert first.shown == "It's ****."
-    assert given(model) == (
-        "It's ****.\n[digits heard so far, not shown: 6; a telephone number has ten]"
-    )
+    assert given(model) == ("It's ****.\n[digits heard so far, not shown: 6]")
     assert "554321" not in str(model.requests)
     # Whole, the number is the model's to read back and to take the message with.
     whole = await agent.handle("two three four two")
@@ -885,9 +906,9 @@ async def test_a_closed_office_keeps_a_callback_number_from_the_model_until_whol
     model.then(says("Go on."), says("Sorry, once more?"), says("Go on."))
     await agent.handle("one two three, four five")
     await agent.handle("six seven eight nine")
-    assert given(model) == "****\n[digits heard, not shown: 9; a telephone number has ten]"
+    assert given(model) == "****\n[digits heard, not shown: 9]"
     await agent.handle("zero")
-    assert given(model) == "****\n[digits heard so far, not shown: 1; a telephone number has ten]"
+    assert given(model) == "****"
     assert "".join(("123", "45", "6789")) not in str(model.requests)
 
 
@@ -900,6 +921,10 @@ async def test_digits_stay_hidden_where_the_last_four_may_be_asked(
     agent = await agent_for(model, deps, registry)
     await agent.handle("five five four three two one")
     assert given(model) == "****"
+    # Nor is what the mask leaves of a whole number read as digits the caller gave.
+    model.then(says("Is this your first visit?"))
+    await agent.handle("My phone is 555 010 2030.")
+    assert "[" not in given(model)
     await agent.handle("two three four two")
     assert given(model) == "****"
     assert "5543212342" not in str(model.requests)
@@ -1335,6 +1360,9 @@ async def test_model_request_shape(model_id: str | None) -> None:
         # against max_tokens. Haiku 5.5 accepts thinking off at effort low.
         "thinking": {"type": "disabled"},
         "output_config": {"effort": "low"},
+        # One tool call in a reply: the model has asked for the same tool twice, and for a
+        # second it had no reason for, in one breath.
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
         "stream": True,
     }
     for sampling in ("temperature", "top_p", "top_k"):

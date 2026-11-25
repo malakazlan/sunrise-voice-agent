@@ -24,7 +24,11 @@ turns:
             status: needs_confirmation
             name: "Maria Garcia"
             callback_number: "5554439081"
-            reason_short: "Wants to move her appointment"
+    # The reason is the model's own wording: the scripted run's alone.
+    expect_scripted:
+      tools:
+        - call: take_message
+          returns: {reason_short: "Wants to move her appointment"}
   - caller: "Yes, that's right."
     model:
       - call: take_message
@@ -36,6 +40,14 @@ turns:
     expect:
       said: [after_hours_close]
       phase: closing
+    expect_scripted:
+      rows:
+        - table: messages
+          where: {kind: callback, body: "Wants to move her appointment"}
+          count: 1
+        - table: requests
+          where: {type: callback, summary: "Wants to move her appointment"}
+          count: 1
 expect:
   said: [closed, after_hours_close]
   offered: [take_message, report_emergency, close_call]
@@ -52,13 +64,12 @@ expect:
         kind: callback
         name: "Maria Garcia"
         callback_number: "5554439081"
-        body: "Wants to move her appointment"
         after_hours: true
       count: 1
     - table: messages
       count: 1
     - table: requests
-      where: {type: callback, summary: "Wants to move her appointment"}
+      where: {type: callback}
       count: 1
     - table: requests
       count: 1

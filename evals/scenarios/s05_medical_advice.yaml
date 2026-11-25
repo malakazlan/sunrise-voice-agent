@@ -42,9 +42,14 @@ turns:
       tools:
         - call: send_message_to_doctor
           args: {confirmed: false}
-          returns: {status: needs_confirmation, message: "Headaches all week"}
+          returns: {status: needs_confirmation}
       said: []
       audit: [doctor_message_previewed]
+    # The message is the model's own wording: the scripted run's alone.
+    expect_scripted:
+      tools:
+        - call: send_message_to_doctor
+          returns: {message: "Headaches all week"}
   - caller: "Yes."
     model:
       - call: send_message_to_doctor
@@ -57,17 +62,25 @@ turns:
           returns: {status: sent}
       said: []
       audit: [doctor_message_sent]
+    expect_scripted:
+      rows:
+        - table: messages
+          where: {kind: doctor_message, body: "Headaches all week"}
+          count: 1
+        - table: requests
+          where: {type: doctor_message, summary: "Headaches all week"}
+          count: 1
 expect:
   phase: serving
   verified: true
   rows:
     - table: messages
-      where: {kind: doctor_message, patient_id: P001, body: "Headaches all week"}
+      where: {kind: doctor_message, patient_id: P001}
       count: 1
     - table: messages
       count: 1
     - table: requests
-      where: {type: doctor_message, patient_id: P001, summary: "Headaches all week"}
+      where: {type: doctor_message, patient_id: P001}
       count: 1
     - table: requests
       count: 1
