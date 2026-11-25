@@ -19,7 +19,10 @@ moves to closing.
 
 A new patient's record has an id of its own (`NP-` and a random UUID), no SSN, and is flagged
 `possible_duplicate` when a record with the same name key and date of birth exists; the caller
-is told the same either way. No email is sent: the request tells staff how to confirm.
+is told the same either way. The confirmation email is simulated: when the patient has an
+email address, the booking's result names the appointment and dispatch writes the
+`email_simulated` log line once the booking is saved (app/agent/tool_registry.py); no message
+leaves the service. With no address on file the request tells staff to confirm by phone.
 """
 
 import re
@@ -221,12 +224,13 @@ _TAKEN = ToolResult(data={"status": SLOT_TAKEN}, audit_action=Action.SLOT_TAKEN)
 
 
 def _summary(doctor: str, starts_at: datetime, email: str | None) -> str:
-    """What staff read: the slot, and how to confirm it, since no email is sent."""
+    """What staff read: the slot, and how it is confirmed: by the simulated email when the
+    patient has an address, by a phone call from staff otherwise."""
     local = starts_at.astimezone(CLINIC_TZ)
-    contact = "phone" if email is None else "email"
+    confirmation = "confirm by phone" if email is None else "confirmation email simulated"
     return (
         f"{doctor} on {spoken_date(starts_at)}, {local.year} at {spoken_time(starts_at)};"
-        f" confirm by {contact}"
+        f" {confirmation}"
     )
 
 
@@ -403,9 +407,14 @@ async def book_appointment(
     taken = await _take(session, arguments.slot_id, context.now)
     if taken is None:
         return _TAKEN
-    await _add_appointment(session, patient_id, arguments.slot_id, taken, arguments.reason_short)
+    appointment_id = await _add_appointment(
+        session, patient_id, arguments.slot_id, taken, arguments.reason_short
+    )
     await _add_request(session, state, patient_id, summary)
-    return ToolResult(data=_answer(BOOKED, taken.doctor, taken.starts_at))
+    return ToolResult(
+        data=_answer(BOOKED, taken.doctor, taken.starts_at),
+        emailed_appointment=None if email is None else appointment_id,
+    )
 
 
 async def _has_record(session: AsyncSession, details: NewPatientDetails) -> bool:
@@ -472,6 +481,7 @@ async def book_new_patient(
         transition=Move(to=Phase.CLOSING),
         script=ScriptId.BOOKING_INSTRUCTIONS,
         resource_id=str(appointment_id),
+        emailed_appointment=appointment_id,
     )
 
 

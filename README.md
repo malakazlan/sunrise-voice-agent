@@ -13,8 +13,9 @@ What is real and what is not:
   chain, the console. Every rule about identity, patient data and money is code, not prompt.
 - Simulated: every patient is synthetic (`app/db/seed_data.json`); no real health information is
   stored or processed. The call is a browser page, not a phone number. A transfer to staff
-  writes a request and an event; there is no phone system behind it. No confirmation email is
-  sent. In dev and demo the clinic's clock can be fixed (`SIMULATED_NOW`).
+  writes a request and an event; there is no phone system behind it. The confirmation email
+  after a booking is simulated by a log line. In dev and demo the clinic's clock can be fixed
+  (`SIMULATED_NOW`).
 - No Business Associate Agreement (BAA) is signed with any vendor. See
   [HIPAA-aware design](#hipaa-aware-design) for what would have to change before real patients.
 
@@ -36,15 +37,17 @@ Where to look:
 
 1. [Quick start](#quick-start)
 2. [Architecture](#architecture)
-3. [The seven calls](#the-seven-calls)
-4. [HIPAA-aware design](#hipaa-aware-design)
-5. [Latency](#latency)
-6. [Testing and evals](#testing-and-evals)
-7. [The admin console](#the-admin-console)
-8. [Configuration](#configuration)
-9. [Deploy behind a proxy](#deploy-behind-a-proxy)
-10. [Limits and next steps](#limits-and-next-steps)
-11. [How it works, in detail](#how-it-works-in-detail)
+3. [The stack, and why](#the-stack-and-why)
+4. [The seven calls](#the-seven-calls)
+5. [Identity, booking and after hours](#identity-booking-and-after-hours)
+6. [HIPAA-aware design](#hipaa-aware-design)
+7. [Latency](#latency)
+8. [Testing and evals](#testing-and-evals)
+9. [The admin console](#the-admin-console)
+10. [Configuration](#configuration)
+11. [Deploy behind a proxy](#deploy-behind-a-proxy)
+12. [Limits and next steps](#limits-and-next-steps)
+13. [How it works, in detail](#how-it-works-in-detail)
 
 ## Quick start
 
@@ -187,6 +190,21 @@ One caller turn, and where each guard sits:
    call's start, end and emergencies are written by background tasks; after the call the masked
    transcript is stored.
 
+## The stack, and why
+
+| Layer | Choice | Why |
+|---|---|---|
+| Voice pipeline | Pipecat (open source, Python), one pinned version | It runs inside our own process, so the guards and the tool gate sit in the turn loop as our code; no hosted agent platform holds the call or the prompt, and speech-to-text, the model and text-to-speech can each be swapped |
+| Call | WebRTC from a browser page, with our own coturn relay | A web call needs no telephony account; audio goes from the browser to our server, through our relay when a network blocks the direct path, and through no third-party media service |
+| Turn detection | Silero voice activity detection, in process | No network hop to decide the caller has stopped |
+| Speech-to-text | Deepgram, streaming | Low delay, a transcript finalized on request, vocabulary hints for drug names and the doctors' names (never a patient's); offers a BAA |
+| Model | Claude Haiku through the Anthropic API (`LLM_MODEL`) | A fast first token with dependable tool calls; the tools and the rules are ours, so a small model is enough; the API can be covered by a BAA |
+| Text-to-speech | ElevenLabs Flash | A natural voice at low delay; its BAA is the weakest of the three ([Vendors and BAAs](#vendors-and-baas)) |
+| Service | FastAPI, one process per role | The voice service and the admin API are the same code started in two roles, so the admin side holds no vendor key and cannot slow a call |
+| Data | Postgres | Transactions for a booking two callers want at once, a runtime role that cannot change the audit log, triggers that refuse it |
+| Console | Next.js with shadcn/ui, its own container | A thin client: no data, no secret, only the admin API's masked JSON |
+| Run | Docker Compose | One command locally and on the server; CI builds and smoke-tests the same stack |
+
 ## The seven calls
 
 The seven scenarios of the assignment. Each eval in the last column runs the call as text
@@ -196,11 +214,59 @@ through the same turn loop ([Testing and evals](#testing-and-evals)).
 |---|---|---|---|---|
 | Verified refill | Gives name and date of birth, then the last four of the SSN; asks for a refill | Verifies in code, reads the refill back, files it once confirmed; with no refills left, sends it to the doctor and never says it is approved | `app/agent/verification.py`, `app/guard/input.py`, `app/agent/serving.py` | `s01`, `s09`, `s11` |
 | Failed verification | Gives a wrong date or wrong digits | Says the same fail line whatever did not match; locks the call on the third failure and offers staff; five failures in an hour lock that identity across calls | `app/agent/verification.py`, `app/domain/matching.py` | `s02`, `s12` |
-| New patient booking | First visit; gives name, date of birth, phone, email, insurance, reason | Spells the email back letter by letter, offers at most three open slots, reads the chosen one back, books it in one transaction | `app/agent/booking.py` | `s03` |
+| New patient booking | First visit; gives name, date of birth, phone, email, insurance, reason | Spells the email back letter by letter, offers at most three open slots, reads the chosen one back, books it in one transaction, simulates the confirmation email | `app/agent/booking.py` | `s03` |
 | After hours | Calls at 9 PM on a Tuesday | Says the clinic is closed; can only take a message, report an emergency or say goodbye | `app/domain/office_hours.py`, `app/agent/endings.py`, `app/agent/tool_registry.py` | `s04`, `s10` |
 | Medical advice | Asks what to take | Declines and offers a message to the doctor; a sentence of advice the model writes is withheld and replaced | `app/guard/output.py`, `app/agent/prompts.py` | `s05` |
 | Emergency | Says "I have chest pain", or describes one in other words | Says the 911 line and ends the call; no tool runs after | `app/guard/input.py`, `app/agent/endings.py` | `s06`, `s10`, `s13` |
 | Third party | Verified caller asks for her husband's balance, or tells the agent to ignore its rules | Gives nothing: tools act only on the caller's own record, and no tool takes a patient id | `app/agent/serving.py`, `app/agent/tool_registry.py` | `s07`, `s08` |
+
+## Identity, booking and after hours
+
+The three flows the assignment asks the README to explain. Each is code; the model's part is to
+talk.
+
+**Identity verification** (`app/agent/verification.py`, `app/guard/input.py`,
+[docs/identity.md](docs/identity.md))
+
+1. The model asks for the full name and the date of birth and passes them to `verify_identity`.
+2. Code then asks, with a fixed line, for the last four digits of the Social Security number
+   only. The caller's answer is swallowed by the input guard: the model, the logs and the
+   transcript never get it, and code alone checks it (`submit_identity`).
+3. All three must match the same one record. Until they do, no patient-data tool is offered,
+   and dispatch refuses one that is called anyway.
+4. Any mismatch gets the same line ("I'm sorry, I couldn't verify those details"), whatever
+   was wrong. The third failure ends verification on that call and offers the clinic's staff;
+   five failures in an hour lock that identity across calls.
+
+**Booking a new patient** (`app/agent/booking.py`, [docs/tools.md](docs/tools.md))
+
+1. The agent confirms it is a first visit, then collects only what a booking needs: full name,
+   date of birth, phone, email, insurance provider and member ID or self-pay, and the reason in
+   a few words. Any other field is refused by the tool's schema.
+2. It spells the email back, offers at most three open slots (by doctor, day or time of day if
+   the caller has a preference) and reads the chosen one back.
+3. Once the caller confirms, one transaction takes the slot (so of two callers one wins), adds
+   the new patient's record (an id of its own, no SSN), the appointment and a `booking`
+   request.
+4. The agent gives the arrival instructions and says a confirmation will come by email. That
+   email is simulated: once the booking is saved the service writes one log line,
+   `email_simulated kind=booking_confirmation appointment_id=… call_id=…`, with no address
+   and no name, and the booking request staff see says `confirmation email simulated`. No
+   message leaves the service.
+5. A verified patient books through the same slots (`find_slots`, `book_appointment`) without
+   giving details again; with no email on file the request tells staff to confirm by phone.
+
+**After hours** (`app/domain/office_hours.py`, `app/agent/endings.py`)
+
+1. The time is checked when the call starts, in the clinic's zone (Monday to Friday, 9:00 to
+   17:00 Eastern; the console's Config page or `SIMULATED_NOW` can force it for a demo).
+2. Closed: the agent says so and gives the hours. No identity check and no patient-data tool
+   exists on a closed call, so nothing can be shared even with a caller who could verify.
+3. It can take a message (name, callback number, the reason in a few words), which it reads
+   back before saving, report an emergency, or say goodbye. The closing line is the
+   assignment's: the message is recorded, the team calls back on the next business day, and
+   an emergency means 911.
+4. An emergency said at any point, open or closed, gets the 911 line at once and ends the call.
 
 ## HIPAA-aware design
 
@@ -242,6 +308,21 @@ compliant service. What the code does:
 - **Retention.** Calls keep a masked transcript and per-turn timings; requests, messages and
   bookings are kept for staff. The runtime role cannot delete anything, and there is no
   retention job: rows stay until the database owner removes them.
+
+### The ten principles, one by one
+
+| # | Principle | How it is met | Where |
+|---|---|---|---|
+| 1 | Verify before disclosure | A patient-data tool is offered only to a verified caller, and dispatch checks again when it is called | `app/agent/tool_registry.py`, `app/agent/verification.py` |
+| 2 | Minimum necessary | Each read returns one field group of the caller's own record; booking and messages take only their listed fields | `app/agent/serving.py`, `app/agent/booking.py` |
+| 3 | SSN protection | Only the last four digits are stored; the caller's digits are swallowed before the model, checked in code, never said back, never logged | `app/guard/input.py`, `app/guard/output.py`, `app/db/seed_data.json` |
+| 4 | Masked logs and transcripts | Every log line passes a masking formatter; the stored transcript is masked three times; the admin API masks again | `app/guard/logging.py`, `app/guard/mask.py`, `app/agent/call_record.py` |
+| 5 | Matching in code, not in the model | Lookup and verification are queries and comparisons in code; the prompt holds no patient data and no tool takes a patient id | `app/agent/verification.py`, `app/domain/matching.py`, `app/agent/prompts.py` |
+| 6 | Secure secrets | `.env` is ignored by git, `.env.example` lists every variable, CI scans the history, each container gets only its own variables | `.env.example`, `app/config.py` |
+| 7 | Audit log | Every tool call and every admin read or write appends who, what, which record, the outcome and when to an HMAC-chained log, with ids and never values | `app/audit/log.py` |
+| 8 | Business Associate Agreements | The vendors, what reaches each, what their own pages say, and what production needs | [Vendors and BAAs](#vendors-and-baas) |
+| 9 | Call recording notice | The greeting, said by code first on every call and not interruptible, says the call may be recorded | `app/agent/scripts.py` |
+| 10 | Synthetic data only | The seed is the assignment's fake data and two more fake patients | `app/db/seed_data.json` |
 
 ### Vendors and BAAs
 
@@ -515,8 +596,7 @@ After a deploy:
   restart signs everyone out and resets the limits, and replicas would not share them.
 - A request marked handled cannot be unmarked.
 - The transfer is simulated, and the call is a browser page, not a phone line.
-- No email is sent, though the booking line tells a new patient that a confirmation will come
-  by email.
+- The confirmation email is a log line: no message leaves the service.
 - Four SSN digits that read as a year (1900 to 2099), said before the identity step asks for
   them and without a cue such as "SSN", reach the model.
 - Office hours have no holiday calendar.

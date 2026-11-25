@@ -90,7 +90,7 @@ expect:
     - table: requests
       where:
         type: booking
-        summary: "Dr. Patel on Wednesday, November 25, 2026 at 9:30 AM; confirm by email"
+        summary: "Dr. Patel on Wednesday, November 25, 2026 at 9:30 AM; confirmation email simulated"
       count: 1
     - table: requests
       count: 1
