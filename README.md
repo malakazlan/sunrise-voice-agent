@@ -18,6 +18,20 @@ What is real and what is not:
 - No Business Associate Agreement (BAA) is signed with any vendor. See
   [HIPAA-aware design](#hipaa-aware-design) for what would have to change before real patients.
 
+A live call needs three vendor keys (Anthropic, Deepgram, ElevenLabs) and a Linux host. Without
+them the quick start gives you the console and the admin API, but no call; the seven calls can
+still be run as text, with no key ([see them pass](#see-the-seven-calls-pass-without-keys)).
+
+Where to look:
+
+- [The seven calls](#the-seven-calls): each scenario of the assignment, the code that decides
+  it and the eval that covers it.
+- `evals/scenarios/`: those calls as files, turn by turn, with what must come of each.
+- `tests/`: the Python suite ([Testing and evals](#testing-and-evals) says what it covers).
+- [HIPAA-aware design](#hipaa-aware-design): what the code does with identity and patient data,
+  and the vendors' BAAs.
+- [The admin console](#the-admin-console): what staff see, with screenshots.
+
 ## Contents
 
 1. [Quick start](#quick-start)
@@ -34,7 +48,10 @@ What is real and what is not:
 
 ## Quick start
 
-Needs Docker with Compose, `openssl` and a POSIX shell. From a clean clone:
+Needs Docker with Compose, `openssl` and a POSIX shell. The stack is built and run in CI on
+Linux. coturn uses host networking, which needs a Linux host, so a live call to a local stack
+needs Linux; on Docker Desktop (macOS, Windows) the stack and the console run, but calls are not
+expected to connect. From a clean clone:
 
 ```sh
 cp .env.example .env
@@ -52,7 +69,9 @@ set_env CONSOLE_ORIGIN http://127.0.0.1:3000
 
 export ADMIN_API_ORIGIN=http://127.0.0.1:8001
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
-curl http://127.0.0.1:8000/health http://127.0.0.1:8001/health http://127.0.0.1:3000/health
+# Each service answers once it has started; curl tries each for up to a minute.
+curl -fsS --retry 30 --retry-all-errors --retry-delay 2 \
+  http://127.0.0.1:8000/health http://127.0.0.1:8001/health http://127.0.0.1:3000/health
 ```
 
 `.env.example` sets `APP_ENV=dev`, which allows plain `http` for the console's origin on your
@@ -64,11 +83,14 @@ machine. The three local addresses:
 | `http://127.0.0.1:3000/` | the console (`console`) | sign in as `admin` with `ADMIN_PASSWORD` from `.env` |
 | `http://127.0.0.1:8001/` | the admin API (`admin-api`) | what the console reads; `/health` for you |
 
+- A live browser call has been made on a deployed Linux server behind HTTPS
+  ([Deploy](#deploy-behind-a-proxy)), not on a local stack. Pressing Call here is not shown to
+  work.
 - The `up` line is the one the CI `docker` job runs (`.github/workflows/ci.yml`, "Smoke test
-  through Compose"), with an env file written the same way; CI then sets `ADMIN_API_ORIGIN` and
-  brings the console up. CI checks every service's `/health`, the admin sign-in and the
-  console's headers, and makes test calls through coturn with a scripted WebRTC client
-  (`scripts/relay_probe.py`). It does not make a browser call to this local stack.
+  through Compose"), with its own env file (`APP_ENV=prod`, fixed test values). CI does not
+  run this dev env file, a console sign-in or a browser call. It checks every service's
+  `/health`, the admin API's sign-in by `curl`, the console's headers, and makes test calls
+  through coturn with a scripted WebRTC client (`scripts/relay_probe.py`).
 - A call needs the three vendor keys and a voice id in `.env` (run the `up` line again after
   adding them). Without them the stack runs and the call page's call is refused at set-up.
 - The office is open Monday to Friday, 9:00 to 17:00, America/New_York; outside those hours the
@@ -76,6 +98,22 @@ machine. The three local addresses:
   the console's Config page, or set `SIMULATED_NOW` in `.env` (dev and demo only).
 - The synthetic patients you can verify as are in `app/db/seed_data.json`.
 - Running without Docker, the checks and the tests: [docs/development.md](docs/development.md).
+
+### See the seven calls pass without keys
+
+The evals run every call as text through the agent's turn loop, with the model's replies taken
+from the scenario files: no vendor key, only the database. Needs [uv](https://docs.astral.sh/uv/)
+as well, and port 5432 free on your machine.
+
+```sh
+cp .env.example .env    # skip if you made one above
+docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml \
+  up -d --wait db
+set -a; . ./.env; set +a    # the evals read POSTGRES_* from the environment
+uv run python -m evals
+```
+
+It prints one line per scenario, `1/1` when it passed.
 
 ## Architecture
 
@@ -96,8 +134,9 @@ flowchart LR
   tts["ElevenLabs<br/>text-to-speech"]
 
   caller -->|"HTTPS: page, ICE servers, SDP offer"| voice
-  caller <-->|"audio (WebRTC), direct or relayed"| coturn
-  coturn <-->|"audio"| voice
+  caller <-->|"audio (WebRTC), direct"| voice
+  caller <-->|"audio, relayed"| coturn
+  coturn <-->|"audio, relayed"| voice
   voice -->|"caller audio"| stt
   stt -->|"transcript text"| voice
   voice -->|"guarded text, tool results"| llm
@@ -107,7 +146,7 @@ flowchart LR
   voice -->|"rows and audit events, runtime role"| db
   admin -->|"reads, audit events, marks, config, runtime role"| db
   staff -->|"HTTPS: pages"| console
-  staff <-->|"masked JSON, session cookie"| admin
+  staff <-->|"masked JSON, one audited reveal, session cookie"| admin
 ```
 
 - The voice service serves no admin route and holds no admin password. The admin API holds no
@@ -181,13 +220,14 @@ compliant service. What the code does:
   in every turn. One known gap: four digits that read as a year (1900 to 2099), said before the
   step asks for them and without a cue such as "SSN", reach the model.
 - **Masking.** Logs carry event names, ids and counts; every log line passes the masking
-  formatter (`app/guard/mask.py`). The stored transcript is masked three times (patterns, the
+  formatter (`app/guard/logging.py`, with the patterns of `app/guard/mask.py`). The stored transcript is masked three times (patterns, the
   names the call knows, then Presidio). The admin API masks again on the way out. Audio is
   never stored. Details: [docs/data.md](docs/data.md), [docs/call-record.md](docs/call-record.md).
 - **Audit chain.** Every tool call, admin read and admin write appends an event to
   `audit_events`, HMAC-chained under `AUDIT_HMAC_KEY`. Database triggers refuse updates and
   deletes, and the runtime role has no such privilege. "Check the chain now" on the console's
-  Audit page walks the whole chain and reports every break. Details: [docs/data.md](docs/data.md).
+  Audit page walks the whole chain, lists the first 100 breaks and says when there were more.
+  Details: [docs/data.md](docs/data.md).
 - **The admin console.** It shows only what the API has masked; every read is audited in the
   read's own transaction. "Show callback details" is the one place a caller's name and full
   number are shown: an explicit `POST`, audited as `admin_revealed_callback`, limited to 30 a
@@ -204,7 +244,7 @@ compliant service. What the code does:
 
 Each vendor's own page, read on 2026-11-25.
 
-| Vendor | What reaches it | BAA offered |
+| Vendor | What reaches it | What the vendor's page says |
 |---|---|---|
 | Anthropic (model, first-party API) | The caller's words after the input guard, including name and date of birth; the verified caller's first name; tool results of the caller's own record | Yes, for the first-party API once the organization signs the BAA and turns on HIPAA readiness; not for the Console, beta features or consumer plans; zero data retention is not required. [API and data retention](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention), [BAA for commercial customers](https://privacy.claude.com/en/articles/8114513) |
 | Deepgram (speech-to-text) | The caller's audio, all of it, SSN digits included: the input guard runs on Deepgram's transcript. The calls opt out of Deepgram's model improvement programme (`mip_opt_out`) | Yes, for Enterprise customers. [Pricing](https://deepgram.com/pricing), [data privacy and compliance](https://developers.deepgram.com/docs/data-privacy-compliance) |
@@ -240,8 +280,10 @@ Choices that buy the time:
 - A small, fast model (`claude-haiku-5-5`), streamed, effort `low`, thinking off, at most 300
   tokens, no retries; a fallback line if the first token has not come within 8 seconds.
 - Scripted lines (verification, emergency, after hours) need no model request.
-- ElevenLabs' Flash v2.5 over its streaming WebSocket. Speech starts at a whole sentence, after
-  the output guard.
+- ElevenLabs' Flash v2.5 over its streaming WebSocket. The model's reply is spoken once it has
+  ended and passed the output guard, as one line (`app/agent/turn.py`), so the model never
+  announces a tool's work before it is done. The cost is the time from the reply's first
+  sentence to its end.
 - "One moment while I check." when a tool has not answered within 1.2 seconds.
 - Nothing slow between the transcript and the reply: the vocabulary hints are built at
   start-up, the config is read from memory, and the call's start, end and emergency events,
@@ -260,9 +302,10 @@ logging is configured in one module, SSN patterns have one owner, no file holds 
 literal, no test is skipped. The console has its own tests ([console/README.md](console/README.md)).
 CI runs lint, types, the suite, the console's checks, a secret scan and the Docker stack.
 
-Each change is written test first: the test is run and seen to fail before the code exists.
-Then each line that carries a rule is broken on purpose, the test named for that rule must
-fail, and the line is restored.
+The Python service's rules were written test first: each test was run and seen to fail before
+the code existed. In both codebases, every test named for a rule has been shown to fail when
+its rule is removed: the line that carries the rule is broken on purpose, the test fails, and
+the line is restored.
 
 The evals run each call as text through the turn loop a live call uses, against a fresh
 database per run:
@@ -406,7 +449,8 @@ Three public origins on one registrable domain, each behind an HTTPS proxy, plus
   admin API must be the same site for the browser to send it.
 - **Exact origins.** `CONSOLE_ORIGIN` (admin API) is the console's origin and
   `ADMIN_API_ORIGIN` (console) is the admin API's: scheme and host, no path, and no default
-  port (a browser never sends `:443`, so it would never match); `https` outside dev.
+  port (a browser never sends `:443`, so it would never match). `CONSOLE_ORIGIN` must be
+  `https` outside dev; `ADMIN_API_ORIGIN` may be `http` only for a loopback host.
 - **Client addresses.** Set `FORWARDED_ALLOW_IPS` for `admin-api` to the proxy's network, so
   uvicorn trusts its `X-Forwarded-For` and the sign-in limit counts each client. Otherwise every
   client shares the proxy's address and one limit. Behind a CDN the proxy sees the CDN's
@@ -434,6 +478,7 @@ never its value:
 1 validation error for DeploymentSettings
 call_access_token
   Value error, call_access_token is required unless app_env is dev [type=value_error]
+    For further information visit https://errors.pydantic.dev/2.14/v/value_error
 ```
 
 After a deploy:
@@ -457,10 +502,15 @@ After a deploy:
 ## Limits and next steps
 
 - One admin user, from settings; no named staff accounts or roles.
-- Admin sessions, the sign-in limiter, the live-call stream places and the list of live calls
-  are in memory, per process: a restart signs everyone out, and replicas would not share them.
+- Admin sessions, the sign-in limiter, the callback reveal limiter, the live-call stream
+  places, the list of live calls and the cap on concurrent calls are in memory, per process: a
+  restart signs everyone out and resets the limits, and replicas would not share them.
 - A request marked handled cannot be unmarked.
-- The transfer is simulated, no email is sent, and the call is a browser page, not a phone line.
+- The transfer is simulated, and the call is a browser page, not a phone line.
+- No email is sent, though the booking line tells a new patient that a confirmation will come
+  by email.
+- Four SSN digits that read as a year (1900 to 2099), said before the identity step asks for
+  them and without a cue such as "SSN", reach the model.
 - Office hours have no holiday calendar.
 - Masking free text is best effort: a name the call never learned, said in lower case, can stay
   in a stored transcript. The output guard's rules are patterns and cannot catch every phrasing.

@@ -102,13 +102,19 @@ def test_no_ssn_shaped_literals_in_repo() -> None:
 
 
 # R1: the call page's access token is CALL_ACCESS_TOKEN. Its old name is accepted nowhere, so
-# no tracked file names it, in any case. Assembled here so that this file does not match its own
-# scan.
-OLD_ACCESS_TOKEN_NAME = re.compile("demo" + "_access_token", re.IGNORECASE)
+# no tracked file names it, in any case and however it is joined. Assembled here so that this
+# file does not match its own scan.
+OLD_ACCESS_TOKEN_NAME = re.compile("demo" + r".?access", re.IGNORECASE)
 
 
 def test_old_access_token_name_is_gone() -> None:
-    for sample in ("DEMO" + "_ACCESS_TOKEN=x", "settings.demo" + "_access_token"):
+    for sample in (
+        "DEMO" + "_ACCESS_TOKEN=x",
+        "settings.demo" + "_access_token",
+        "Demo" + "AccessToken",
+        "demo" + "-access-token",
+        "the demo" + " access token",
+    ):
         assert OLD_ACCESS_TOKEN_NAME.search(sample), sample
     assert not OLD_ACCESS_TOKEN_NAME.search("CALL_ACCESS_TOKEN=x APP_ENV=demo")
 

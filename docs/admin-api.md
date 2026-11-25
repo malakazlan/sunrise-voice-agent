@@ -187,7 +187,7 @@ calls, and runs in a process of its own (`app/api/security.py`, `sessions.py`, `
 
 Two ways to sign in, one check (`AdminAccess`):
 
-- HTTP Basic stays as it was, for scripts, and reads only: a state-changing request with Basic
+- HTTP Basic, for scripts, reads only: a state-changing request with Basic
   alone is refused. The stream refuses Basic.
 - A browser session: `POST /admin/api/session` checks the user and password as Basic does, in
   constant time, against the same failed-sign-in limit (failures of either kind count for the
@@ -320,5 +320,5 @@ outage as `admin_config_read_failed`).
   way (reason `config_unknown`). At shutdown the refusals' events and the turn rows still
   queued get 5 seconds in all.
 - Office override: `open` or `closed` decides whether the office is open for calls that start
-  after the change; a running call keeps the answer it started with. `schedule` is the clock,
-  exactly as before.
+  after the change; a running call keeps the answer it started with. `schedule` is the
+  office hours by the clinic's clock.
