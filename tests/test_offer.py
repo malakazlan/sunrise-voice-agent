@@ -17,7 +17,7 @@ from app.agent.turn_record import TurnRecorder
 from app.api.offer import OpenCall
 from app.audit.queue import AuditQueue
 from app.config import Settings
-from app.main import create_app
+from app.main import create_app, worker_count
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
 
@@ -620,6 +620,26 @@ def test_shutdown_drains_both_queues_within_one_limit(monkeypatch: pytest.Monkey
     took = asyncio.run(main())
     assert given == [5, 5]
     assert took < 6, took
+
+
+@pytest.mark.parametrize(
+    ("cpus", "calls", "workers"),
+    [
+        # Never fewer than Python's own default for the loop's executor, min(32, cpus + 4)...
+        (8, 3, 12),
+        (64, 1, 32),
+        (None, 1, 5),
+        (1, 1, 5),
+        # ...and two for each call at once (its audio's encoding and one lookup or load at
+        # set-up), and two to spare.
+        (2, 3, 8),
+        (4, 3, 8),
+        (16, 20, 42),
+        (64, 20, 42),
+    ],
+)
+def test_worker_count(cpus: int | None, calls: int, workers: int) -> None:
+    assert worker_count(cpus, calls) == workers
 
 
 def test_worker_threads_are_started_before_the_first_call(

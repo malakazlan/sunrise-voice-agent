@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -40,11 +41,21 @@ CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 # queued: both are drained at once under this one limit, and what is left then is dropped, so a
 # stalled database cannot hold the stop past the container's grace period.
 QUEUES_WAIT_SECONDS = 5
-# The loop's default executor runs what a call hands it (the VAD's loading, a host's address,
-# aiortc's audio encoding): a worker for each call at once, and two to spare. How long its
-# workers may take to start, at start-up.
+# The loop's default executor runs what a call hands it: aiortc's encoding of each audio frame
+# it sends, one at a time for the call's one track, and at set-up one load or lookup at a time
+# (the VAD's model, the STUN server's address); so two workers per call at once. Decoding runs
+# on aiortc's own thread for the call. Address lookups of the database's host share it, and
+# can take seconds: hence the spare workers. How long the workers may take to start, at
+# start-up.
+WORKERS_PER_CALL = 2
 SPARE_WORKERS = 2
 WORKERS_START_SECONDS = 10
+
+
+def worker_count(cpus: int | None, calls: int) -> int:
+    """How many workers the loop's default executor gets: never fewer than Python's own
+    default, min(32, cpus + 4), and enough for every call at once with some to spare."""
+    return max(min(32, (cpus or 1) + 4), WORKERS_PER_CALL * calls + SPARE_WORKERS)
 
 
 async def start_workers(count: int) -> None:
@@ -128,7 +139,7 @@ def create_app(
         _app.state.poll = poll
         await poll.start()
         # Before the first call, never during one.
-        await start_workers(settings.max_concurrent_calls + SPARE_WORKERS)
+        await start_workers(worker_count(os.cpu_count(), settings.max_concurrent_calls))
         yield
         await poll.stop()
         refusals.close()
