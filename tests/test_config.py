@@ -416,6 +416,11 @@ def test_ci_checks_each_service_against_its_role() -> None:
     assert 'grep -q "1 validation error for DeploymentSettings"' in workflow
     assert "StartupSettings" not in workflow
     assert 'echo "admin-api container: $state"' in workflow
+    # The checks are Python passed in single quotes: a quote inside one ends the shell string.
+    scripts = re.findall(r" -c '\n(.*?)\n *'", workflow, re.DOTALL)
+    assert len(scripts) >= 3
+    for script in scripts:
+        assert "'" not in script, script[:60]
     assert '"app": {name.upper() for name in VOICE_FIELDS}' in workflow
     assert '("app", VOICE_FIELDS)' in workflow
     assert '"startup": {name.upper() for name in STARTUP_CHECK_FIELDS}' in workflow

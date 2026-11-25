@@ -296,7 +296,7 @@ jobs:
           from app.config import ADMIN_FIELDS, STARTUP_CHECK_FIELDS, VOICE_FIELDS
           expected = {
               "app": {name.upper() for name in VOICE_FIELDS},
-              # The one variable that is no setting: uvicorn's own, for the proxy's address.
+              # The one variable that is no setting: read by uvicorn, for the proxy address.
               "admin-api": {name.upper() for name in ADMIN_FIELDS} | {"FORWARDED_ALLOW_IPS"},
               "startup": {name.upper() for name in STARTUP_CHECK_FIELDS},
           }
