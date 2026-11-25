@@ -275,6 +275,20 @@ def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
     assert not owner & compose_environment("app")
 
 
+def test_the_console_gets_only_the_admin_api_origin() -> None:
+    # The admin console (console/) holds no secret: its one setting is the admin API's origin, and
+    # neither that nor its host port reaches any other service.
+    assert compose_environment("console") == {"ADMIN_API_ORIGIN"}
+    console = compose_service("console")
+    assert console[console.index("ports:") + 1] == '- "127.0.0.1:${CONSOLE_HOST_PORT:-3000}:3000"'
+    assert not any(line.startswith(("depends_on", "env_file")) for line in console)
+    for service in ("db", "startup", "app", "coturn"):
+        assert not {"ADMIN_API_ORIGIN", "CONSOLE_HOST_PORT"} & compose_environment(service), service
+    # Nothing depends on it: its name appears once, as its own service.
+    lines = [line.strip() for line in COMPOSE.read_text(encoding="utf-8").splitlines()]
+    assert lines.count("console:") == 1
+
+
 @pytest.mark.usefixtures("offline_env")
 def test_defaults_apply_without_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "prod")
