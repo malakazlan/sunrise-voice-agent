@@ -9,13 +9,14 @@ activity detection (Silero) and Deepgram's streaming speech-to-text to the agent
 lines ("Voice out and the call's life", below) and sends each turn's result to the call page
 over the data channel.
 
-- `GET /` serves the call page (`web/index.html`, built by `app/api/page.py`): a phone with
-  the access code, Call and End call, a "relay only" switch, the call's time and a line that
-  follows the two audio levels (the assistant's and the caller's, read in the browser and
-  never sent anywhere). Beside it, once the call talks, the conversation as text: what the
-  model was given of each caller turn (the guard's text, or a redaction bar for a swallowed
-  or emergency turn), the lines said, "scripted line" where no model was asked, the tool
-  steps, the output guard's rule when it withheld part of a reply, a hand-off, and the
+- `GET /` serves the call page (`web/index.html`, built by `app/api/page.py`), in the
+  console's colours and with its logo: a phone with the access code, Call and End call, a
+  "relay only" switch, the call's time and a bar meter that follows the live audio (the
+  assistant's or the caller's, read in the browser and never sent anywhere) and says who is
+  speaking. Beside it, once the call talks, the conversation as text: what the model was
+  given of each caller turn (the guard's text, or a "not passed to the assistant" mark for a
+  swallowed or emergency turn), the lines said, "scripted line" where no model was asked, the
+  tool steps, the output guard's rule when it withheld part of a reply, a hand-off, and the
   timings behind a switch; and the connection state, the ICE candidate types in use and why
   the call ended. The server's text is written as text, never as markup.
 - The page is read once, when the app is built, with its two font files (IBM Plex, served
