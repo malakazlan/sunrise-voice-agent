@@ -83,6 +83,16 @@ VERIFIED = verified("Sarah")
 REFUSED = ToolOutcome(
     status=Status.REFUSED, message="That is not available right now.", data={}, hand_off=False
 )
+
+
+def not_valid(outcome: ToolOutcome) -> bool:
+    """A refusal for arguments that are not valid: nothing ran, nothing is returned, and
+    the model is told to ask the caller for the details."""
+    told = outcome.message or ""
+    fixed = outcome.model_copy(update={"message": REFUSED.message})
+    return fixed == REFUSED and told.startswith("Some details are missing or not valid")
+
+
 FAILED = ToolOutcome(
     status=Status.FAILED, message="That could not be done right now.", data={}, hand_off=False
 )
@@ -659,7 +669,8 @@ async def test_bad_claims_are_refused_by_argument_validation(deps: Deps, seeded:
         {"full_name": "Sarah Johnson", "dob": "1985-03-14", "ssn": LAST_FOUR},
     ):
         after, outcome = await REGISTRY.dispatch(state, "verify_identity", arguments, deps)
-        assert (after, outcome) == (state.model_copy(update={"tool_refusals": 1}), REFUSED)
+        assert after == state.model_copy(update={"tool_refusals": 1})
+        assert not_valid(outcome), arguments
     assert attempts(seeded) == []
     # Born today is a date of birth, and so is the first day of 1900.
     after, outcome = await claim(state, deps, "Sarah Johnson", "2026-11-24")

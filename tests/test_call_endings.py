@@ -99,6 +99,16 @@ HEART_ATTACK = "I think I'm having a heart attack"
 REFUSED = ToolOutcome(
     status=Status.REFUSED, message="That is not available right now.", data={}, hand_off=False
 )
+
+
+def not_valid(outcome: ToolOutcome) -> bool:
+    """A refusal for arguments that are not valid: nothing ran, nothing is returned, and
+    the model is told to ask the caller for the details."""
+    told = outcome.message or ""
+    fixed = outcome.model_copy(update={"message": REFUSED.message})
+    return fixed == REFUSED and told.startswith("Some details are missing or not valid")
+
+
 FAILED = ToolOutcome(
     status=Status.FAILED, message="That could not be done right now.", data={}, hand_off=False
 )
@@ -520,7 +530,7 @@ async def test_message_rules(
         assert (after, outcome) == (closed, DONE.model_copy(update={"data": read_back}))
     for value in ("true", "yes", 1, None):
         _after, outcome = await registry.dispatch(closed, MESSAGE, message(confirmed=value), deps)
-        assert outcome == REFUSED, value
+        assert not_valid(outcome), value
 
     # Each bound, refused whether confirmed or not.
     ssn_shaped = "-".join(["9" * 3, "8" * 2, "7" * 4])
@@ -569,7 +579,7 @@ async def test_message_rules(
             _after, outcome = await registry.dispatch(
                 closed, MESSAGE, {**arguments, "confirmed": confirmed}, deps
             )
-            assert outcome == REFUSED, arguments
+            assert not_valid(outcome), arguments
     assert rows(owner_engine, MESSAGES) == []
     assert rows(owner_engine, REQUESTS) == []
 
@@ -845,7 +855,7 @@ async def test_reasons_are_fixed(
         _after, outcome = await registry.dispatch(
             intake(), TRANSFER, {"reason": said, "confirmed": True}, deps
         )
-        assert outcome == REFUSED, said
+        assert not_valid(outcome), said
 
     # The audit log itself takes only members of its reason registry.
     with pytest.raises(TypeError, match="Reason"):
