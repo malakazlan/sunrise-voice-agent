@@ -5,6 +5,9 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
   agentRules: false,
+  // No image optimizer: the console shows no images, and without it neither /_next/image nor
+  // sharp is in the build.
+  images: { unoptimized: true },
   turbopack: {
     rules: {
       "*.css": {

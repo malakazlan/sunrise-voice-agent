@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 import pytest
+import yaml  # type: ignore[import-untyped]  # PyYAML ships no type information
 from conftest import OFFLINE_DB_ENV, VOICE_SECRETS
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
@@ -284,9 +285,11 @@ def test_the_console_gets_only_the_admin_api_origin() -> None:
     assert not any(line.startswith(("depends_on", "env_file")) for line in console)
     for service in ("db", "startup", "app", "coturn"):
         assert not {"ADMIN_API_ORIGIN", "CONSOLE_HOST_PORT"} & compose_environment(service), service
-    # Nothing depends on it: its name appears once, as its own service.
-    lines = [line.strip() for line in COMPOSE.read_text(encoding="utf-8").splitlines()]
-    assert lines.count("console:") == 1
+    # Nothing depends on it, in either form Compose takes depends_on (a list or a mapping).
+    services = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    assert "console" in services
+    for service, definition in services.items():
+        assert "console" not in (definition.get("depends_on") or []), service
 
 
 @pytest.mark.usefixtures("offline_env")

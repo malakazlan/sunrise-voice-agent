@@ -20,6 +20,9 @@ ENV NODE_ENV=production \
 # The standalone server and the files it serves; nothing else of the build.
 COPY --from=build /console/.next/standalone ./
 COPY --from=build /console/.next/static ./.next/static
+# Images are not optimised (next.config.ts), so the image library Next.js traces in by default is
+# never loaded: it is left out.
+RUN rm -rf node_modules/sharp node_modules/@img
 USER 10001:10001
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --start-interval=2s --retries=3 \
