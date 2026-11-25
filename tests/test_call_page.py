@@ -92,9 +92,10 @@ def test_page_is_self_contained_and_writes_text_only() -> None:
     # No inline style attribute and no inline event handler: the policy would refuse both.
     assert re.findall(r"<[^>]*\sstyle\s*=", markup) == []
     assert re.findall(r"<[^>]*\son[a-z]+\s*=", markup) == []
-    # Nothing from another origin, and no link out.
+    # Nothing from another origin, and no link out: a reference is to a font of ours or to a
+    # drawing in the page itself.
     assert re.findall(r"https?:|//[a-z]", page) == []
-    assert re.findall(r"""(?:src|href)\s*=\s*["'](?!/fonts/)""", markup) == []
+    assert re.findall(r"""(?:src|href)\s*=\s*["'](?!/fonts/|#[a-z])""", markup) == []
     # What the server sends is written as text, never as markup.
     for writer in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
         assert writer not in page

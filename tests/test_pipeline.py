@@ -309,7 +309,7 @@ async def test_a_withheld_reply_reaches_the_page_by_its_rule() -> None:
     (turn,) = turns(call)
     assert (turn["lines"], turn["withheld"]) == ([ADVICE_REFUSAL], "medical_advice")
     page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
-    assert "a reply was withheld: ${message.withheld}" in page
+    assert "A reply was withheld: ${message.withheld}" in page
 
 
 class Broken(Withheld):

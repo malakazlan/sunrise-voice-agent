@@ -11,267 +11,295 @@
   @font-face { font-family: "Plex Mono"; font-weight: 400; font-style: normal; font-display: swap;
     src: url("/fonts/ibm-plex-mono-latin-400.woff2") format("woff2"); }
 
+  /* The console's colours (console/app/globals.css), so the two read as one product. */
   :root {
-    --ink: #121f25;
-    --ink-2: #47575e;
-    --ink-3: #5f6e74;
-    --paper: #f3f2ee;
-    --rule: #d9d8d1;
+    --background: #f4f6f7;
+    --foreground: #14232a;
     --card: #ffffff;
-    --night: #0b1d24;
-    --night-2: #13303a;
-    --on-night: #eef2f1;
-    --on-night-2: #8fa8af;
-    --petrol: #0b5c75;
-    --go: #17805a;
-    --live: #6fdcae;
-    --stop: #c9291c;
+    --primary: #0b5c75;
+    --primary-hover: #094c61;
+    --secondary: #e7f0f3;
+    --secondary-foreground: #0b4558;
+    --muted: #eef2f4;
+    --muted-foreground: #4a5a61;
+    --border: #dbe3e6;
+    --input: #c9d4d8;
+    --destructive: #b42318;
     --emergency: #a3440a;
-    --emergency-soft: #fbeee2;
+    --emergency-soft: #fdf1e7;
+    --sidebar: #0e2a33;
+    --sidebar-2: #123540;
+    --sidebar-foreground: #e3eef1;
+    --sidebar-muted: #9fbcc4;
+    --sidebar-primary: #7fd0e2;
+    --sidebar-accent: #17404c;
+    --live: #5fd3a2;
     --sans: "Plex Sans", ui-sans-serif, system-ui, sans-serif;
     --mono: "Plex Mono", ui-monospace, Consolas, monospace;
     --ease: cubic-bezier(.2, .7, .2, 1);
   }
 
   * { box-sizing: border-box; }
-  body { margin: 0; min-height: 100vh; font-family: var(--sans); color: var(--ink); background: var(--paper);
+  body { margin: 0; min-height: 100vh; font-family: var(--sans); color: var(--foreground); background: var(--background);
     -webkit-font-smoothing: antialiased; line-height: 1.5; display: flex; flex-direction: column; }
   button, input { font: inherit; color: inherit; }
-  :focus-visible { outline: 2px solid var(--petrol); outline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
   [hidden] { display: none !important; }
-  .label { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); }
+  .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
 
-  /* ---------- top ---------- */
-  .top { display: flex; align-items: center; gap: 14px; padding: 18px 32px; }
-  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; white-space: nowrap; }
-  .brand b { font-weight: 600; font-size: 15px; letter-spacing: -0.005em; }
-  .brand span { font-size: 13px; color: var(--ink-3); }
-  .sos { font-size: 13px; font-weight: 600; color: var(--emergency); white-space: nowrap; padding: 7px 0; border-bottom: 1.5px solid currentColor; }
+  /* ---------- top bar, as the console's ---------- */
+  .top { display: flex; align-items: center; gap: 16px; padding: 12px 28px; background: var(--card); border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 12px; margin-right: auto; }
+  .brand svg { width: 36px; height: 36px; border-radius: 9px; flex: none; }
+  .brand b { display: block; font-weight: 600; font-size: 15px; line-height: 1.25; }
+  .brand small { display: block; font-size: 12px; color: var(--muted-foreground); }
+  .hours { font-size: 13.5px; color: var(--muted-foreground); }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; padding: 2px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--muted); color: var(--muted-foreground); white-space: nowrap; }
+  .badge.sos { background: var(--emergency-soft); border-color: #f0cdb3; color: var(--emergency); font-weight: 600; font-size: 12.5px; padding: 6px 12px; }
+  .badge.info { background: var(--secondary); border-color: #c8dfe6; color: var(--secondary-foreground); }
   .sos .narrow { display: none; }
 
   /* ---------- layout ---------- */
-  main { flex: 1; display: grid; grid-template-columns: 372px minmax(0, 560px); gap: 72px; justify-content: center; align-items: center;
-    padding: 4px 32px 28px; min-height: 0; }
+  main { flex: 1; display: grid; grid-template-columns: 376px minmax(0, 620px); gap: 40px; justify-content: center; align-items: center; padding: 28px; min-height: 0; }
 
   /* ---------- the phone ---------- */
-  .phone { position: relative; height: min(660px, calc(100vh - 120px)); min-height: 580px; border-radius: 44px; background: var(--card); color: var(--ink);
-    box-shadow: 0 0 0 1px var(--rule), 0 0 0 9px #e9e8e3, 0 0 0 10px var(--rule), 0 40px 70px -36px rgba(18,31,37,.45);
-    display: flex; flex-direction: column; padding: 22px 30px 30px; overflow: hidden;
+  .phone { position: relative; height: min(680px, calc(100vh - 130px)); min-height: 600px; border-radius: 46px; background: var(--card); color: var(--foreground);
+    box-shadow: 0 0 0 1px var(--border), 0 0 0 9px #e9eef0, 0 0 0 10px var(--border), 0 36px 60px -32px rgba(14,42,51,.45);
+    display: flex; flex-direction: column; align-items: center; padding: 20px 28px 28px; text-align: center; overflow: hidden;
     transition: background .5s var(--ease), color .5s var(--ease); }
-  .ear { align-self: center; width: 54px; height: 5px; border-radius: 3px; background: #e2e1db; transition: background .5s var(--ease); }
-  .bar { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; min-height: 18px; }
-  .state { display: inline-flex; align-items: center; gap: 8px; }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
-  .route { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .ear { width: 54px; height: 5px; border-radius: 3px; background: #dfe6e9; transition: background .5s var(--ease); }
+  .bar { align-self: stretch; display: flex; justify-content: space-between; align-items: center; margin-top: 16px; min-height: 22px; }
+  .state { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--muted-foreground); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa9af; }
+  .route { font-family: var(--mono); font-size: 11.5px; color: var(--muted-foreground); }
 
-  .id { margin-top: 44px; }
-  .id .label { display: block; margin-bottom: 10px; min-height: 17px; }
-  .id h1 { margin: 0; font-size: 34px; line-height: 1.05; font-weight: 500; letter-spacing: -0.025em; }
-  .id p { margin: 10px 0 0; font-size: 15px; color: var(--ink-2); max-width: 28ch; transition: color .5s var(--ease); }
+  /* the picture: the console's logo, with rings that show the call's life */
+  .face { position: relative; margin-top: 44px; width: 112px; height: 112px; flex: none; transition: margin .5s var(--ease), width .5s var(--ease), height .5s var(--ease); }
+  .face .logo { position: relative; width: 100%; height: 100%; border-radius: 30%; display: block; box-shadow: 0 14px 28px -14px rgba(14,42,51,.55); }
+  .ring { position: absolute; inset: 0; border-radius: 30%; border: 1.5px solid var(--sidebar-primary); opacity: 0; }
+  .name { margin: 22px 0 0; font-size: 27px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.15; }
+  .sub { margin: 6px 0 0; font-size: 14.5px; color: var(--muted-foreground); max-width: 30ch; transition: color .5s var(--ease); }
+  .clock { margin-top: 14px; font-family: var(--mono); font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 
-  .clock { margin-top: 30px; font-family: var(--mono); font-size: 54px; line-height: 1; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-  .voice { margin-top: 22px; color: var(--on-night-2); }
-  .voice svg { display: block; width: 100%; height: 56px; overflow: visible; }
-  .voice path { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; vector-effect: non-scaling-stroke; transition: stroke .3s ease; }
-  .voice .who { display: flex; justify-content: space-between; margin-top: 8px; }
-  .voice .who span { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--on-night-2); transition: color .25s ease; }
+  /* the voice: a mirrored bar meter, and who is speaking */
+  .voice { margin-top: 20px; display: grid; justify-items: center; gap: 10px; color: var(--sidebar-muted); }
+  .voice svg { width: 228px; height: 56px; overflow: visible; }
+  .voice rect { fill: currentColor; transition: fill .25s ease; }
+  .speaker { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 500; padding: 4px 12px; border-radius: 999px;
+    background: rgba(227,238,241,.08); transition: color .25s ease, background .25s ease; }
+  .speaker i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
-  .spacer { flex: 1; min-height: 12px; }
+  .spacer { flex: 1; min-height: 14px; }
+  .field { align-self: stretch; text-align: left; }
+  .field label { display: block; font-size: 13.5px; font-weight: 500; margin-bottom: 7px; }
+  .field input { width: 100%; height: 50px; border-radius: 14px; border: 1px solid var(--input); background: #fff; padding: 0 16px; font-family: var(--mono); font-size: 15px; letter-spacing: .08em; }
+  .field input::placeholder { font-family: var(--sans); letter-spacing: 0; color: #7b8a90; }
+  .field input:focus { outline: 2px solid var(--primary); outline-offset: 1px; border-color: var(--primary); }
+  .err { margin: 8px 2px 0; font-size: 13px; color: var(--destructive); }
 
-  .field label { display: block; margin-bottom: 8px; }
-  .field input { width: 100%; height: 48px; border: 0; border-bottom: 1.5px solid var(--ink); border-radius: 0; background: transparent; padding: 0 2px;
-    font-family: var(--mono); font-size: 16px; letter-spacing: .1em; }
-  .field input::placeholder { font-family: var(--sans); letter-spacing: 0; color: var(--ink-3); font-size: 15px; }
-  .field input:focus { outline: 0; border-bottom-color: var(--petrol); box-shadow: 0 1.5px 0 var(--petrol); }
-  .err { margin: 10px 0 0; font-size: 13.5px; color: var(--stop); }
-
-  .keys { margin-top: 26px; display: flex; align-items: center; gap: 16px; }
-  .press { height: 64px; border: 0; border-radius: 32px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 12px;
-    font-weight: 600; font-size: 16px; letter-spacing: -0.005em; transition: transform .12s ease, filter .2s ease, background .3s ease; }
-  .press:hover { filter: brightness(1.06); }
+  .keys { align-self: stretch; margin-top: 14px; display: flex; gap: 12px; align-items: center; }
+  .press { height: 60px; border: 0; border-radius: 30px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 11px;
+    font-weight: 600; font-size: 16px; transition: transform .12s ease, background .2s ease; }
   .press:active { transform: scale(.97); }
-  .press.call { flex: 1; background: var(--go); color: #fff; }
-  .press.end { flex: 1; background: var(--stop); color: #fff; }
-  .press.quiet { width: 64px; flex: none; background: rgba(238,242,241,.1); color: var(--on-night); box-shadow: inset 0 0 0 1px rgba(238,242,241,.22); }
-  .press.quiet[aria-pressed="true"] { background: var(--on-night); color: var(--night); box-shadow: none; }
-  .more { margin-top: 16px; font-size: 13px; color: var(--ink-2); }
-  .more summary { cursor: pointer; list-style: none; display: inline-flex; gap: 8px; align-items: center; }
+  .press.call { flex: 1; background: var(--primary); color: #fff; box-shadow: 0 12px 24px -14px rgba(11,92,117,.9); }
+  .press.call:hover { background: var(--primary-hover); }
+  .press.end { flex: 1; background: var(--destructive); color: #fff; box-shadow: 0 12px 24px -14px rgba(180,35,24,.9); }
+  .press.end:hover { background: #9c1e14; }
+  .press.quiet { width: 60px; flex: none; background: var(--sidebar-accent); color: var(--sidebar-foreground); }
+  .press.quiet[aria-pressed="true"] { background: var(--sidebar-primary); color: var(--sidebar); }
+  .more { margin-top: 12px; font-size: 13px; color: var(--muted-foreground); align-self: stretch; text-align: left; }
+  .more summary { cursor: pointer; list-style: none; text-align: center; }
   .more summary::-webkit-details-marker { display: none; }
-  .more summary::after { content: "+"; font-family: var(--mono); color: var(--ink-3); }
-  .more[open] summary::after { content: "–"; }
-  .more label { display: flex; gap: 10px; align-items: flex-start; margin-top: 10px; }
-  .more input { width: 16px; height: 16px; margin-top: 3px; accent-color: var(--petrol); }
+  .more label { display: flex; gap: 9px; align-items: flex-start; margin-top: 8px; }
+  .more input { width: 15px; height: 15px; margin-top: 3px; accent-color: var(--primary); }
 
-  /* in a call the phone is dark */
-  body[data-live] .phone { background: linear-gradient(180deg, var(--night) 0%, var(--night-2) 140%); color: var(--on-night);
-    box-shadow: 0 0 0 1px #0b1d24, 0 0 0 9px #1a2b31, 0 0 0 10px #0b1d24, 0 40px 70px -36px rgba(18,31,37,.6); }
-  body[data-live] .ear { background: #24414b; }
-  body[data-live] .label, body[data-live] .route { color: var(--on-night-2); }
-  body[data-live] .id p { color: var(--on-night-2); }
+  /* calling and on the line: the screen takes the console sidebar's dark */
+  body[data-live] .phone { background: linear-gradient(180deg, var(--sidebar) 0%, var(--sidebar-2) 100%); color: var(--sidebar-foreground);
+    box-shadow: 0 0 0 1px #0a2028, 0 0 0 9px #183943, 0 0 0 10px #0a2028, 0 36px 60px -32px rgba(14,42,51,.7); }
+  body[data-live] .ear { background: #24505c; }
+  body[data-live] .state, body[data-live] .route, body[data-live] .sub { color: var(--sidebar-muted); }
   body[data-state="connecting"] .dot { background: #f1c453; animation: blink 1s infinite; }
-  body[data-state="live"] .dot { background: var(--live); box-shadow: 0 0 0 4px rgba(111,220,174,.16); }
-  body[data-voice="assistant"] .voice { color: var(--on-night); }
+  body[data-state="connecting"] .ring { animation: ring 2.2s var(--ease) infinite; }
+  body[data-state="connecting"] .ring + .ring { animation-delay: 1.1s; }
+  body[data-state="live"] .dot { background: var(--live); box-shadow: 0 0 0 4px rgba(95,211,162,.18); }
+  body[data-state="live"] .face { width: 72px; height: 72px; margin-top: 26px; }
+  body[data-voice="assistant"] .face .ring:first-child { animation: talk 1.1s ease-in-out infinite alternate; }
+  body[data-voice="assistant"] .voice { color: var(--sidebar-primary); }
   body[data-voice="you"] .voice { color: var(--live); }
-  body[data-voice="assistant"] .who .them, body[data-voice="you"] .who .me { color: currentColor; }
-  body[data-state="emergency"] .phone { background: var(--emergency-soft); box-shadow: 0 0 0 1px #e6c4a6, 0 0 0 9px #f3dcc7, 0 0 0 10px #e6c4a6, 0 40px 70px -36px rgba(163,68,10,.4); }
-  body[data-state="emergency"] .id h1 { color: var(--emergency); font-weight: 600; }
-  body[data-state="emergency"] .ear { background: #e6c4a6; }
+  body[data-voice="assistant"] .speaker { background: rgba(127,208,226,.12); }
+  body[data-voice="you"] .speaker { background: rgba(95,211,162,.12); }
+  body[data-state="emergency"] .phone { background: var(--emergency-soft); box-shadow: 0 0 0 1px #f0cdb3, 0 0 0 9px #f8e2d0, 0 0 0 10px #f0cdb3, 0 36px 60px -32px rgba(163,68,10,.4); }
+  body[data-state="emergency"] .name { color: var(--emergency); }
+  body[data-state="emergency"] .ear { background: #f0cdb3; }
+  body[data-state="unavailable"] .face { filter: grayscale(1); opacity: .55; }
 
   @keyframes blink { 50% { opacity: .3; } }
-  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes ring { 0% { transform: scale(1); opacity: .65; } 100% { transform: scale(1.7); opacity: 0; } }
+  @keyframes talk { from { transform: scale(1.06); opacity: .35; } to { transform: scale(1.2); opacity: .8; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
-  /* ---------- beside the phone: no card, type on paper ---------- */
-  .side { align-self: stretch; display: flex; flex-direction: column; justify-content: center; min-height: 0; padding: 8px 0; }
-  .intro { animation: rise .5s var(--ease) both; }
-  .intro section { padding: 22px 0; border-top: 1px solid var(--rule); display: grid; grid-template-columns: 130px 1fr; gap: 20px; }
-  .intro section:last-child { border-bottom: 1px solid var(--rule); }
-  .intro ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; font-size: 17px; letter-spacing: -0.005em; }
-  .intro p { margin: 0; font-size: 15.5px; color: var(--ink-2); max-width: 44ch; }
-  .intro p b { color: var(--ink); font-weight: 500; }
+  /* ---------- beside the phone: the console's cards ---------- */
+  .side { align-self: center; display: grid; min-width: 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 24px; overflow: hidden; box-shadow: 0 1px 2px rgba(20,35,42,.03); animation: rise .4s var(--ease) both; }
+  .head { display: flex; align-items: center; gap: 12px; padding: 18px 22px; border-bottom: 1px solid var(--border); }
+  .head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .head p { margin: 2px 0 0; font-size: 13px; color: var(--muted-foreground); }
+  .head .last { margin-left: auto; }
+  .toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted-foreground); cursor: pointer; white-space: nowrap; }
+  .toggle input { accent-color: var(--primary); width: 15px; height: 15px; }
 
-  .talk { display: flex; flex-direction: column; height: min(660px, calc(100vh - 120px)); min-height: 580px; animation: rise .5s var(--ease) both; }
-  .talk-head { display: flex; align-items: baseline; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--ink); }
-  .talk-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
-  .talk-head p { margin: 0; font-size: 13px; color: var(--ink-3); }
-  .toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
-  .toggle input { accent-color: var(--petrol); width: 15px; height: 15px; }
-  .script { flex: 1; overflow-y: auto; padding: 6px 0 20px 16px; margin-left: -16px; scrollbar-width: thin; }
+  .list { margin: 0; }
+  .list > div { display: grid; grid-template-columns: 140px 1fr; gap: 16px; padding: 15px 22px; border-bottom: 1px solid var(--border); }
+  .list > div:last-child { border-bottom: 0; }
+  .list dt { font-size: 13.5px; color: var(--muted-foreground); }
+  .list dd { margin: 0; font-size: 15px; }
+  .list ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 5px; }
+  .list b { font-weight: 600; }
 
-  .turn { display: grid; grid-template-columns: 96px 1fr; gap: 0 18px; padding: 14px 0; border-bottom: 1px solid var(--rule); animation: rise .35s var(--ease) both; }
-  .turn .label { padding-top: 4px; }
-  .turn .label small { display: block; margin-top: 4px; letter-spacing: .04em; text-transform: none; font-size: 10.5px; color: var(--ink-3); }
-  .turn p { margin: 0; font-size: 17px; line-height: 1.5; letter-spacing: -0.004em; color: var(--ink); }
-  .turn p + p { margin-top: 6px; }
-  .turn p.none { color: var(--ink-3); font-size: 14px; }
-  .turn.you p { font-size: 15.5px; color: var(--ink-2); }
-  .turn.you .label { color: var(--petrol); }
-  .turn.now { position: relative; }
-  .turn.now::before { content: ""; position: absolute; left: -16px; top: 16px; bottom: 16px; width: 2px; background: var(--go); border-radius: 2px; }
-  .turn.now p { font-weight: 500; }
-  .redact { display: inline-block; width: 132px; height: 15px; border-radius: 3px; background: var(--ink); vertical-align: -2px; margin-right: 10px; }
-  .turn.you.private p { font-size: 14px; color: var(--ink-3); }
-  .aside { margin-top: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); display: none; gap: 2px 14px; flex-wrap: wrap; }
-  .aside b { color: var(--ink); font-weight: 400; }
-  .show-timings .aside { display: flex; }
-  .cue { padding: 10px 0 10px 114px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--rule); }
-  .cue.sos { color: var(--emergency); }
-  .cue.staff { color: var(--petrol); }
+  .talk { display: flex; flex-direction: column; height: min(680px, calc(100vh - 130px)); min-height: 600px; }
+  .script { flex: 1; overflow-y: auto; scrollbar-width: thin; }
+  .turn { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 0 13px; padding: 14px 22px; border-bottom: 1px solid var(--border); animation: rise .3s var(--ease) both; }
+  .pic { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-size: 11px; font-weight: 600; margin-top: 1px; }
+  .pic svg { width: 30px; height: 30px; border-radius: 9px; display: block; }
+  .turn.you .pic { background: var(--secondary); color: var(--secondary-foreground); }
+  .who { font-size: 12.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .who b { font-weight: 600; color: var(--primary); }
+  .turn.you .who b { color: var(--foreground); }
+  .turn p { margin: 2px 0 0; font-size: 15.5px; line-height: 1.5; overflow-wrap: anywhere; }
+  .turn p.none { color: var(--muted-foreground); font-size: 14px; }
+  .turn.you p { color: #2c3d44; }
+  .turn.now { background: #f6fafb; box-shadow: inset 3px 0 0 var(--primary); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-family: var(--mono); font-size: 12.5px; padding: 2px 9px; border-radius: 8px; border: 1px solid var(--border); background: var(--muted); color: var(--muted-foreground); }
+  .chip svg { width: 13px; height: 13px; flex: none; }
+  .timing { display: none; margin-top: 7px; font-family: var(--mono); font-size: 11.5px; color: var(--muted-foreground); gap: 2px 12px; flex-wrap: wrap; }
+  .timing b { color: var(--foreground); font-weight: 400; }
+  .show-timings .timing { display: flex; }
+  .cue { padding: 9px 22px 9px 65px; font-size: 13px; color: var(--muted-foreground); border-bottom: 1px solid var(--border); background: #fafbfc; }
+  .cue.sos { color: var(--emergency); background: var(--emergency-soft); font-weight: 600; }
+  .cue.staff { color: var(--secondary-foreground); background: var(--secondary); }
+  .foot { display: flex; gap: 6px 24px; flex-wrap: wrap; padding: 12px 22px; border-top: 1px solid var(--border); background: #fafbfc; font-size: 12.5px; color: var(--muted-foreground); }
+  .foot b { font-family: var(--mono); font-weight: 400; color: var(--foreground); margin-left: 6px; }
 
-  .facts { display: flex; gap: 6px 28px; margin: 0; padding-top: 12px; border-top: 1px solid var(--ink); flex-wrap: wrap; }
-  .facts div { display: flex; gap: 8px; align-items: baseline; }
-  .facts dd { margin: 0; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
-
-  @media (max-width: 980px) {
-    .top { padding: 14px 20px; }
-    .brand span { display: none; }
+  @media (max-width: 1000px) {
+    .top { padding: 10px 16px; }
+    .hours { display: none; }
     .sos .wide { display: none; } .sos .narrow { display: inline; }
-    main { grid-template-columns: minmax(0, 372px); gap: 28px; padding: 14px 24px 24px; align-items: start; align-content: start; }
-    .side { align-self: start; justify-content: flex-start; }
-    .phone { height: auto; min-height: 560px; }
+    main { grid-template-columns: minmax(0, 400px); padding: 20px 18px; gap: 20px; align-items: start; align-content: start; }
+    .phone { height: auto; min-height: 580px; }
+    .side { align-self: start; }
     .talk { height: auto; min-height: 0; }
-    .script { overflow: visible; padding-left: 0; margin-left: 0; }
-    .turn.now::before { left: -10px; }
-    .intro section { grid-template-columns: 1fr; gap: 8px; }
-    .turn { grid-template-columns: 1fr; gap: 4px; }
-    .cue { padding-left: 0; }
-    .talk-head { flex-wrap: wrap; }
-    .talk-head p { display: none; }
+    .script { overflow: visible; }
+    .list > div { grid-template-columns: 1fr; gap: 4px; }
+    .head p { display: none; }
   }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
 <body data-state="idle">
 
+<!-- The console's logo (console/app/icon.svg), and the mark of a turn kept from the assistant. -->
+<svg class="defs" aria-hidden="true">
+  <symbol id="logo" viewBox="0 0 32 32">
+    <rect width="32" height="32" fill="#0e2a33"/>
+    <path d="M8 21a8 8 0 0 1 16 0" fill="none" stroke="#7fd0e2" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M6 25h20" stroke="#7fd0e2" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M16 7v4M9.5 10l2 2.5M22.5 10l-2 2.5" stroke="#7fd0e2" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="logo-lit" viewBox="0 0 32 32">
+    <rect width="32" height="32" fill="#17404c"/>
+    <path d="M8 21a8 8 0 0 1 16 0" fill="none" stroke="#7fd0e2" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M6 25h20" stroke="#7fd0e2" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M16 7v4M9.5 10l2 2.5M22.5 10l-2 2.5" stroke="#7fd0e2" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="kept" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 3l18 18"/>
+    <path d="M10.6 6.2A9.7 9.7 0 0 1 12 6c5 0 8.5 4 9.5 6a13 13 0 0 1-2.8 3.5M6.5 7.6A13 13 0 0 0 2.5 12c1 2 4.5 6 9.5 6 1.3 0 2.5-.3 3.6-.7"/>
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>
+  </symbol>
+</svg>
+<template id="logo-pic"><svg aria-hidden="true"><use href="#logo"/></svg></template>
+<template id="kept-chip"><span class="chip"><svg aria-hidden="true"><use href="#kept"/></svg>not passed to the assistant</span></template>
+
 <header class="top">
-  <div class="brand"><b>Sunrise Family Clinic</b><span>Phone assistant · demo line</span></div>
-  <span class="sos"><span class="wide">In an emergency, hang up and call 911</span><span class="narrow">Emergency: call 911</span></span>
+  <div class="brand">
+    <svg aria-hidden="true"><use href="#logo"/></svg>
+    <div><b>Sunrise Family Clinic</b><small>Phone assistant</small></div>
+  </div>
+  <span class="hours">Monday to Friday, 9:00 to 17:00 Eastern</span>
+  <span class="badge sos">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 10v4M12 17v.01"/></svg>
+    <span class="wide">Emergency? Call 911</span><span class="narrow">Call 911</span>
+  </span>
 </header>
 
 <main>
   <section class="phone" aria-label="The call">
     <div class="ear" aria-hidden="true"></div>
     <div class="bar">
-      <span class="state label" role="status"><span class="dot" aria-hidden="true"></span><span id="status">Ready</span></span>
+      <span class="state" role="status"><span class="dot" aria-hidden="true"></span><span id="status">Ready</span></span>
       <span class="route" id="route" data-show="live"></span>
     </div>
 
-    <div class="id">
-      <span class="label" id="eyebrow">Sunrise Family Clinic</span>
-      <h1 id="name">Front desk</h1>
-      <p id="sub">Talk to the clinic's phone assistant.</p>
+    <div class="face" aria-hidden="true">
+      <span class="ring"></span><span class="ring"></span>
+      <svg class="logo"><use id="face" href="#logo"/></svg>
     </div>
+    <h1 class="name" id="name">Front desk</h1>
+    <p class="sub" id="sub">Sunrise Family Clinic · phone assistant</p>
 
-    <div class="clock" id="clock" data-show="connecting live" aria-label="Call time">00:00</div>
-    <div class="voice" data-show="connecting live" aria-hidden="true">
-      <svg viewBox="0 0 300 56" preserveAspectRatio="none"><path id="wave" d="M0 28 L300 28"/></svg>
-      <div class="who"><span class="them">Assistant</span><span class="me">You</span></div>
+    <div class="clock" id="clock" data-show="live" aria-label="Call time">00:00</div>
+    <div class="voice" data-show="live" aria-hidden="true">
+      <svg viewBox="0 0 228 56" id="meter"><rect x="0" y="26" width="4" height="4" rx="2"/></svg>
+      <span class="speaker"><i></i><span id="speaker">On the line</span></span>
     </div>
 
     <div class="spacer"></div>
 
     <div class="field" data-show="idle">
-      <label class="label" for="token">Access code</label>
+      <label for="token">Access code</label>
       <input id="token" type="password" autocomplete="off" placeholder="Paste the code you were given">
       <p class="err" id="error" role="alert" hidden></p>
     </div>
 
     <div class="keys">
       <button class="press quiet" type="button" id="text" aria-pressed="true" aria-label="Show the conversation as text" data-show="connecting live">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
       </button>
       <button class="press call" type="button" id="call" data-show="idle ended emergency unavailable">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/></svg>
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/></svg>
         <span id="callLabel">Call</span>
       </button>
       <button class="press end" type="button" id="hangup" data-show="connecting live">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 14c5-5 13-5 18 0l-2.2 2.6-3.6-1.4v-2.4a9 9 0 0 0-6.4 0v2.4l-3.6 1.4L3 14z"/></svg>
+        <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 14c5-5 13-5 18 0l-2.2 2.6-3.6-1.4v-2.4a9 9 0 0 0-6.4 0v2.4l-3.6 1.4L3 14z"/></svg>
         End call
       </button>
     </div>
 
     <details class="more" data-show="idle">
-      <summary>Trouble connecting</summary>
+      <summary>Trouble connecting?</summary>
       <label><input id="relay" type="checkbox"><span>Send the call through the clinic's relay only. Try it if the call connects but you hear nothing.</span></label>
     </details>
   </section>
 
   <div class="side">
-    <div class="intro" id="intro">
-      <section>
-        <span class="label">You can ask for</span>
-        <ul>
-          <li>A prescription refill</li>
-          <li>Your next appointment, a lab status or your balance</li>
-          <li>A first visit as a new patient</li>
-          <li>A message for your doctor</li>
-        </ul>
-      </section>
-      <section>
-        <span class="label">It will ask you</span>
-        <p>Your <b>full name and date of birth</b>, then the <b>last four digits of your Social Security number</b>. Code checks those digits. The AI model never receives them.</p>
-      </section>
-      <section>
-        <span class="label">Hours</span>
-        <p>Monday to Friday, 9:00 to 17:00 Eastern. Outside those hours it takes a message.</p>
-      </section>
-      <section>
-        <span class="label">Demo line</span>
-        <p>Synthetic patients only. Use made-up details. You need a microphone.</p>
-      </section>
-    </div>
+    <section class="card" id="intro">
+      <div class="head"><div><h2>Before you call</h2><p>What the assistant can do, and what it will ask.</p></div><span class="badge info last">Demo line</span></div>
+      <dl class="list">
+        <div><dt>You can ask for</dt><dd><ul><li>A prescription refill</li><li>Your next appointment, a lab status or your balance</li><li>A first visit as a new patient</li><li>A message for your doctor</li></ul></dd></div>
+        <div><dt>It will ask you</dt><dd>Your <b>full name and date of birth</b>, then the <b>last four digits of your Social Security number</b>. Code checks those digits. The AI model never receives them.</dd></div>
+        <div><dt>Hours</dt><dd>Monday to Friday, 9:00 to 17:00 Eastern. Outside those hours it takes a message.</dd></div>
+        <div><dt>Demo line</dt><dd>Synthetic patients only. Use made-up details. You need a microphone.</dd></div>
+      </dl>
+    </section>
 
-    <section class="talk" id="talk" aria-label="The conversation as text" hidden>
-      <div class="talk-head">
-        <h2>Conversation</h2>
-        <p>Your words appear as the assistant received them.</p>
-        <label class="toggle"><input type="checkbox" id="timings"> Timings</label>
+    <section class="card talk" id="talk" aria-label="The conversation as text" hidden>
+      <div class="head">
+        <div><h2>Conversation</h2><p>Your words appear as the assistant received them.</p></div>
+        <label class="toggle last"><input type="checkbox" id="timings"> Timings</label>
       </div>
       <div class="script" id="script"></div>
-      <dl class="facts">
-        <div><dt class="label">State</dt><dd id="state">idle</dd></div>
-        <div><dt class="label">Route</dt><dd id="candidate">none</dd></div>
-        <div><dt class="label">Ended</dt><dd id="ended">-</dd></div>
-      </dl>
+      <div class="foot"><span>State<b id="state">idle</b></span><span>Route<b id="candidate">none</b></span><span>Ended<b id="ended">-</b></span></div>
     </section>
   </div>
 </main>
@@ -295,15 +323,15 @@
   // What the caller is told when the clinic has switched the assistant off.
   const UNAVAILABLE = "The clinic's phone assistant is unavailable right now. Please call the front desk. If this is an emergency, call 911.";
 
-  // Each view of the phone: status, the small line above the name, the name, the line below.
+  // Each view of the phone: the status, the name under the picture, the line below it.
   const VIEWS = {
-    idle: ["Ready", "Sunrise Family Clinic", "Front desk", "Talk to the clinic's phone assistant."],
-    connecting: ["Calling", "Calling", "Front desk", "Connecting."],
-    live: ["On the line", "On the line with", "Front desk", ""],
-    ended: ["Call ended", "", "Call ended", ""],
-    emergency: ["Call ended", "If this is an emergency", "Call 911 now",
+    idle: ["Ready", "Front desk", "Sunrise Family Clinic · phone assistant"],
+    connecting: ["Calling", "Front desk", "Calling."],
+    live: ["On the line", "Front desk", ""],
+    ended: ["Call ended", "Call ended", ""],
+    emergency: ["Call ended", "Call 911 now",
       "The assistant cannot help in an emergency. Hang up and dial 911, or go to the nearest emergency room."],
-    unavailable: ["Unavailable", "Sunrise Family Clinic", "Not available right now", UNAVAILABLE],
+    unavailable: ["Unavailable", "Not available right now", UNAVAILABLE],
   };
   // Why a call ended, in the caller's words, by the server's reason.
   const REASONS = {
@@ -322,14 +350,15 @@
   };
 
   const view = (state, over = {}) => {
-    const [status, eyebrow, name, sub] = VIEWS[state];
+    const [status, name, sub] = VIEWS[state];
+    const live = state === "connecting" || state === "live";
     document.body.dataset.state = state;
-    document.body.toggleAttribute("data-live", state === "connecting" || state === "live");
+    document.body.toggleAttribute("data-live", live);
+    el("face").setAttribute("href", live ? "#logo-lit" : "#logo");
     document.querySelectorAll("[data-show]").forEach((node) => {
       node.toggleAttribute("hidden", !node.dataset.show.split(" ").includes(state));
     });
     show("status", status);
-    show("eyebrow", over.eyebrow ?? eyebrow);
     show("name", name);
     const line = over.sub ?? sub;
     show("sub", line);
@@ -408,31 +437,50 @@
     return minutes ? `${minutes} min ${seconds % 60} s` : `${seconds} s`;
   };
 
-  // ---------- the voice line: the two audio levels, the assistant's and the caller's ----------
+  // ---------- the voice meter: the live audio, the assistant's or the caller's ----------
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const QUIET = 0.02;
+  const QUIET = 0.02;        // below this level nobody is speaking
+  const HOLD_MS = 450;       // a speaker stays shown this long into a pause
+  const EACH_SIDE = 14;      // bars on each side of the middle one
+  const SPEAKERS = { assistant: "Assistant speaking", you: "Listening to you", "": "On the line" };
   let sound = null;
   let meters = {};
   let drawing = null;
-  let height = 0;
-  let phase = 0;
+  let voice = "";
+  let heardAt = 0;
 
-  // A stream's level, 0 to 1: the root mean square of its samples. Read only, never played.
+  // The bars, made from the one in the page: the middle bar is the lowest band, the edges the
+  // highest, so speech swells from the centre.
+  const bars = [];
+  for (let index = 0; index <= EACH_SIDE * 2; index += 1) {
+    const rect = index ? el("meter").firstElementChild.cloneNode() : el("meter").firstElementChild;
+    rect.setAttribute("x", String(index * 8));
+    el("meter").append(rect);
+    bars.push({ rect, away: Math.abs(index - EACH_SIDE), value: 0 });
+  }
+
+  // One stream's level (0 to 1, the root mean square of its samples) and its frequency bands.
+  // Read only: never played, never sent anywhere.
   const meter = (stream) => {
     const source = sound.createMediaStreamSource(stream);
     const analyser = sound.createAnalyser();
     analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
     source.connect(analyser);
     const samples = new Uint8Array(analyser.fftSize);
-    return () => {
-      analyser.getByteTimeDomainData(samples);
-      let sum = 0;
-      for (const sample of samples) sum += ((sample - 128) / 128) ** 2;
-      return Math.sqrt(sum / samples.length);
+    const bands = new Uint8Array(analyser.frequencyBinCount);
+    return {
+      level: () => {
+        analyser.getByteTimeDomainData(samples);
+        let sum = 0;
+        for (const sample of samples) sum += ((sample - 128) / 128) ** 2;
+        return Math.sqrt(sum / samples.length);
+      },
+      bands: () => { analyser.getByteFrequencyData(bands); return bands; },
     };
   };
 
-  // The line is an extra: if the browser has no audio graph, the call goes on without it.
+  // The meter is an extra: if the browser has no audio graph, the call goes on without it.
   const listenTo = (who, stream) => {
     try {
       const Sound = window.AudioContext || window.webkitAudioContext;
@@ -446,32 +494,39 @@
     }
   };
 
+  const speaking = (who) => {
+    if (voice === who) return;
+    voice = who;
+    document.body.dataset.voice = who;
+    show("speaker", SPEAKERS[who]);
+  };
+
   const draw = () => {
-    const them = meters.them ? meters.them() : 0;
-    const me = meters.me ? meters.me() : 0;
-    const voice = them > QUIET ? "assistant" : me > QUIET ? "you" : "";
-    if (document.body.dataset.voice !== voice) document.body.dataset.voice = voice;
-    const target = Math.min(24, Math.max(them, me) * 260);
-    height += (target - height) * 0.18;
-    if (!still) phase += 0.055;
-    let path = "";
-    for (let x = 0; x <= 300; x += 3) {
-      const envelope = Math.sin(Math.PI * x / 300) ** 1.4;
-      const y = 28 + envelope * height * (Math.sin(x * 0.085 + phase * 2.2) * 0.55
-        + Math.sin(x * 0.21 - phase * 3.1) * 0.3 + Math.sin(x * 0.047 + phase) * 0.35);
-      path += `${x ? "L" : "M"}${x} ${y.toFixed(2)} `;
-    }
-    el("wave").setAttribute("d", path);
-    drawing = still ? setTimeout(draw, 250) : requestAnimationFrame(draw);
+    const now = performance.now();
+    const them = meters.them ? meters.them.level() : 0;
+    const me = meters.me ? meters.me.level() : 0;
+    const heard = them > QUIET ? "assistant" : me > QUIET ? "you" : "";
+    if (heard) { heardAt = now; speaking(heard); } else if (now - heardAt > HOLD_MS) speaking("");
+    const source = heard === "assistant" ? meters.them : heard === "you" ? meters.me : null;
+    const bands = source ? source.bands() : null;
+    bars.forEach((bar) => {
+      const target = bands ? (bands[2 + bar.away * 2] / 255) ** 1.4 * (1 - 0.3 * bar.away / EACH_SIDE) : 0;
+      bar.value += (target - bar.value) * 0.35;
+      const height = Math.max(4, bar.value * 54);
+      bar.rect.setAttribute("y", (28 - height / 2).toFixed(1));
+      bar.rect.setAttribute("height", height.toFixed(1));
+    });
+    drawing = still ? setTimeout(draw, 200) : requestAnimationFrame(draw);
   };
 
   const stopDrawing = () => {
     if (still) clearTimeout(drawing); else cancelAnimationFrame(drawing);
     drawing = null;
     meters = {};
-    height = 0;
+    voice = "";
     delete document.body.dataset.voice;
-    el("wave").setAttribute("d", "M0 28 L300 28");
+    show("speaker", SPEAKERS[""]);
+    bars.forEach((bar) => { bar.value = 0; bar.rect.setAttribute("y", "26"); bar.rect.setAttribute("height", "4"); });
     if (sound) sound.close().catch(() => {});
     sound = null;
   };
@@ -484,6 +539,8 @@
     if (text !== undefined) made.textContent = text;
     return made;
   };
+  // A copy of one of the page's own templates: the logo, the mark of a turn kept private.
+  const stamp = (id) => el(id).content.firstElementChild.cloneNode(true);
 
   const ms = (value) => (typeof value === "number" ? String(value) : "–");
 
@@ -497,14 +554,19 @@
     el("script").scrollTop = el("script").scrollHeight;
   };
 
-  const cue = (text, kind = "") => put(node("div", `cue ${kind}`.trim(), `[ ${text} ]`));
+  const cue = (text, kind = "") => put(node("div", `cue ${kind}`.trim(), text));
 
-  const turnRow = (who, kind, notes) => {
+  // One line of the conversation: the picture, who spoke, their badges, and room for the words.
+  const turnRow = (who, kind, badges) => {
     const row = node("div", `turn ${kind}`.trim());
-    const label = node("span", "label", who);
-    notes.forEach((note) => label.append(node("small", "", note)));
+    const picture = node("span", "pic");
+    if (who === "You") picture.textContent = "You"; else picture.append(stamp("logo-pic"));
     const words = node("div");
-    row.append(label, words);
+    const head = node("div", "who");
+    head.append(node("b", "", who));
+    badges.forEach(([text, tone]) => head.append(node("span", `badge ${tone}`.trim(), text)));
+    words.append(head);
+    row.append(picture, words);
     return [row, words];
   };
 
@@ -517,40 +579,33 @@
 
   const addTurn = (message) => {
     if (message.type === "turn") {
-      const given = typeof message.shown === "string";
-      const [row, words] = turnRow("You", given ? "you" : "you private", []);
-      if (given) {
-        words.append(node("p", "", message.shown));
-      } else {
-        const kept = node("p");
-        kept.append(node("span", "redact"), "kept private, not passed to the assistant");
-        words.append(kept);
-      }
+      const [row, words] = turnRow("You", "you", []);
+      words.append(typeof message.shown === "string" ? node("p", "", message.shown) : stamp("kept-chip"));
       put(row);
     }
     const timings = message.type === "turn" ? (message.timings || {}) : null;
-    const notes = [];
+    const badges = [];
     // No first token: no model was asked, the line is the system's own.
-    if (!timings || typeof timings.first_token_ms !== "number") notes.push("scripted line");
-    if (timings && timings.tool_rounds > 0) notes.push(`${timings.tool_rounds} tool step${timings.tool_rounds === 1 ? "" : "s"}`);
-    const [row, words] = turnRow("Assistant", "now", notes);
+    if (!timings || typeof timings.first_token_ms !== "number") badges.push(["scripted line", ""]);
+    if (timings && timings.tool_rounds > 0) badges.push([`${timings.tool_rounds} tool step${timings.tool_rounds === 1 ? "" : "s"}`, "info"]);
+    const [row, words] = turnRow("Assistant", "now", badges);
     const lines = Array.isArray(message.lines) ? message.lines : [];
     if (lines.length === 0) words.append(node("p", "none", "(no reply)"));
     lines.forEach((text) => words.append(node("p", "", String(text))));
     if (timings) {
-      const aside = node("div", "aside");
+      const timing = node("div", "timing");
       const [heard, figure] = stage("first audio", "–");
-      aside.append(
+      timing.append(
         stage("silence wait", ms(timings.vad_ms))[0], stage("transcript", ms(timings.stt_ms))[0],
         stage("first token", ms(timings.first_token_ms))[0], stage("last token", ms(timings.last_token_ms))[0],
         heard, stage("turn done", ms(timings.total_ms))[0], node("span", "", "ms after you stopped speaking"));
-      words.append(aside);
+      words.append(timing);
       firstAudio.set(message.turn, figure);
     }
     document.querySelectorAll(".turn.now").forEach((earlier) => earlier.classList.remove("now"));
     put(row);
-    if (typeof message.withheld === "string") cue(`a reply was withheld: ${message.withheld}`);
-    if (message.hand_off === true) cue("passed to the clinic's staff", "staff");
+    if (typeof message.withheld === "string") cue(`A reply was withheld: ${message.withheld}`);
+    if (message.hand_off === true) cue("Passed to the clinic's staff", "staff");
   };
 
   const showFirstAudio = (message) => {
@@ -575,7 +630,7 @@
     stopDrawing();
   };
 
-  // The phone after a call: the emergency view, or why it ended and how long it took.
+  // The phone after a call: the emergency view, or how long it took and why it ended.
   const finish = (otherwise) => {
     const took = lasted();
     hangUp();
@@ -583,7 +638,7 @@
     document.querySelectorAll(".turn.now").forEach((last) => last.classList.remove("now"));
     if (told && told.reason === "emergency") return view("emergency");
     const why = told ? (told.hint || REASONS[told.reason] || `The call ended: ${told.reason}.`) : otherwise;
-    view("ended", { eyebrow: took, sub: why });
+    view("ended", { sub: took ? `${took} · ${why}` : why });
   };
 
   const call = async () => {
@@ -605,7 +660,7 @@
       show("state", "asking for the microphone");
       show("sub", "Allow the microphone when your browser asks.");
       mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-      show("sub", "Connecting.");
+      show("sub", "Calling.");
       listenTo("me", mic);
       if (drawing === null) draw();
 
@@ -628,14 +683,14 @@
         if (!message) return;
         if (["opening", "turn", "said"].includes(message.type)) addTurn(message);
         if (message.type === "first_audio") showFirstAudio(message);
-        if (message.type === "interrupted") cue("you interrupted the assistant");
+        if (message.type === "interrupted") cue("You interrupted the assistant");
         if (message.type === "ended") {
           // The server's last message, kept on the page when the connection then drops.
           const ended = typeof message.hint === "string"
             ? `${message.reason}: ${message.hint}`
             : String(message.reason);
           show("ended", ended);
-          cue(`the call ended: ${ended}`, message.reason === "emergency" ? "sos" : "");
+          cue(`The call ended: ${ended}`, message.reason === "emergency" ? "sos" : "");
           told = { reason: String(message.reason), hint: typeof message.hint === "string" ? message.hint : null };
           // The last line has been played by now; the phone hangs up a moment later.
           closeTimer = setTimeout(() => finish(""), 1200);
