@@ -936,6 +936,28 @@ and demo when set).
   - The summaries count events and rows, not their causes: a guard block's reason is its rule
     name, nothing of what was said.
 
+### Admin console
+
+`console/` is the admin console: a separate Next.js app (TypeScript, Tailwind, shadcn/ui,
+TanStack Query, Recharts) in its own container, served at its own origin. It is a thin client of
+`/admin/api/*`: it holds no data, no secret and no business rule, and shows only what the API has
+already masked and audited. Pages: live calls (from the API's stream), call history and call
+detail, requests, appointments and slots, the audit log with the chain check, guardrails,
+metrics, and sign-in. How to run it, its rules and its tests are in `console/README.md`.
+
+- One setting, `ADMIN_API_ORIGIN` (the admin API's exact origin), read when a request is served:
+  one image for every environment. Without a valid one the console answers 503 to everything.
+- Every response carries a Content-Security-Policy with a fresh nonce (`connect-src` is the
+  console itself and the admin API only), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` and a `Permissions-Policy` denying camera, microphone and
+  geolocation. Fonts are bundled; nothing is loaded from another origin.
+- Compose service `console`: loopback port `${CONSOLE_HOST_PORT:-3000}`, receives only
+  `ADMIN_API_ORIGIN`, depends on nothing; nothing depends on it. Set both in the shell, not in
+  `.env`:
+  `ADMIN_API_ORIGIN=https://admin.example.org docker compose --env-file .env -f deploy/docker-compose.yml up -d console`.
+- The session, anti-forgery and CORS routes it signs in with come with the admin API's session
+  slice; until then it runs against its own mock API (`npm run dev:mock`).
+
 ### Output guard
 
 Every sentence of the model's own answer is checked in code before it is returned
