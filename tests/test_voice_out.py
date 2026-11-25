@@ -14,11 +14,13 @@ import pytest
 from conftest import VOICE_SECRETS, offline_settings
 from pipecat.frames.frames import (
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     TextFrame,
     TTSSpeakFrame,
     TTSTextFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.tests.utils import SleepFrame, run_test
 from speech_fakes import (
@@ -27,6 +29,7 @@ from speech_fakes import (
     FakeVoice,
     agent_call,
     caller_says,
+    caller_talks_over,
     settle,
     until,
 )
@@ -190,7 +193,7 @@ async def test_interruption_drops_the_rest(offline_deps: Deps) -> None:
 
         # Two words in, the caller speaks: speech stops, the second line never plays.
         await voice.start(2)
-        await call.send(VADUserStartedSpeakingFrame())
+        await call.send(*caller_talks_over())
         await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
         assert voice.waiting == 0
         await call.send(*caller_says("Actually, I have another question.")[1:])
@@ -215,6 +218,48 @@ async def test_interruption_drops_the_rest(offline_deps: Deps) -> None:
     assert {"type": "interrupted", "lines": 2} in call.messages()
 
 
+async def test_only_words_interrupt(offline_deps: Deps) -> None:
+    model = ScriptedModel(
+        says("One two three four five six seven eight."), says("Yes?"), says("Go on.")
+    )
+    time = FakeTime()
+    processor, playback = agent_call(new_call_id(), offline_deps, model, time)
+    voice = FakeVoice(autoplay=False)
+
+    async with CallPipeline(processor, playback, voice) as call:
+        processor.connected()
+        await until(lambda: voice.waiting == 1, "the greeting")
+        await voice.play_all()
+        await call.send(*caller_says("Tell me a number."))
+        await until(lambda: voice.waiting == 1, "the reply")
+        await voice.start(2)
+
+        # A sound is not the caller speaking: a noise in the room cuts nothing.
+        await call.send(VADUserStartedSpeakingFrame(), VADUserStoppedSpeakingFrame())
+        await settle()
+        assert call.frames(InterruptionFrame) == []
+        # Nor is one word heard so far, which a noise can be mistaken for.
+        await call.send(
+            VADUserStartedSpeakingFrame(),
+            InterimTranscriptionFrame("uh", "", "2026-11-24T15:00:00Z"),
+        )
+        await settle()
+        assert call.frames(InterruptionFrame) == []
+        assert {"type": "interrupted", "lines": 1} not in call.messages()
+        # Two words are the caller speaking: the line stops.
+        await call.send(InterimTranscriptionFrame("uh wait", "", "2026-11-24T15:00:00Z"))
+        await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
+        await call.send(*caller_says("Wait, one moment.")[1:])
+        await until(lambda: voice.waiting == 1, "the next reply")
+
+        # A finished utterance of one word interrupts too: "Stop."
+        await voice.start(1)
+        await call.send(*caller_says("Stop."))
+        await until(lambda: len(call.frames(InterruptionFrame)) == 2, "the second interruption")
+
+    assert call.messages().count({"type": "interrupted", "lines": 1}) == 2
+
+
 # --- R12 --------------------------------------------------------------------------------
 
 
@@ -234,7 +279,7 @@ async def test_voice_logs_carry_no_text(
         await call.send(*caller_says("marker-caller-words about my pills"))
         await until(lambda: voice.waiting == 2, "the reply")
         await voice.start(2)
-        await call.send(VADUserStartedSpeakingFrame())
+        await call.send(*caller_talks_over())
         await until(lambda: len(call.frames(InterruptionFrame)) == 1, "the interruption")
     logged = re.sub(r"(?m)^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", "", caplog.text)
     assert "line_interrupted" in logged

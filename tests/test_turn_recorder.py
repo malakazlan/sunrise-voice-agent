@@ -14,13 +14,13 @@ from typing import Any
 
 import pytest
 from conftest import offline_settings
-from pipecat.frames.frames import VADUserStartedSpeakingFrame
 from speech_fakes import (
     CallPipeline,
     FakeTime,
     FakeVoice,
     agent_call,
     caller_says,
+    caller_talks_over,
     settle,
     until,
 )
@@ -532,7 +532,7 @@ async def test_a_row_does_not_wait_for_audio_that_will_not_come() -> None:
         # The caller speaks over the turn's line before it plays: the line is over unheard.
         await call.send(*caller_says("First question."))
         await until(lambda: len([m for m in call.messages() if m["type"] == "turn"]) == 1, "turn")
-        await call.send(VADUserStartedSpeakingFrame())
+        await call.send(*caller_talks_over())
         await until(lambda: len(kept.rows) == 1, "the first row")
         # The next turn's line never plays either: the call ends first.
         await call.send(*caller_says("Second question.")[1:])

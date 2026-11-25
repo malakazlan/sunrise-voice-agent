@@ -659,7 +659,11 @@
 
       show("state", "asking for the microphone");
       show("sub", "Allow the microphone when your browser asks.");
-      mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Echo cancellation keeps the agent's own voice, from the caller's speakers, out of
+      // what it hears; noise suppression keeps the room out.
+      mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       show("sub", "Calling.");
       listenTo("me", mic);
       if (drawing === null) draw();

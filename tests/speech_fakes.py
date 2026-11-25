@@ -13,6 +13,7 @@ from typing import Any
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
@@ -283,6 +284,15 @@ def caller_says(text: str) -> list[Frame]:
         VADUserStartedSpeakingFrame(),
         VADUserStoppedSpeakingFrame(),
         TranscriptionFrame(text, "", "2026-11-24T15:00:00Z", finalized=True),
+    ]
+
+
+def caller_talks_over(text: str = "Hold on please") -> list[Frame]:
+    """A caller starting to speak over a line: the sound, then the first words speech-to-text
+    hears of it, before the utterance is finished."""
+    return [
+        VADUserStartedSpeakingFrame(),
+        InterimTranscriptionFrame(text, "", "2026-11-24T15:00:00Z"),
     ]
 
 

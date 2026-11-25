@@ -963,7 +963,7 @@ def test_speech_defaults_apply(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.elevenlabs_voice_id is None
     # ElevenLabs' Flash v2.5: its lowest-latency model the multi-stream WebSocket serves.
     assert settings.tts_model == "eleven_flash_v2_5"
-    assert settings.vad_stop_seconds == 0.5
+    assert settings.vad_stop_seconds == 0.8
     assert settings.idle_seconds == 30
 
 

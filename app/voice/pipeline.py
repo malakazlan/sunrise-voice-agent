@@ -18,8 +18,14 @@ call's phase, the caller's patient id and the turn's last tool, go to the turn r
 (app/agent/turn_record.py) as the turn's row, which takes it without waiting.
 
 While the caller is muted (the opening line, the closed line, the emergency line) nothing they
-say is a turn, an interruption or an emergency. Otherwise, when they start speaking over a line,
-speech out is interrupted: what they did not hear leaves the conversation (`heard`).
+say is a turn, an interruption or an emergency. Otherwise, when they speak over a line, speech
+out is interrupted: what they did not hear leaves the conversation (`heard`). Speaking is words,
+not sound: a line stops once speech-to-text has heard INTERRUPT_WORDS words of an utterance
+still going on, or any word of a finished piece of one. A noise in the room, which voice
+activity detection reports as speech and speech-to-text hears no words in, stops nothing.
+
+Utterances that are waiting together when a turn can start (the caller went on, in pieces, while
+the turn before ran) are one turn, their words joined: one reply, not one for each piece.
 
 An emergency is not left to the turn queue: every finished utterance is read by the input
 guard's emergency decision as it arrives, whatever the call is doing (a turn running, turns
@@ -169,6 +175,11 @@ class _Connected:
     pass
 
 
+# Words speech-to-text has heard of an utterance still going on before a line is interrupted:
+# one word can be a noise mis-heard.
+INTERRUPT_WORDS = 2
+
+
 def _ms(seconds: float) -> int:
     return round(seconds * 1000)
 
@@ -272,12 +283,16 @@ class AgentProcessor(FrameProcessor):
             # Speech out reports that it can no longer work, on its way to the pipeline
             # worker, which then ends the pipeline.
             self._speech_unusable = True
-        if isinstance(frame, VADUserStartedSpeakingFrame | VADUserStoppedSpeakingFrame) or (
-            isinstance(frame, TranscriptionFrame | TranscriptionFinalizedFrame)
+        if isinstance(
+            frame,
+            VADUserStartedSpeakingFrame
+            | VADUserStoppedSpeakingFrame
+            | InterimTranscriptionFrame
+            | TranscriptionFrame
+            | TranscriptionFinalizedFrame,
         ):
+            # What is heard of the caller stops here: nothing downstream gets their words.
             await self._caller(frame)
-            return
-        if isinstance(frame, InterimTranscriptionFrame):
             return
         await self.push_frame(frame, direction)
 
@@ -297,23 +312,33 @@ class AgentProcessor(FrameProcessor):
             self._speech_end = None
             return
         if isinstance(frame, VADUserStartedSpeakingFrame):
+            # A sound, which may be the caller or a noise: nothing is interrupted for it.
             self._caller_speaking = True
             self._idle_prompted = False
             self._stop_idle()
-            if self._playback.interruptible:
-                await self._interrupt()
             return
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             if self._speech_end is None:
                 self._speech_end = self._clock()
             self._rearm_idle()
             return
+        if isinstance(frame, InterimTranscriptionFrame):
+            if len(frame.text.split()) >= INTERRUPT_WORDS:
+                await self._spoken_over()
+            return
         if isinstance(frame, TranscriptionFrame):
             self._heard.append(frame.text)
+            if frame.text.strip():
+                await self._spoken_over()
             if frame.finalized:
                 await self._utterance_done()
             return
         await self._utterance_done()
+
+    async def _spoken_over(self) -> None:
+        """The caller has said words: a line they may interrupt stops."""
+        if self._playback.interruptible:
+            await self._interrupt()
 
     async def _utterance_done(self) -> None:
         """A finished utterance: an emergency is acted on the moment it is heard, whatever
@@ -422,6 +447,7 @@ class AgentProcessor(FrameProcessor):
                 continue
             if self._agent is None or self._closing is not None:
                 continue
+            item = self._with_those_waiting(item)
             self._turn_count += 1
             caller_end = self._caller_end(item)
             self._awaiting_line = (self._turn_count, caller_end)
@@ -445,6 +471,21 @@ class AgentProcessor(FrameProcessor):
                 self._close(ending)
                 return
             self._rearm_idle()
+
+    def _with_those_waiting(self, first: _Utterance) -> _Utterance:
+        """The utterance with every one waiting behind it, as one: the caller went on, in
+        pieces, while the turn before ran. The words in order; the times of the last piece."""
+        pieces = [first]
+        while not self._queue.empty():
+            waiting = self._queue.get_nowait()
+            if isinstance(waiting, _Utterance):
+                pieces.append(waiting)
+        if len(pieces) == 1:
+            return first
+        logger.info("utterances_joined call_id=%s pieces=%d", self._call_id, len(pieces))
+        return _Utterance(
+            " ".join(piece.text for piece in pieces), pieces[-1].speech_end, pieces[-1].transcribed
+        )
 
     async def _open(self) -> None:
         try:
