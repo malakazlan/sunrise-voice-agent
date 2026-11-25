@@ -98,6 +98,7 @@ from app.agent.tool_registry import (
 from app.agent.tools import call_tool, hand_off, offers_a_message, submit_claim
 from app.audit.log import AGENT, Action, Event, Outcome, Reason, ResourceType
 from app.guard.input import GuardAction, guard_input
+from app.guard.mask import digits_given, mask_ssns
 from app.guard.output import GuardedReply, OutputRule, guard_reply
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,12 @@ BLOCK_REASONS = {
 # code, is the caller's first message, before the opening line.
 CALL_CONNECTED = "(The call has connected.)"
 # What the call record's history holds in place of a turn the model was given nothing of.
+# A turn that says at least this many digits gets the note of what code read in it.
+DIGITS_NOTED = 3
+# A telephone number: ten digits, or eleven with a leading one or zero.
+PHONE_DIGITS = 10
+PHONE_DIGITS_MOST = 11
+SSN_DIGITS = 9
 SWALLOWED_TURN = "(turn withheld)"
 EMERGENCY_TURN = "(emergency turn withheld)"
 
@@ -263,6 +270,10 @@ class CallAgent:
         # The history the call record stores: what the model is shown and what is said, and
         # the marker of each turn the model never saw. Never sent to the model.
         self._record: list[dict[str, Any]] = []
+        # Every digit the caller has said that the model was given, in order; and the
+        # pieces, kept from the model, of the number an unverified caller is giving.
+        self._own_digits = ""
+        self._number = ""
 
     @property
     def state(self) -> CallState:
@@ -320,6 +331,69 @@ class CallAgent:
         """A message joins the conversation and the call record's history."""
         self._messages.append(message)
         self._record.append(message)
+
+    def _append_caller(self, text: str, said: str) -> None:
+        """The caller's words join the conversation as the input guard passed them (`text`),
+        with a note of code's, for the model alone, about the digits in them; the call's record
+        keeps the words without it. A model counts digits badly, speech-to-text writes them
+        its own way, and a number comes in pieces: code reads and counts them."""
+        self._record.append({"role": "user", "content": text})
+        note = self._number_note(text, said) if self._takes_a_number() else self._digits_note(text)
+        self._messages.append(
+            {"role": "user", "content": text if note is None else f"{text}\n[{note}]"}
+        )
+
+    def _takes_a_number(self) -> bool:
+        """Whether the caller may be giving a telephone number, a piece at a time, where the
+        last four of an SSN are never asked for: a new patient's booking, and a closed office,
+        which takes messages only. Not an open office before verification: there a run of
+        digits may be the last four said early, and nothing is kept or counted."""
+        return self._state.phase is Phase.BOOKING or not self._state.office_open
+
+    def _digits_note(self, text: str) -> str | None:
+        """For digits the model can read: what code read of them, and how many. They are the
+        caller's own, which a reply may read back."""
+        digits = digits_given(text, DIGITS_NOTED)
+        self._own_digits += digits
+        if len(digits) < DIGITS_NOTED:
+            return None
+        return f"digits heard in this turn: {digits} ({len(digits)})"
+
+    def _number_note(self, text: str, said: str) -> str | None:
+        """For a number the caller is giving, a piece at a time: code keeps the pieces across
+        turns and tells the model how many digits it has. Where the model can read the caller's
+        digits (a new patient's booking) the note names them, and they are the caller's own to
+        hear back; where it cannot (a closed office) the note gives the count alone, until the
+        pieces make a whole number, which is then the model's to read back. An SSN, a date and
+        digits after an SSN cue are no piece of a number (`mask_ssns`, `digits_given`). More
+        digits than a number has are not one: none is kept. Nor are nine hidden digits as a
+        turn ends: they read as an SSN said in pieces, which one more digit must never turn
+        into a number the model is given. A turn that says no digit ends the number: the
+        pieces are the caller's turns one after another."""
+        piece = digits_given(mask_ssns(said), 1)
+        if not piece:
+            # The caller moved on: what comes next is another number.
+            self._number = ""
+            return None
+        readable = digits_given(text, 1) == piece
+        kept = self._number + piece
+        if len(kept) > PHONE_DIGITS_MOST:
+            kept = piece
+        if len(kept) > PHONE_DIGITS_MOST or (not readable and len(kept) == SSN_DIGITS):
+            self._number = ""
+            hidden = "" if readable else ", not shown"
+            return f"digits heard{hidden}: {len(kept)}; a telephone number has ten"
+        if readable:
+            self._own_digits += piece
+        if len(kept) < PHONE_DIGITS:
+            self._number = kept
+            if readable:
+                return f"digits heard so far: {kept} ({len(kept)}); a telephone number has ten"
+            return f"digits heard so far, not shown: {len(kept)}; a telephone number has ten"
+        self._number = ""
+        if not readable:
+            self._own_digits += kept
+        return f"number heard, {len(kept)} digits: {kept}"
 
     def _withheld(self, marker: str) -> None:
         """A turn the model is given nothing of leaves its marker in the record's history."""
@@ -415,7 +489,7 @@ class CallAgent:
         if decision.action is GuardAction.SWALLOW or decision.text is None:
             return self._turn(decision.action, None, timings)
 
-        withheld, timings = await self._model_turn(decision.text, started)
+        withheld, timings = await self._model_turn(decision.text, transcript, started)
         return self._turn(decision.action, decision.text, timings, withheld)
 
     def _turn(
@@ -437,10 +511,13 @@ class CallAgent:
             last_tool=self._last_tool,
         )
 
-    async def _model_turn(self, text: str, started: float) -> tuple[OutputRule | None, TurnTimings]:
+    async def _model_turn(
+        self, text: str, said: str, started: float
+    ) -> tuple[OutputRule | None, TurnTimings]:
         """One caller turn the model answers, its lines released as they are decided; the
-        output guard's rule if it blocked part of the answer."""
-        self._append({"role": "user", "content": text})
+        output guard's rule if it blocked part of the answer. `text` is the caller's words
+        as the input guard passed them, `said` as speech-to-text gave them."""
+        self._append_caller(text, said)
         marks: list[float] = []
         rounds = 0
         withheld: OutputRule | None = None
@@ -464,7 +541,12 @@ class CallAgent:
                     round_started = asked_at
                     continue
                 if reply.stop_reason == "end_turn" and reply.text.strip() and not reply.tool_calls:
-                    guarded = guard_reply([reply.text], self._state, read_back=tuple(read_back))
+                    guarded = guard_reply(
+                        [reply.text],
+                        self._state,
+                        read_back=tuple(read_back),
+                        own_digits=self._own_digits,
+                    )
                     if not guarded.said and guarded.block is None:
                         raise _ModelFailedError("reply_too_long")
                     await self._say_guarded(guarded)

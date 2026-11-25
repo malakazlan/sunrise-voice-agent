@@ -44,7 +44,24 @@ over the data channel.
   finalize, and only a finalized transcript makes a turn. Utterances that are waiting together
   when a turn can start (the caller went on, in pieces, while the turn before ran) are one
   turn, their words joined. The wait is a trade: shorter answers sooner but takes a pause
-  inside a phone number for the end of the turn.
+  inside a phone number for the end of the turn. So an utterance that is plainly not
+  finished is not a turn yet (`unfinished` in `app/voice/pipeline.py`): one that ends on a
+  comma, on a word no sentence ends on ("my email is alex at"), on what was asked for and
+  "is" ("my phone number is"), or that is single digits alone, three or more, neither four
+  (the last four) nor ten or eleven (a whole number). It waits 2 seconds
+  (`HOLD_SECONDS`) for its rest, which joins it, and longer, up to 10 seconds, while the
+  caller is speaking again; with nothing more heard it is a turn as it stands. An emergency phrase is read in each piece as it arrives and in the pieces joined.
+- Numbers in pieces (`app/agent/turn.py`, `digits_given` in `app/guard/mask.py`): a model
+  counts digits badly and speech-to-text writes them its own way (spoken digits have come
+  back as a date). Code reads the digits of each caller turn and adds a note for the model
+  alone, in square brackets after the caller's words: the digits and how many. For a new
+  patient's booking and a closed office's callback number it keeps the pieces across the
+  caller's turns one after another and says how many of ten it has; where the input guard
+  hides digits from the model (a caller who is not verified) the note gives the count
+  alone until the pieces make a whole number. A date and an SSN are never a piece. An open
+  office before verification gets no note: a run of digits there may be the last four.
+  The stored transcript keeps the caller's words without the notes. The model's part is
+  the talking: say what it has so far, ask for the rest, read the whole number back.
 - Vocabulary hints (`app/voice/vocabulary.py`): Nova-3's keyterm prompting, one `keyterm`
   query parameter per term, so that "Lisinopril" is heard as the drug. The list is built once
   at start-up: the distinct medication names of the `medications` table cut to their drug word

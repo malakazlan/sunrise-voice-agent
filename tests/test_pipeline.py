@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     OutputTransportMessageUrgentFrame,
     TranscriptionFinalizedFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -52,7 +53,16 @@ from app.guard.output import OutputRule
 from app.main import create_app
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
-from app.voice.pipeline import Agent, AgentProcessor, deepgram_stt, load_vad, open_agent_call
+from app.voice.pipeline import (
+    HOLD_MOST_SECONDS,
+    HOLD_SECONDS,
+    Agent,
+    AgentProcessor,
+    deepgram_stt,
+    load_vad,
+    open_agent_call,
+    unfinished,
+)
 from app.voice.speech import Playback
 from app.voice.speech_check import SpeechCheck
 from app.voice.vocabulary import Vocabulary, keyterms
@@ -99,7 +109,10 @@ def agent_in_intake(
 
 
 def adapter(
-    agent: Agent, clock: Clock, refused: list[None] | None = None
+    agent: Agent,
+    clock: Clock,
+    refused: list[None] | None = None,
+    time: FakeTime | None = None,
 ) -> tuple[AgentProcessor, Playback]:
     """The voice adapter around an agent the test built, OPENING its opening line; each time it
     asks why speech out refused, `refused` gets an entry."""
@@ -118,7 +131,7 @@ def adapter(
         vad_stop_seconds=0.5,
         speech_refused=lambda: asked.append(None),
         clock=clock,
-        sleep=FakeTime().sleep,
+        sleep=(time or FakeTime()).sleep,
     )
     return processor, playback
 
@@ -334,18 +347,123 @@ async def test_utterances_waiting_together_become_one_turn() -> None:
     async with CallPipeline(processor, playback, FakeVoice()) as call:
         processor.connected()
         await until(lambda: playback.quiet, "the opening line")
-        await call.send(transcript("My number is", finalized=True))
-        await until(lambda: agent.given == ["My number is"], "the first turn")
+        await call.send(transcript("I have a new number.", finalized=True))
+        await until(lambda: agent.given == ["I have a new number."], "the first turn")
         # While that turn runs the caller goes on, in two pieces: one turn for both, not two
         # replies one after the other.
-        await call.send(transcript("five five five two zero one", finalized=True))
+        await call.send(transcript("It is five five five two zero one", finalized=True))
         await call.send(transcript("three three four four.", finalized=True))
         agent.go.set()
         await until(lambda: len(turns(call)) == 2, "the second turn")
         await settle()
 
-    assert agent.given == ["My number is", "five five five two zero one three three four four."]
+    assert agent.given == [
+        "I have a new number.",
+        "It is five five five two zero one three three four four.",
+    ]
     assert [turn["turn"] for turn in turns(call)] == [1, 2]
+
+
+def test_what_is_plainly_unfinished() -> None:
+    rows = [
+        # What was asked for and "is", with no answer yet: speech-to-text's full stop or none.
+        ("My phone number is", True),
+        ("And my phone number is.", True),
+        ("my email is", True),
+        # A word no sentence ends on.
+        ("my email is alex dot carter at", True),
+        ("Sarah Johnson and.", True),
+        ("It's", True),
+        # A comma: more is coming.
+        ("Eight, nine,", True),
+        # Single digits alone, a piece of a number.
+        ("five five six", True),
+        ("Zero three four four five six.", True),
+        ("554 321", True),
+        ("double five six seven eight", True),
+        # The last four, a whole number, a time, one digit: answers as they stand.
+        ("three three four four", False),
+        ("Four five six seven.", False),
+        ("five five five two zero one three three four four", False),
+        ("(554) 321-2342.", False),
+        ("Nine.", False),
+        ("Nine thirty", False),
+        # Finished sentences, some ending on words that often lead on.
+        ("Yes it is.", False),
+        ("Yes it is", False),
+        ("That's my number.", False),
+        ("It's.", False),
+        ("Is my email on file with", True),
+        ("Is that right?", False),
+        ("What is my phone number is?", False),
+        ("Yes", False),
+        ("I would like a refill", False),
+        ("", False),
+        (".", False),
+    ]
+    assert [(text, unfinished(text)) for text, _ in rows] == rows
+
+
+@pytest.mark.anyio
+async def test_an_unfinished_utterance_waits_for_its_rest() -> None:
+    agent = Slow()
+    agent.go.set()
+    time = FakeTime()
+    processor, playback = adapter(agent, Clock(), time=time)
+
+    async with CallPipeline(processor, playback, FakeVoice()) as call:
+        processor.connected()
+        await until(lambda: playback.quiet, "the opening line")
+        # A sentence that leads on is not a turn yet: its rest joins it, and they are one.
+        await call.send(transcript("My phone number is", finalized=True))
+        await settle()
+        assert agent.given == []
+        await call.send(transcript("five five five two zero one.", finalized=True))
+        await until(lambda: len(agent.given) == 1, "the joined turn")
+        assert agent.given == ["My phone number is five five five two zero one."]
+        # A piece of a number waits for the next, until they make a whole one.
+        await call.send(transcript("five five six", finalized=True))
+        await call.send(transcript("seven eight nine", finalized=True))
+        await settle()
+        assert len(agent.given) == 1
+        await call.send(transcript("zero one two three", finalized=True))
+        await until(lambda: len(agent.given) == 2, "the whole number")
+        assert agent.given[1] == "five five six seven eight nine zero one two three"
+        # The waits of the pieces that were joined are over: none ends a later one early.
+        await time.advance(HOLD_SECONDS / 2)
+        # Nothing more comes: after the wait it is a turn as it stands.
+        await call.send(transcript("My email is", finalized=True))
+        await time.advance(HOLD_SECONDS - 0.1)
+        assert len(agent.given) == 2
+        await time.advance(0.1)
+        await until(lambda: len(agent.given) == 3, "the turn after the wait")
+        assert agent.given[2] == "My email is"
+        # A caller who is speaking again when the wait ends is given one more wait.
+        await call.send(transcript("My number is", finalized=True))
+        await call.send(VADUserStartedSpeakingFrame())
+        await time.advance(HOLD_SECONDS)
+        assert len(agent.given) == 3
+        await call.send(transcript("five five five.", finalized=True))
+        await until(lambda: len(agent.given) == 4, "the turn of a caller who went on")
+        assert agent.given[3] == "My number is five five five."
+        await time.advance(HOLD_SECONDS)
+        await settle()
+        assert len(agent.given) == 4
+        # A sound that does not stop is not waited for without end.
+        await call.send(transcript("My email is", finalized=True))
+        for _ in range(round(HOLD_MOST_SECONDS / HOLD_SECONDS) - 1):
+            await time.advance(HOLD_SECONDS)
+        assert len(agent.given) == 4
+        await time.advance(HOLD_SECONDS)
+        await until(lambda: len(agent.given) == 5, "the turn after the longest wait")
+        # The last four and a finished sentence are turns at once.
+        await call.send(transcript("three three four four", finalized=True))
+        await until(lambda: agent.given[-1] == "three three four four", "the last four")
+        await call.send(transcript("Yes, that is right.", finalized=True))
+        await until(lambda: agent.given[-1] == "Yes, that is right.", "a finished sentence")
+        await settle()
+
+    assert time.waiting <= 2  # the idle and the longest-call timers, no wait left behind
 
 
 class Broken(Withheld):

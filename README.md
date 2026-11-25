@@ -167,7 +167,11 @@ One caller turn, and where each guard sits:
 
 1. Silero voice activity detection hears the caller stop (`VAD_STOP_SECONDS`, 0.8 s by default);
    Deepgram is asked to finalize, and only a final transcript makes a turn
-   (`app/voice/pipeline.py`).
+   (`app/voice/pipeline.py`). A sentence that is plainly not finished ("my phone number
+   is", three digits of a number) waits up to 2 s for its rest instead of being answered.
+   Code, not the model, reads and counts the digits the caller says and tells the model in
+   a note it alone sees, so a number given in pieces is kept, completed and read back
+   ([docs/call-pipeline.md](docs/call-pipeline.md)).
 2. **Input guard** (`app/guard/input.py`), pure code, before the model: an emergency phrase
    gives the 911 line at once and the model sees nothing; while the identity step waits for
    the last four digits, any turn with a number is swallowed and code submits the digits;

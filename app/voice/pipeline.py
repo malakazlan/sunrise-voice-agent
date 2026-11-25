@@ -25,7 +25,11 @@ still going on, or any word of a finished piece of one. A noise in the room, whi
 activity detection reports as speech and speech-to-text hears no words in, stops nothing.
 
 Utterances that are waiting together when a turn can start (the caller went on, in pieces, while
-the turn before ran) are one turn, their words joined: one reply, not one for each piece.
+the turn before ran) are one turn, their words joined: one reply, not one for each piece. And
+an utterance that is plainly not finished (`unfinished`: it ends on a word that leads on, or is
+a piece of a number) is not a turn yet: it waits HOLD_SECONDS for its rest, which joins it, and
+longer (up to HOLD_MOST_SECONDS) while the caller is speaking. An emergency is read in every
+piece as it arrives, and in the pieces joined.
 
 An emergency is not left to the turn queue: every finished utterance is read by the input
 guard's emergency decision as it arrives, whatever the call is doing (a turn running, turns
@@ -93,6 +97,7 @@ from app.agent.turn import Line, Speak, TurnResult, start_call
 from app.agent.turn_record import TurnRecorder, TurnRow
 from app.audit.log import Reason
 from app.config import Settings
+from app.guard.mask import single_digits_alone
 from app.voice.speech import CallerGate, LineMark, Playback, PlayoutTracker, elevenlabs_tts
 from app.voice.speech_check import SpeechCheck
 from app.voice.transport import audio_transport, open_connection, server_ice_servers
@@ -180,6 +185,46 @@ class _Connected:
 INTERRUPT_WORDS = 2
 
 
+# How long an utterance that is plainly not finished waits for its rest before it is a turn as
+# it stands.
+HOLD_SECONDS = 2.0
+# The longest it waits, for a caller who is still speaking when the wait ends.
+HOLD_MOST_SECONDS = 10.0
+# Words no finished sentence ends on, whatever speech-to-text put after them.
+_NEVER_LAST = frozenset("a an and at because but dot my of or the with".split())
+# Words a sentence seldom ends on: unfinished when speech-to-text ended no sentence there.
+_SELDOM_LAST = frozenset("are email for it's number that's then to uh um was".split())
+# "My phone number is": what is asked for, and no answer yet.
+_ASKED_FOR = frozenset("address birth email name number".split())
+# Digits said alone are a piece of a number from this many, unless they are the last four or a
+# whole telephone number: an answer as they stand.
+_PIECE_DIGITS = 3
+_WHOLE_NUMBERS = frozenset({4, 10, 11})
+
+
+def unfinished(text: str) -> bool:
+    """Whether the caller has plainly not finished, so that a pause in the middle of a sentence
+    or of a number is not the end of their turn. Speech-to-text ends most pieces with a full
+    stop, so one proves little. Unfinished are:
+    words that end on a comma, on a word no sentence ends on ("my email is alex at"), or on
+    what was asked for and "is" ("my phone number is"); and single digits said alone that are
+    a piece of a number (three or more, not the last four, not a whole number)."""
+    said = text.strip()
+    stopped = said.endswith(".")
+    words = said.rstrip(".").lower().split()
+    if not words:
+        return False
+    last = words[-1]
+    if last.endswith(",") or last in _NEVER_LAST:
+        return True
+    if last == "is" and len(words) > 1 and words[-2] in _ASKED_FOR:
+        return True
+    if not stopped and last in _SELDOM_LAST:
+        return True
+    digits = single_digits_alone(said)
+    return len(digits) >= _PIECE_DIGITS and len(digits) not in _WHOLE_NUMBERS
+
+
 def _ms(seconds: float) -> int:
     return round(seconds * 1000)
 
@@ -241,6 +286,9 @@ class AgentProcessor(FrameProcessor):
         self._turn_free.set()
         self._caller_changed = asyncio.Event()
         self._caller_speaking = False
+        # An utterance plainly not finished, waiting for its rest, and the wait.
+        self._held: _Utterance | None = None
+        self._holding: asyncio.Task[None] | None = None
         self._idle_prompted = False
         self._turn_count = 0
         # The turn whose first line has not been released yet, with when its caller stopped
@@ -348,12 +396,44 @@ class AgentProcessor(FrameProcessor):
         speech_end, self._speech_end = self._speech_end, None
         if not text or self._agent is None or self._ended:
             return
+        if self._held is not None:
+            # The rest of what was plainly unfinished.
+            text = f"{self._held.text} {text}"
+        self._let_go()
         if self._agent.is_emergency(text):
             await self._emergency()
             return
-        if self._closing is None:
-            self._stop_idle()
-            self._queue.put_nowait(_Utterance(text, speech_end, self._clock()))
+        if self._closing is not None:
+            return
+        self._stop_idle()
+        heard = _Utterance(text, speech_end, self._clock())
+        if unfinished(text):
+            self._held = heard
+            self._holding = self.create_task(self._hold(), "utterance_held")
+            return
+        self._queue.put_nowait(heard)
+
+    async def _hold(self) -> None:
+        """The wait for the rest of an unfinished utterance. With nothing more heard it
+        becomes a turn as it stands. While the caller is speaking again, or their words are
+        still being written, the wait goes on, up to HOLD_MOST_SECONDS: the rest is on its way
+        (or the sound is a noise that does not stop)."""
+        waited = 0.0
+        while waited < HOLD_SECONDS or (
+            waited < HOLD_MOST_SECONDS and (self._caller_speaking or self._speech_end is not None)
+        ):
+            await self._sleep(HOLD_SECONDS)
+            waited += HOLD_SECONDS
+        held, self._held, self._holding = self._held, None, None
+        if held is not None and self._closing is None and not self._ended:
+            self._queue.put_nowait(held)
+
+    def _let_go(self) -> None:
+        """Nothing is held any more: its rest came, or the call moved on."""
+        self._held = None
+        if self._holding is not None and self._holding is not asyncio.current_task():
+            self._holding.cancel()
+        self._holding = None
 
     async def _emergency(self) -> None:
         """An emergency the caller said, outside a turn: the running turn is cancelled and the
@@ -700,6 +780,7 @@ class AgentProcessor(FrameProcessor):
         """End the call at once: for the reason already decided, if any."""
         self._closing = self._closing or reason
         current = asyncio.current_task()
+        self._let_go()
         for task in (self._turns, self._speaker, self._idle, self._max, self._closer):
             if task is not None and task is not current and not task.done():
                 await self.cancel_task(task)
