@@ -7,7 +7,11 @@ matches blocks it with a scripted line to say instead:
 1. `ssn_last4`: a run of digits, numerals or number words, equal to the caller's verified last
    four, read across the reply so far. A longer run that holds them, such as a phone number,
    passes.
-2. `ssn_shape`: a run that reads as nine digits, in any grouping, verified or not.
+2. `ssn_shape`: a run that reads as nine digits, in any grouping, verified or not, unless
+   those nine are digits the caller said on this call, one after another (`own_digits`: a
+   phone number given in pieces, read back before it is whole). The model has no SSN to say:
+   the records hold the last four only, and an SSN the caller says is redacted before the
+   model. This rule is the last check, and the caller's own number is not what it is for.
 3. `phi_outside_gate`: the caller is not verified, or the office is closed, and the sentence
    carries a money amount, a lab status or a dosage.
 4. `medical_advice`: advice or diagnosis phrasing.
@@ -39,7 +43,7 @@ from types import MappingProxyType
 
 from app.agent.scripts import ScriptId
 from app.agent.state import CallState
-from app.guard.mask import reads_as_nine_digits, says_a_number, says_digits
+from app.guard.mask import nine_digit_readings, says_a_number, says_digits
 
 # A reply is cut at the last complete sentence within this many characters.
 MAX_REPLY_CHARACTERS = 600
@@ -214,12 +218,12 @@ def _without_read_back(sentence: str, read_back: tuple[str, ...]) -> str:
 
 
 def _broken_rule(
-    text: str, state: CallState, said_before: str, read_back: tuple[str, ...]
+    text: str, state: CallState, said_before: str, read_back: tuple[str, ...], own_digits: str
 ) -> OutputRule | None:
     so_far = f"{said_before} {text}" if said_before else text
     if state.verified_ssn4 is not None and says_digits(so_far, state.verified_ssn4):
         return OutputRule.SSN_LAST4
-    if reads_as_nine_digits(text):
+    if any(reading not in own_digits for reading in nine_digit_readings(text)):
         return OutputRule.SSN_SHAPE
     if not (state.verified and state.office_open) and _carries_patient_data(text):
         return OutputRule.PHI_OUTSIDE_GATE
@@ -237,11 +241,12 @@ def guard_output(
     *,
     said_before: str = "",
     read_back: tuple[str, ...] = (),
+    own_digits: str = "",
 ) -> Block | None:
     """The block for one sentence of the model's, or None when it may be said. `said_before`
     is what this reply has said already; `read_back` the texts a tool gave the model this turn
     to read back to the caller."""
-    rule = _broken_rule(_plain(sentence), state, _plain(said_before), read_back)
+    rule = _broken_rule(_plain(sentence), state, _plain(said_before), read_back, own_digits)
     return None if rule is None else Block(rule=rule, script=INSTEAD[rule])
 
 
@@ -309,7 +314,11 @@ def split_sentences(pieces: Iterable[str]) -> Iterator[str]:
 
 
 def guard_reply(
-    pieces: Iterable[str], state: CallState, *, read_back: tuple[str, ...] = ()
+    pieces: Iterable[str],
+    state: CallState,
+    *,
+    read_back: tuple[str, ...] = (),
+    own_digits: str = "",
 ) -> GuardedReply:
     """A reply's sentences while each passes `guard_output` and the reply, its sentences joined
     by a space, stays within MAX_REPLY_CHARACTERS. The first blocked sentence ends it: it is not
@@ -320,7 +329,13 @@ def guard_reply(
         length += 1 + len(sentence)
         if length > MAX_REPLY_CHARACTERS:
             break
-        block = guard_output(sentence, state, said_before=" ".join(said), read_back=read_back)
+        block = guard_output(
+            sentence,
+            state,
+            said_before=" ".join(said),
+            read_back=read_back,
+            own_digits=own_digits,
+        )
         if block is not None:
             return GuardedReply(said=tuple(said), block=block)
         said.append(sentence)

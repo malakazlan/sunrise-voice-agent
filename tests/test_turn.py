@@ -36,6 +36,7 @@ from app.audit.log import CHAIN_LOCK, AuditLog, Reason
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
 from app.guard.input import GuardAction
+from app.guard.output import OutputRule
 from app.main import create_app
 from app.runtime_config import taking_calls
 from app.voice.calls import CallRegistry
@@ -750,6 +751,147 @@ async def test_prompt_is_static(deps: Deps, registry: Registry) -> None:
     await agent.handle("What do I owe?")
 
     assert [request.system for request in model.requests] == [SYSTEM_PROMPT] * 4
+
+
+async def booking(agent: CallAgent, model: ScriptedModel) -> None:
+    """The caller says it is their first visit: the call moves to booking."""
+    model.then(calls(("start_new_patient", {})), says("What is your phone number?"))
+    await agent.handle("This is my first visit.")
+    assert agent.state.phase is Phase.BOOKING
+
+
+def given(model: ScriptedModel) -> str:
+    """What the model was given of the caller's last turn."""
+    content: str = model.requests[-1].messages[-1]["content"]
+    return content
+
+
+async def test_a_number_given_in_pieces_is_kept_by_code(deps: Deps, registry: Registry) -> None:
+    so_far = "So far I have five five four, three two one, two three four."
+    model = ScriptedModel()
+    agent = await agent_for(model, deps, registry)
+    await booking(agent, model)
+
+    # A new patient gives a number in pieces. Code reads the digits, however speech-to-text
+    # wrote them, keeps them across turns and tells the model what it has and how many.
+    model.then(says("And the rest?"))
+    first = await agent.handle("It's five five four, three two one.")
+    assert first.shown == "It's five five four, three two one."
+    assert given(model) == (
+        "It's five five four, three two one."
+        "\n[digits heard so far: 554321 (6); a telephone number has ten]"
+    )
+    # Nine of the caller's own digits may be read back to them: they are no SSN.
+    model.then(says(so_far))
+    second = await agent.handle("two three four")
+    assert given(model).endswith(
+        f"\n[digits heard so far: {'554321' + '234'} (9); a telephone number has ten]"
+    )
+    assert (second.lines, second.withheld) == ((so_far,), None)
+    # The last digit makes ten: the number is whole.
+    model.then(says("Thank you."))
+    await agent.handle("two.")
+    assert given(model) == "two.\n[number heard, 10 digits: 5543212342]"
+    # A new number starts afresh, and is whole however speech-to-text wrote it.
+    model.then(says("Okay."), says("Okay."))
+    await agent.handle("five five six")
+    assert given(model).endswith("\n[digits heard so far: 556 (3); a telephone number has ten]")
+    await agent.handle("No, it is (554) 321-2342.")
+    assert given(model) == "No, it is (554) 321-2342.\n[number heard, 10 digits: 5543212342]"
+    # More digits than a number has are not one: the model is told how many, and none is kept.
+    model.then(says("Sorry?"), says("Okay."))
+    await agent.handle("05/05/1964... Three two, one, nine, four six.")
+    assert given(model).endswith("\n[digits heard: 14; a telephone number has ten]")
+    await agent.handle("five five six")
+    assert given(model).endswith("\n[digits heard so far: 556 (3); a telephone number has ten]")
+    # A date alone is a date, and an SSN is never a piece of a number.
+    model.then(says("Thanks."), says("Thanks."))
+    await agent.handle("January 10, 2003.")
+    assert "[" not in given(model)
+    ssn = " ".join(["123", "45", "6789"])
+    await agent.handle(f"My social is {ssn}.")
+    assert "[" not in given(model)
+    assert "6789" not in str(model.requests)
+    # A turn without a digit ended the number: the three before the date are not counted.
+    model.then(says("Go on."))
+    await agent.handle("two three four")
+    assert given(model).endswith("\n[digits heard so far: 234 (3); a telephone number has ten]")
+    # The call's record keeps the caller's words as the guard passed them, without the notes.
+    assert "heard" not in str(agent.history)
+
+
+async def test_a_closed_office_keeps_a_callback_number_from_the_model_until_whole(
+    deps: Deps, registry: Registry
+) -> None:
+    so_far = "I have five five four, three two one, two three four, and then?"
+    model = ScriptedModel(says("And the rest?"), says(so_far))
+    closed = Deps(
+        sessions=deps.sessions,
+        audit=deps.audit,
+        now=lambda: EVENING,
+        claim_keys=deps.claim_keys,
+        config=deps.config,
+    )
+    agent, _closed_line = await start_call(new_call_id(), closed, model, registry)
+    assert not agent.state.office_open
+
+    # A closed office takes messages from callers it cannot verify: a run of digits short of a
+    # whole number is hidden from the model. Code keeps the pieces and says only how many.
+    first = await agent.handle("It's five five four, three two one.")
+    assert first.shown == "It's ****."
+    assert given(model) == (
+        "It's ****.\n[digits heard so far, not shown: 6; a telephone number has ten]"
+    )
+    assert "554321" not in str(model.requests)
+    # Whole, the number is the model's to read back and to take the message with.
+    whole = await agent.handle("two three four two")
+    assert given(model) == "****\n[number heard, 10 digits: 5543212342]"
+    assert (whole.lines, whole.withheld) == ((so_far,), None)
+    # Nine hidden digits, as a turn ends, read as an SSN: they are dropped, never completed
+    # into a number the model is given.
+    model.then(says("Go on."), says("Sorry, once more?"), says("Go on."))
+    await agent.handle("one two three, four five")
+    await agent.handle("six seven eight nine")
+    assert given(model) == "****\n[digits heard, not shown: 9; a telephone number has ten]"
+    await agent.handle("zero")
+    assert given(model) == "****\n[digits heard so far, not shown: 1; a telephone number has ten]"
+    assert "".join(("123", "45", "6789")) not in str(model.requests)
+
+
+async def test_digits_stay_hidden_where_the_last_four_may_be_asked(
+    deps: Deps, registry: Registry
+) -> None:
+    # An open office, a caller not yet verified: a run of digits may be the last four, said
+    # early. Nothing is kept and nothing counted.
+    model = ScriptedModel(says("Could I have your name?"), says("And your date of birth?"))
+    agent = await agent_for(model, deps, registry)
+    await agent.handle("five five four three two one")
+    assert given(model) == "****"
+    await agent.handle("two three four two")
+    assert given(model) == "****"
+    assert "5543212342" not in str(model.requests)
+
+
+async def test_a_verified_callers_own_digits_may_be_read_back(
+    deps: Deps, registry: Registry
+) -> None:
+    read_back = "I have five five four, three two one, two three five so far."
+    model = ScriptedModel()
+    agent = await agent_for(model, deps, registry)
+    await verified(agent, model)
+
+    # A verified caller's digits reach the model, with what code read of them and how many.
+    model.then(says("And then?"), says(read_back))
+    await agent.handle("Call me on five five four, three two one, two three.")
+    assert given(model).endswith("\n[digits heard in this turn: 55432123 (8)]")
+    # Nine digits the caller said, over two turns, are theirs to hear back.
+    result = await agent.handle("Then five.")
+    assert "[" not in given(model)
+    assert (result.lines, result.withheld) == ((read_back,), None)
+    # Nine they did not say are not.
+    model.then(says("The number is five five four, three two one, two three six."))
+    result = await agent.handle("What number do you have?")
+    assert (result.lines, result.withheld) == ((FALLBACK,), OutputRule.SSN_SHAPE)
 
 
 def test_every_offered_tool_is_described() -> None:

@@ -256,6 +256,28 @@ def test_ssn_shapes_are_blocked() -> None:
     assert rule(both, UNVERIFIED) == "ssn_shape"
 
 
+def test_the_callers_own_digits_may_be_read_back() -> None:
+    nine = "".join(NINE_PARTS)
+    sentence = f"So far I have {' '.join(NINE_PARTS)}."
+    for state in (SARAH, UNVERIFIED, CLOSED):
+        # Nine digits of the model's own are an SSN's shape.
+        assert rule(sentence, state) == "ssn_shape"
+        # The same nine, said by the caller on this call (a phone number given in pieces), are
+        # theirs to hear back, wherever they stand among what the caller said.
+        for own in (nine, nine + "0", "555" + nine, "20" + nine + "77"):
+            assert guard_output(sentence, state, own_digits=own) is None, own
+        # Nine digits the caller did not say stay blocked, whatever else they said.
+        for own in ("", nine[:-1], nine[:-1] + "0", nine[::-1], nine[:4] + "0" + nine[4:]):
+            blocked = guard_output(sentence, state, own_digits=own)
+            assert blocked is not None and blocked.rule.value == "ssn_shape", own
+    # The verified caller's last four is never said back, the caller's own digits or not.
+    last_four = f"Your last four are {' '.join(LAST_FOUR)}."
+    assert guard_output(last_four, SARAH, own_digits=LAST_FOUR) is not None
+    # A reply is guarded the same way, sentence by sentence.
+    assert guard_reply([sentence], UNVERIFIED, own_digits=nine).block is None
+    assert guard_reply([sentence], UNVERIFIED).block is not None
+
+
 # --- R4 -------------------------------------------------------------------------------------
 
 # Patient data: blocked before verification or while the office is closed, allowed for a

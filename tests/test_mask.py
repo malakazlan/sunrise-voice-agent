@@ -5,7 +5,7 @@ import sys
 
 from conftest import REPO_ROOT
 
-from app.guard.mask import mask, mask_ssns
+from app.guard.mask import digits_given, mask, mask_ssns, single_digits_alone
 
 # Identifier samples are assembled from short pieces, so that no tracked file holds one.
 SSN_PARTS = ("123", "45", "6789")
@@ -468,3 +468,43 @@ def test_digit_reading_is_linear() -> None:
     timings = json.loads(measured.stdout)
     assert len(timings) == 6 * len(texts)
     assert max(timings) < LINEAR_BOUND_SECONDS, max(timings)
+
+
+def test_the_digits_of_a_number_are_read_apart_from_a_date() -> None:
+    rows = [
+        # A date is not a number, with its month's name or in numerals alone.
+        ("Hi, this is Sarah Johnson, born March 14, 1985.", ""),
+        ("01/10/2003.", ""),
+        ("the 3rd of March 1985", ""),
+        # Beside a number, a date with its month's name is still a date.
+        (f"November 8th 1972 and my number is {' '.join(PHONE_PARTS)}", "".join(PHONE_PARTS)),
+        # Numerals alone beside other digits are digits speech-to-text wrote as a date.
+        ("05/05/1964... Three two, one, nine, four six.", "05051964321946"),
+        # A number, however it is written or said.
+        (f"({PHONE_PARTS[0]}) {PHONE_PARTS[1]}-{PHONE_PARTS[2]}.", "".join(PHONE_PARTS)),
+        ("My number is five five four, three two one.", "554321"),
+        ("five five six", "556"),
+        ("No digits here.", ""),
+    ]
+    assert [(text, digits_given(text, 1)) for text, _ in rows] == rows
+    # One digit beside a date in numerals does not make the date a number where three are asked.
+    assert digits_given("01/10/2003 at 9", 3) == "9"
+    assert digits_given("01/10/2003 at 9", 1) == "01102003" + "9"
+
+
+def test_single_digits_said_alone() -> None:
+    rows = [
+        ("five five six", "556"),
+        ("Zero three, four four. Five six.", "034456"),
+        ("554 321", "554321"),
+        ("(554) 321-2342.", "5543212342"),
+        ("double five six", "556"),
+        # A tens word or a teen is a time, an age, a year: not digits one by one.
+        ("Nine thirty", ""),
+        ("nineteen eighty five", ""),
+        # Any other word, and it is a sentence.
+        ("It is five five six", ""),
+        ("five five six please", ""),
+        ("", ""),
+    ]
+    assert [(text, single_digits_alone(text)) for text, _ in rows] == rows

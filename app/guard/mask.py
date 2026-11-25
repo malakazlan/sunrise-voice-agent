@@ -229,7 +229,7 @@ _DIGIT_TOKEN = re.compile(
 )
 _JOINS = re.compile(r"[ \t.-]{0,3}|[ \t]{0,3}dash[ \t]{0,3}", re.IGNORECASE)
 _JOINS_SINGLE_DIGITS = re.compile(r"[ \t-]{0,2},[ \t-]{0,2}")
-# What the output guard reads (`says_digits`, `reads_as_nine_digits`): numerals and number
+# What the output guard reads (`says_digits`, `nine_digit_readings`): numerals and number
 # words without the homophones, so "ten thirty to eleven thirty" is two times. For the caller's
 # last four, tokens also join across commas, brackets, en and em dashes, "and", and um or uh.
 _SPOKEN_TOKEN = re.compile(
@@ -418,21 +418,56 @@ def spoken_digits(text: str) -> str:
     return "".join(_digits(run) for run in _runs(text))
 
 
+# Dates written with the month's name, or as Python writes them: never part of a number.
+_WORDED_DATES = frozenset({"repr", "month_first", "day_first"})
+
+
+def digits_given(text: str, least: int) -> str:
+    """The digits of a number the caller is giving, in order, written or spoken: every digit
+    the text says but those of a date. A date with its month's name is never part of a number.
+    One written in numerals alone ("05/05/1964") is a date when the text says fewer than
+    `least` other digits, and digits speech-to-text wrote as a date when it says more."""
+
+    def apart_from(kinds: frozenset[str]) -> str:
+        kept = _IDENTIFIER.sub(lambda found: " " if found.lastgroup in kinds else found[0], text)
+        return spoken_digits(kept)
+
+    apart = apart_from(_DATE_KINDS)
+    return apart if len(apart) < least else apart_from(_WORDED_DATES)
+
+
+_BETWEEN_DIGITS = re.compile(r"[\s.,()–—-]*")
+_ONE_BY_ONE = frozenset({*_UNIT_DIGITS, *_HOMOPHONE_DIGITS, *_REPEATS})
+
+
+def single_digits_alone(text: str) -> str:
+    """The digits of a text that says digits one by one and nothing else: numerals, the words
+    for single digits, double and triple, with only spaces, commas, full stops, brackets and
+    dashes between them. Empty for any other text: "nine thirty" is a time, not two pieces."""
+    tokens = [token[0].lower() for token in _DIGIT_TOKEN.finditer(text)]
+    if not all(token.isdigit() or token in _ONE_BY_ONE for token in tokens):
+        return ""
+    if not _BETWEEN_DIGITS.fullmatch(_DIGIT_TOKEN.sub("", text)):
+        return ""
+    return spoken_digits(text)
+
+
 def says_a_number(text: str) -> bool:
     """Whether the text holds any digit or number word, whether or not it reads as digits."""
     return any(token.counted for run in _runs(text) for token in run)
 
 
-def reads_as_nine_digits(text: str) -> bool:
-    """For the output guard: whether any run of numerals and number words (no homophones), or
-    the run without an "oh" at its ends, reads as exactly nine digits, line by line; what
-    `mask` hides as an SSN, here wherever the run starts or ends, inside letters or digits
-    too."""
-    return any(
-        len(_digits(group)) == 9
+def nine_digit_readings(text: str) -> tuple[str, ...]:
+    """For the output guard: the digits of each run of numerals and number words (no
+    homophones), or of the run without an "oh" at its ends, that reads as exactly nine digits,
+    line by line; what `mask` hides as an SSN, here wherever the run starts or ends, inside
+    letters or digits too."""
+    return tuple(
+        _digits(group)
         for line in text.split("\n")
         for run in _runs(line, tokens=_SPOKEN_TOKEN)
         for group in _groups(run)
+        if len(_digits(group)) == 9
     )
 
 
