@@ -236,7 +236,9 @@ talk.
 1. The model asks for the full name and the date of birth and passes them to `verify_identity`.
 2. Code then asks, with a fixed line, for the last four digits of the Social Security number
    only. The caller's answer is swallowed by the input guard: the model, the logs and the
-   transcript never get it, and code alone checks it (`submit_identity`).
+   transcript never get it, and code alone checks it (`submit_identity`). In its place the
+   model gets a fixed note from code saying only that the digits were checked and whether the
+   caller is verified, so it never asks for them a second time.
 3. All three must match the same one record. Until they do, no patient-data tool is offered,
    and dispatch refuses one that is called anyway.
 4. Any mismatch gets the same line ("I'm sorry, I couldn't verify those details"), whatever

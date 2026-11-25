@@ -31,7 +31,14 @@ from app.agent.prompts import SYSTEM_PROMPT, TOOL_DESCRIPTIONS
 from app.agent.state import IdentityClaim, Phase, claim, move, new_call, verify
 from app.agent.tool_registry import Deps, Registry
 from app.agent.tools import register_tools
-from app.agent.turn import CALL_CONNECTED, CallAgent, drain_guard_audits, start_call
+from app.agent.turn import (
+    CALL_CONNECTED,
+    NOT_VERIFIED_NOTE,
+    VERIFIED_NOTE,
+    CallAgent,
+    drain_guard_audits,
+    start_call,
+)
 from app.audit.log import CHAIN_LOCK, AuditLog, Reason
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine, create_session_factory
@@ -361,15 +368,40 @@ async def test_swallowed_turns_never_reach_the_model(
     for turn in said:
         assert turn not in sent
     assert FIRST_PAIR + SECOND_PAIR not in sent
-    # The conversation holds the scripted lines, never the swallowed turns.
+    # The conversation holds the scripted lines, never the swallowed turns: in their place the
+    # model is told, by code, that the digits were checked and what came of it.
     assert [m["content"] for m in model.requests[-1].messages if isinstance(m["content"], str)] == [
         CALL_CONNECTED,
         GREETING,
         CLAIM_TURN,
         SSN_ASK,
+        VERIFIED_NOTE,
         VERIFIED_SARAH,
         "Can you help me with something?",
     ]
+    assert model.requests[-1].messages[-3] == {"role": "user", "content": VERIFIED_NOTE}
+    # The note is the model's alone: the call's record keeps the marker of the withheld turn.
+    assert VERIFIED_NOTE not in str(agent.history)
+
+
+async def test_the_model_is_told_when_the_digits_did_not_match(
+    deps: Deps, registry: Registry
+) -> None:
+    model = ScriptedModel(calls(("verify_identity", SARAH_CLAIM)))
+    agent = await agent_for(model, deps, registry)
+    await agent.handle(CLAIM_TURN)
+    wrong = await agent.handle("nine nine nine nine")
+    assert wrong.action is GuardAction.SWALLOW
+    assert not agent.state.verified
+
+    model.then(says("I can pass you to our staff."))
+    await agent.handle("What now?")
+    notes = [
+        m["content"]
+        for m in model.requests[-1].messages
+        if m["role"] == "user" and m["content"] in (VERIFIED_NOTE, NOT_VERIFIED_NOTE)
+    ]
+    assert notes == [NOT_VERIFIED_NOTE]
 
 
 # --- R2 ---------------------------------------------------------------------------------
@@ -559,9 +591,10 @@ async def test_scripts_are_spoken_verbatim(
             },
         ],
     }
-    # The model is told the line was said, as its own message.
-    assert after_claim[claimed_at + 3 : claimed_at + 5] == [
+    # The model is told the line was said, as its own message, and that the digits were checked.
+    assert after_claim[claimed_at + 3 : claimed_at + 6] == [
         {"role": "assistant", "content": SSN_ASK},
+        {"role": "user", "content": VERIFIED_NOTE},
         {"role": "assistant", "content": VERIFIED_SARAH},
     ]
     assert rows(owner_engine) == [

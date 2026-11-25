@@ -145,6 +145,17 @@ PHONE_DIGITS = 10
 PHONE_DIGITS_MOST = 11
 SSN_DIGITS = 9
 SWALLOWED_TURN = "(turn withheld)"
+# What the model is told, in place of the digits it is never given, once code has checked them:
+# without it the model sees its question and then the scripted line with no answer between,
+# and may ask for the digits again.
+VERIFIED_NOTE = (
+    "(The caller said the digits. The clinic's system checked them: the caller is verified."
+    " Do not ask for them again.)"
+)
+NOT_VERIFIED_NOTE = (
+    "(The caller said the digits. The clinic's system checked them: they did not match, and"
+    " the caller is not verified.)"
+)
 EMERGENCY_TURN = "(emergency turn withheld)"
 
 # What the model is told about a tool call that ended its turn with a scripted line, and about
@@ -482,6 +493,9 @@ class CallAgent:
         if decision.submit:
             self._state, outcome = await submit_claim(self._state, self._deps)
             self._hand_off = self._hand_off or outcome.hand_off
+            # For the model alone, before the line code says about it.
+            note = VERIFIED_NOTE if self._state.verified else NOT_VERIFIED_NOTE
+            self._messages.append({"role": "user", "content": note})
             self._line_for(outcome)
         elif decision.script is not None:
             self.say(decision.script)

@@ -215,14 +215,17 @@ def unfinished(text: str) -> bool:
     if not words:
         return False
     last = words[-1]
+    digits = single_digits_alone(said)
+    if len(digits) in _WHOLE_NUMBERS:
+        # An answer as it stands, however speech-to-text ended it.
+        return False
     if last.endswith(",") or last in _NEVER_LAST:
         return True
     if last == "is" and len(words) > 1 and words[-2] in _ASKED_FOR:
         return True
     if not stopped and last in _SELDOM_LAST:
         return True
-    digits = single_digits_alone(said)
-    return len(digits) >= _PIECE_DIGITS and len(digits) not in _WHOLE_NUMBERS
+    return len(digits) >= _PIECE_DIGITS
 
 
 def _ms(seconds: float) -> int:
