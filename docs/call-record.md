@@ -1,6 +1,66 @@
 # Call record and turn timings
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+Audio is never stored. When a call ends, one record of it is kept for staff: when it happened,
+how it ended, and a transcript that has been masked three times. Each caller turn also leaves a
+row of timings, used for the latency metrics. None of this work happens while the caller is
+waiting.
+
+```mermaid
+flowchart LR
+  T["Call transcript"] --> P1["1. Pattern masking<br/>SSNs, dates, phones, emails"]
+  P1 --> P2["2. Known names<br/>replaced by PERSON"]
+  P2 --> P3["3. Presidio and spaCy<br/>names, places, dates in free text"]
+  P3 --> S[("call_sessions<br/>stored, masked")]
+  S --> A["Admin API<br/>masks again on the way out"]
+```
+
+## The three masking layers
+
+| Layer | What it catches | How |
+|---|---|---|
+| 1. Patterns | SSNs (digits or spoken words), dates of birth, phone numbers, email addresses | Our own masker in `app/guard/mask.py` |
+| 2. Known names | The verified patient's name and every name given to a tool, also spelled letter by letter | Replaced by a `PERSON` marker in `app/agent/call_record.py` |
+| 3. Presidio with spaCy | Names, locations and dates the first two layers cannot know about | Microsoft Presidio over the spaCy model `en_core_web_sm` |
+
+- The spaCy model is pinned and installed with the dependencies. It is never downloaded at run
+  time.
+- The Presidio pass runs on its own worker thread after the call, never on the loop that
+  carries live calls.
+- If the Presidio pass fails, the transcript from layers 1 and 2 is stored and the row is
+  flagged as not fully masked. It is never stored unmasked.
+
+## What a call record holds
+
+| Field | Notes |
+|---|---|
+| Start, end, office open or closed | The call's own clock |
+| Verified or not, and as which patient | A patient id, never a name |
+| Why the call ended | A fixed reason code |
+| Number of caller turns | |
+| Masked transcript | A turn the model was never given appears as a marker, not as text |
+
+## Turn timings
+
+Every turn records how long each stage took: the silence wait, the final transcript, the model's
+first and last token, the first audio, and the whole turn. The rows hold only ids, fixed names
+and numbers. They are written by a background task from a queue, so recording a turn costs the
+call nothing; if the queue is full a row is dropped and counted, never raised into the call.
+
+## Known limit
+
+Masking free text is best effort. The language model behind layer 3 can over-mask ordinary
+words such as "today" and can miss an unusual name.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Call record
 
@@ -87,3 +147,5 @@ an id's shape or a registry's names. The runtime role may insert and read it, no
   with no line goes at once.
 - At shutdown the app waits for the queue to be written (`TurnRecorder.drain()`), at most 5
   seconds; a process killed outright loses what was queued.
+
+</details>

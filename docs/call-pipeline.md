@@ -1,6 +1,79 @@
 # The call pipeline: speech in, the model, speech out
 
-Part of the [README](../README.md)'s reference.
+[Back to the README](../README.md)
+
+## At a glance
+
+A call is live audio between the caller's browser and the voice service. Each time the caller
+stops speaking, one **turn** runs: speech becomes text, code checks it, the model answers with
+the help of tools, code checks the answer, and the answer is spoken. The model is one step in
+that chain and never the one that decides what is allowed.
+
+```mermaid
+sequenceDiagram
+  participant C as Caller's browser
+  participant V as Voice service
+  participant S as Deepgram
+  participant M as Claude Haiku
+  participant D as Postgres
+  participant T as ElevenLabs
+  C->>V: audio (WebRTC)
+  V->>S: audio stream
+  S-->>V: final transcript
+  Note over V: Input guard (code)
+  V->>M: guarded text and the tools allowed now
+  M-->>V: tool call
+  Note over V: Gate and dispatch (code)
+  V->>D: work and audit event, one transaction
+  D-->>V: result
+  V->>M: tool result
+  M-->>V: reply text
+  Note over V: Output guard (code)
+  V->>T: line to speak
+  T-->>V: audio
+  V->>C: audio (WebRTC)
+```
+
+## The stages of a turn
+
+| Stage | What happens | Code |
+|---|---|---|
+| Connect | The page sets up a WebRTC call with a token; audio goes direct, or through our TURN relay | `app/voice/transport.py` |
+| Listen | Voice activity detection hears the caller stop; speech-to-text finalizes the words | `app/voice/pipeline.py` |
+| Check the words | The input guard handles emergencies and SSN digits before the model | `app/guard/input.py` |
+| Think | The model gets a fixed prompt, the conversation and only the tools allowed now | `app/agent/turn.py`, `app/agent/model.py` |
+| Act | A tool call goes through the gate and dispatch; its work and audit event commit together | `app/agent/tool_registry.py` |
+| Check the answer | The output guard reads every sentence before it is spoken | `app/guard/output.py` |
+| Speak | The line is streamed to text-to-speech and played to the caller | `app/voice/speech.py` |
+
+## Conversation behaviour
+
+- **A pause is not always the end.** A sentence that plainly is not finished ("my phone number
+  is", three digits of a number) waits 2 seconds for its rest, longer while the caller is
+  still speaking.
+- **Numbers are counted by code.** A phone number given in pieces is assembled and counted by
+  code, which tells the model what it heard. A model counts digits badly; code does not.
+- **Interruptions need words.** The caller can talk over the agent, but a line stops only once
+  speech-to-text has heard words, so a noise in the room stops nothing. The greeting, the
+  closed line and the 911 line cannot be interrupted.
+- **One tool call per reply.** The model reads each tool's result before asking for the next.
+- **Never silent.** "One moment while I check." when a tool is slow; a fixed fallback line if
+  the model does not answer in time.
+- **Emergencies win.** An emergency phrase is heard even while a turn is running or the call is
+  closing.
+
+## How a call ends
+
+The caller hangs up, the agent closes after the caller has nothing else, an emergency ends it
+with the 911 line, a transfer hands it to staff, silence ends it after a prompt, or the maximum
+call length is reached. Each ending writes an audit event with its reason.
+
+## Full reference
+
+The complete detail, for when you need the exact rule.
+
+<details>
+<summary>Open the full reference</summary>
 
 ## Voice call: speech in, the model and its tools
 
@@ -261,3 +334,5 @@ Limits:
 - On a real call the agent's own voice coming back through loudspeakers can be heard as the
   caller's words and interrupt it. The call page asks the browser for echo cancellation, noise
   suppression and automatic gain; headphones remove the cause.
+
+</details>

@@ -1,5 +1,5 @@
 # Test only (CI): every variable of the deployment given to every service, as a platform that
-# adds its env file to each service does (Coolify, some versions). Each service must still
+# adds its env file to each service does (some hosting panels). Each service must still
 # start; app and admin-api ignore the other role's secrets (app/config.py). The path is the
 # repo root's .env, relative to deploy/.
 #   docker compose --env-file .env -f deploy/docker-compose.yml \
