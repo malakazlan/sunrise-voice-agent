@@ -1001,8 +1001,15 @@ def test_no_print_in_app() -> None:
 # append, so its modules name no write construct (SQLAlchemy's insert, update, delete, merge,
 # a session's add, raw SQL text) and hold no string with a writing SQL keyword; every other
 # `.append` call is refused, so the one there is is the audit log's. Docstrings are prose and
-# are not read. Like the scans above, a lint against accidents.
-ADMIN_MODULES = ("app/api/admin.py", "app/audit/read.py", "app/audit/console.py")
+# are not read. A route of the API's own app for the DELETE method (`@app.delete`, signing out)
+# is a route, not a write. Like the scans above, a lint against accidents.
+ADMIN_MODULES = (
+    "app/api/admin.py",
+    "app/api/reads.py",
+    "app/api/live.py",
+    "app/audit/read.py",
+    "app/audit/console.py",
+)
 WRITE_NAMES = {
     "insert",
     "update",
@@ -1043,15 +1050,31 @@ def is_audit_append(node: ast.AST) -> bool:
     )
 
 
+def route_decorators(tree: ast.AST) -> set[int]:
+    """The `app.<method>` attributes that decorate a function: `@app.delete(...)` is a route."""
+    return {
+        id(decorator.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "app"
+    }
+
+
 def admin_write_uses(source: str) -> list[str]:
     tree = ast.parse(source)
     prose = docstring_ids(tree)
+    routes = route_decorators(tree)
     uses = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in WRITE_NAMES:
             uses.append(node.id)
         elif isinstance(node, ast.Attribute) and node.attr in WRITE_NAMES:
-            uses.append(f".{node.attr}")
+            if id(node) not in routes:
+                uses.append(f".{node.attr}")
         elif isinstance(node, ast.alias) and node.name.split(".")[-1] in WRITE_NAMES:
             uses.append(f"import {node.name}")
         elif (
@@ -1090,6 +1113,9 @@ def test_admin_is_read_only() -> None:
         "SQL = 'drop table requests'\n",
         "rows.append(row)\n",
         "self.audit.append(session, event, now=now)\n",
+        # Only a route decorator is a route: anything else named app.delete is not.
+        "await app.delete(row)\n",
+        "remove = app.delete\n",
     ):
         assert admin_write_uses(sample), sample
     assert not admin_write_uses(
@@ -1097,6 +1123,7 @@ def test_admin_is_read_only() -> None:
         "await audit.append(session, event, now=now)\n"
         "await session.execute(select(Request).where(Request.id < before))\n"
         "logger.info('admin_read action=%s rows=%d', action, count)\n"
+        "@app.delete('/session')\nasync def sign_out() -> None: ...\n"
     )
 
     sources = {name: (REPO_ROOT / name).read_text(encoding="utf-8") for name in ADMIN_MODULES}
@@ -1108,7 +1135,13 @@ def test_admin_is_read_only() -> None:
         name: sum(1 for node in ast.walk(ast.parse(source)) if is_audit_append(node))
         for name, source in sources.items()
     }
-    assert appends == {"app/api/admin.py": 1, "app/audit/read.py": 0, "app/audit/console.py": 0}
+    assert appends == {
+        "app/api/admin.py": 1,
+        "app/api/reads.py": 0,
+        "app/api/live.py": 0,
+        "app/audit/read.py": 0,
+        "app/audit/console.py": 0,
+    }
 
 
 # app/guard/mask.py is the one owner of the SSN patterns: the cues, the SSN shape, the bare last

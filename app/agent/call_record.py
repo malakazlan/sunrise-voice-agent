@@ -34,8 +34,7 @@ import asyncio
 import functools
 import importlib.util
 import logging
-import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -50,7 +49,7 @@ from app.agent.tool_registry import Deps
 from app.audit.log import Reason
 from app.db.models import MAX_TRANSCRIPT, CallSession, Patient
 from app.guard.logging import quiet_presidio
-from app.guard.mask import mask
+from app.guard.mask import hide_names, mask
 
 if TYPE_CHECKING:
     from presidio_analyzer import AnalyzerEngine
@@ -93,12 +92,6 @@ NAME_ARGUMENTS = {
     "collect_new_patient": "full_name",
     "take_message": "name",
 }
-# A word of a name: letters, with an apostrophe inside (O'Brien). Shorter words are not hidden.
-NAME_WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
-MIN_NAME_LETTERS = 2
-# What goes between the letters of a name spelled out: S A R A H, j-o-h-n-s-o-n, s.a.r.a.h.
-SPELLED_GAP = r"[\s.,-]+"
-PERSON = "<PERSON>"
 
 # One thread makes every record, one at a time: off the event loop, and the model is never used
 # from two threads at once.
@@ -172,25 +165,6 @@ def _tool_names(history: Sequence[Mapping[str, Any]]) -> list[str]:
     return names
 
 
-def _hide_names(text: str, names: Iterable[str]) -> str:
-    """The text with each word of the names, of MIN_NAME_LETTERS or more, replaced by PERSON
-    wherever it stands as a whole word, in any case, as it is or spelled out: one compiled
-    alternation, so one pass over the text."""
-    words = {
-        word.lower()
-        for name in names
-        for word in NAME_WORD.findall(name)
-        if len(word) >= MIN_NAME_LETTERS
-    }
-    if not words:
-        return text
-    forms = {re.escape(word) for word in words} | {
-        SPELLED_GAP.join(re.escape(letter) for letter in word if letter != "'") for word in words
-    }
-    alternation = "|".join(sorted(forms, key=len, reverse=True))
-    return re.sub(rf"(?<!\w)(?:{alternation})(?!\w)", PERSON, text, flags=re.IGNORECASE)
-
-
 def _transcript(history: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
     """One line for each caller turn and each thing the agent said, in order, and the number of
     caller turns. Text the model wrote beside a tool call was never said and is left out."""
@@ -227,7 +201,7 @@ def _masked(history: Sequence[Mapping[str, Any]], names: Sequence[str]) -> tuple
     whether it was cut."""
     text, turns = _transcript(history)
     text, cut = _cut(text)
-    return _hide_names(mask(text), [*names, *_tool_names(history)]), turns, cut
+    return hide_names(mask(text), [*names, *_tool_names(history)]), turns, cut
 
 
 async def _patient_names(session: AsyncSession, patient_id: str) -> list[str]:

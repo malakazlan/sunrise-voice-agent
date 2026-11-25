@@ -44,7 +44,9 @@ def cid(number: int) -> str:
 # The one call the single-call routes read in these tests.
 CALL_ROUTE = f"/admin/api/calls/{cid(1)}"
 TURNS_ROUTE = f"/admin/api/calls/{cid(1)}/turns"
+DETAIL_ROUTE = f"/admin/api/calls/{cid(1)}/detail"
 LIVE_ROUTE = "/admin/api/calls/live"
+QUEUE_ROUTE = "/admin/api/queue"
 ROUTES = [
     "/admin/api/requests",
     "/admin/api/messages",
@@ -58,6 +60,8 @@ ROUTES = [
     "/admin/api/slots",
     "/admin/api/guardrails/summary",
     "/admin/api/metrics/summary",
+    QUEUE_ROUTE,
+    DETAIL_ROUTE,
 ]
 # Each route's audit action, resource type and resource id, written out by hand.
 ROUTE_EVENTS = {
@@ -73,6 +77,8 @@ ROUTE_EVENTS = {
     "/admin/api/slots": ("admin_read_slots", "slot", None),
     "/admin/api/guardrails/summary": ("admin_read_guardrails", "audit_event", None),
     "/admin/api/metrics/summary": ("admin_read_metrics", "call", None),
+    QUEUE_ROUTE: ("admin_read_queue", "request", None),
+    DETAIL_ROUTE: ("admin_read_call_detail", "call", cid(1)),
 }
 LISTS = {
     "/admin/api/requests": "requests",
@@ -272,9 +278,14 @@ def ssn_sample() -> str:
     return "-".join(["123", "45", "6789"])
 
 
+CALLER_NAME = "Jane Doe"
+MESSAGE_BODY = f"Jane Doe asks. Number {ssn_sample()}, mail jane.doe@example.com, born 3/14/1985"
+
+
 def seed_identifiers(engine: Engine) -> None:
-    """One request, one message, one call and one appointment holding every kind of identifier
-    the masking hides; a turn of the call, and an open slot."""
+    """A refill request and a doctor's message with its request, one call and one appointment
+    holding every kind of identifier the masking hides, the caller's name among them; a turn
+    of the call, and an open slot."""
     with engine.begin() as connection:
         connection.execute(INSERT_PATIENT)
         connection.execute(
@@ -284,7 +295,19 @@ def seed_identifiers(engine: Engine) -> None:
                 "call_id": cid(1),
                 "patient_id": "P001",
                 "type": "refill",
-                "summary": f"Refill, dob 1985-03-14, phone 555-201-3344, ssn {ssn_sample()}",
+                "summary": "Refill for Jane Doe, dob 1985-03-14, phone 555-201-3344,"
+                f" ssn {ssn_sample()}",
+                "created_at": T0,
+            },
+        )
+        connection.execute(
+            INSERT_REQUEST,
+            {
+                "id": 2,
+                "call_id": cid(1),
+                "patient_id": "P001",
+                "type": "doctor_message",
+                "summary": MESSAGE_BODY,
                 "created_at": T0,
             },
         )
@@ -294,17 +317,17 @@ def seed_identifiers(engine: Engine) -> None:
                 "id": 1,
                 "call_id": cid(1),
                 "patient_id": "P001",
-                "name": "Jane Doe",
+                "name": CALLER_NAME,
                 "callback_number": "555-201-3344",
-                "body": f"Number {ssn_sample()}, mail jane.doe@example.com, born 3/14/1985",
+                "body": MESSAGE_BODY,
                 "created_at": T0,
             },
         )
         insert_call(
             connection,
             1,
-            transcript=f"caller: Refill please, dob 1985-03-14, ssn {ssn_sample()}\n"
-            "agent: I'll mail jane.doe@example.com and call 555-201-3344.",
+            transcript="caller: Jane Doe here. Refill please, dob 1985-03-14,"
+            f" ssn {ssn_sample()}\nagent: I'll mail jane.doe@example.com and call 555-201-3344.",
             patient_id="P001",
         )
         connection.execute(
@@ -352,7 +375,7 @@ def test_admin_requires_credentials(database: StartupSettings) -> None:
             assert response.status_code == 401, (route, name)
             assert response.json() == REFUSED_BODY, (route, name)
             assert response.headers["www-authenticate"] == REFUSED_CHALLENGE, (route, name)
-    assert seen == 12 * 13
+    assert seen == 14 * 13
 
 
 # R2
@@ -379,7 +402,16 @@ def test_admin_is_off_without_a_password(
 def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings) -> None:
     seed_identifiers(owner_engine)
     append_events(database, [call_started(1)])
-    raw = [ssn_sample(), "1985-03-14", "555-201-3344", "201-3344", "jane.doe@", "3/14/1985"]
+    raw = [
+        ssn_sample(),
+        "1985-03-14",
+        "555-201-3344",
+        "201-3344",
+        "jane.doe@",
+        "3/14/1985",
+        "Jane",
+        "Doe",
+    ]
     # The clinic's clock ten minutes after the call started: it is live, and the slot is in
     # the week from today.
     admin_app = create_app(admin_settings(database, simulated_now="2026-11-24T15:40:00Z"))
@@ -400,18 +432,24 @@ def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings)
         for value in raw:
             assert value not in response.text, (route, value)
 
-    assert bodies["/admin/api/requests"].json() == {
-        "requests": [
-            {
-                "id": 1,
-                "created_at": "2026-11-24T15:30:00+00:00",
-                "call_id": cid(1),
-                "type": "refill",
-                "summary": "Refill, dob ****-**-14, phone ***-***-3344, ssn ****",
-                "patient_id": "P001",
-            }
-        ]
+    # The caller's name is hidden wherever it stands, the message's own field included.
+    refill = {
+        "id": 1,
+        "created_at": "2026-11-24T15:30:00+00:00",
+        "call_id": cid(1),
+        "type": "refill",
+        "summary": "Refill for <PERSON> <PERSON>, dob ****-**-14, phone ***-***-3344, ssn ****",
+        "patient_id": "P001",
     }
+    left = {
+        "id": 2,
+        "created_at": "2026-11-24T15:30:00+00:00",
+        "call_id": cid(1),
+        "type": "doctor_message",
+        "summary": "<PERSON> <PERSON> asks. Number ***-**-****, mail j***@***.com, born ****-**-14",
+        "patient_id": "P001",
+    }
+    assert bodies["/admin/api/requests"].json() == {"requests": [left, refill]}
     assert bodies["/admin/api/messages"].json() == {
         "messages": [
             {
@@ -419,11 +457,20 @@ def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings)
                 "created_at": "2026-11-24T15:30:00+00:00",
                 "call_id": cid(1),
                 "kind": "doctor_message",
-                "name": "Jane Doe",
+                "name": "<PERSON> <PERSON>",
                 "callback_number": "***-***-3344",
-                "body": "Number ***-**-****, mail j***@***.com, born ****-**-14",
+                "body": "<PERSON> <PERSON> asks. Number ***-**-****, mail j***@***.com,"
+                " born ****-**-14",
                 "patient_id": "P001",
             }
+        ]
+    }
+    # The Requests page's rows: newest received first, the higher id first at the same instant;
+    # each with the masked numbers its message left, never the caller's name.
+    assert bodies[QUEUE_ROUTE].json() == {
+        "requests": [
+            {**left, "callbacks": ["***-***-3344"], "after_hours": False},
+            {**refill, "callbacks": [], "after_hours": False},
         ]
     }
     call = {
@@ -438,15 +485,32 @@ def test_admin_output_is_masked(owner_engine: Engine, database: StartupSettings)
         "turn_count": 1,
     }
     assert bodies["/admin/api/calls"].json() == {"calls": [call]}
-    assert bodies[CALL_ROUTE].json() == {
-        "call": {
-            **call,
-            # As in the request's summary: digits after an SSN cue are hidden whole.
-            "transcript": "caller: Refill please, dob ****-**-14, ssn ****\n"
-            "agent: I'll mail j***@***.com and call ***-***-3344.",
-            "transcript_truncated": False,
-            "names_masked": True,
-        }
+    stored = {
+        **call,
+        # As in the request's summary: digits after an SSN cue are hidden whole; and the names
+        # the call's records know are hidden a second time.
+        "transcript": "caller: <PERSON> <PERSON> here. Refill please, dob ****-**-14, ssn ****\n"
+        "agent: I'll mail j***@***.com and call ***-***-3344.",
+        "transcript_truncated": False,
+        "names_masked": True,
+        "transcript_withheld": None,
+    }
+    assert bodies[CALL_ROUTE].json() == {"call": stored}
+    assert bodies[DETAIL_ROUTE].json() == {
+        "call": stored,
+        "events": [
+            {
+                "seq": 1,
+                "ts": "2026-11-24T15:30:00+00:00",
+                "call_id": cid(1),
+                "actor": "agent",
+                "action": "call_started",
+                "resource_type": "call",
+                "resource_id": cid(1),
+                "outcome": "success",
+                "reason": None,
+            }
+        ],
     }
     assert bodies["/admin/api/audit"].json() == {
         "events": [
@@ -552,17 +616,21 @@ def test_admin_reads_are_audited(admin_app: FastAPI, owner_engine: Engine) -> No
             response = client.get(f"/admin/api/calls/{missing}", headers=SIGNED_IN)
             assert response.status_code == 404, missing
             assert response.json() == NOT_FOUND_BODY, missing
-        # Nor are the turns of an id that is not a call's.
+        # Nor are the turns of an id that is not a call's, nor the detail of either.
         for malformed in missing_ids[1:]:
             response = client.get(f"/admin/api/calls/{malformed}/turns", headers=SIGNED_IN)
             assert response.status_code == 404, malformed
             assert response.json() == NOT_FOUND_BODY, malformed
+        for missing in missing_ids:
+            response = client.get(f"/admin/api/calls/{missing}/detail", headers=SIGNED_IN)
+            assert response.status_code == 404, missing
+            assert response.json() == NOT_FOUND_BODY, missing
         assert events(owner_engine) == before
 
         # The chain the reads wrote verifies.
         verified = client.get("/admin/api/audit/verify", headers=SIGNED_IN).json()
-    assert verified == {"ok": True, "checked": 12, "breaks": [], "truncated": False}
-    assert [row[0] for row in events(owner_engine)] == list(range(1, 14))
+    assert verified == {"ok": True, "checked": 14, "breaks": [], "truncated": False}
+    assert [row[0] for row in events(owner_engine)] == list(range(1, 16))
 
 
 # R6
@@ -657,15 +725,43 @@ def test_admin_query_bounds(
             assert len(events(owner_engine)) == written, route
 
         # The verify, single-call and live routes take no parameters at all.
-        for route in ("/admin/api/audit/verify", CALL_ROUTE, LIVE_ROUTE):
+        for route in ("/admin/api/audit/verify", CALL_ROUTE, LIVE_ROUTE, DETAIL_ROUTE):
             for query in ["limit=1", "before=1", "call_id=" + cid(1), "x=1"]:
                 response = client.get(f"{route}?{query}", headers=SIGNED_IN)
                 assert response.status_code == 422, (route, query)
                 assert response.json() == INVALID_QUERY_BODY, (route, query)
 
-        # The other routes' own parameters: the requests' type, one call's turns after a turn
-        # number, the slots of up to 14 days from a date, and summaries of 1 to 30 days.
+        # The other routes' own parameters: the requests' type, the queue's type and the last
+        # request of the page before, one call's turns after a turn number, the slots of up to
+        # 14 days from a date, and summaries of 1 to 30 days.
         own = {
+            "/admin/api/calls": (
+                [
+                    "end_reason=nope",
+                    "end_reason=COMPLETED",
+                    "end_reason=",
+                    "end_reason=completed'",
+                    "end_reason=completed&end_reason=error",
+                ],
+                ["end_reason=completed", "end_reason=error&limit=5&before=7"],
+            ),
+            QUEUE_ROUTE: (
+                [
+                    "type=nope",
+                    "type=REFILL",
+                    "type=",
+                    "type=refill&type=booking",
+                    "before=0",
+                    "before=-1",
+                    "before=2147483648",
+                    "before=1;",
+                    "before=1&before=2",
+                    "limit=5",
+                    "call_id=" + cid(1),
+                    "x=1",
+                ],
+                ["type=refill", "before=1", "type=callback&before=2147483647"],
+            ),
             "/admin/api/requests": (
                 [
                     "type=nope",
@@ -739,7 +835,7 @@ def test_admin_query_bounds(
             written += len(allowed)
             assert len(events(owner_engine)) == written, route
     assert len(events(owner_engine)) == written
-    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 5 + 2 + 2
+    assert written == 4 + 4 + 7 + 4 + 4 + 2 + 3 + 2 + 3 + 5 + 2 + 2
     # No read failed: every refused value was refused before the database was asked.
     assert "admin_read_failed" not in caplog.text
 
@@ -832,6 +928,20 @@ def test_admin_paging(admin_app: FastAPI, owner_engine: Engine, database: Startu
                 query = f"limit=50&before={rows[-1][key]}{extra}"
             assert sizes == [50, 50, 20, 0], route
             assert seen == list(range(120, 0, -1)), route
+
+        # The queue, in pages of 50, from the last request of the page before.
+        seen = []
+        sizes = []
+        query = ""
+        for _ in range(5):
+            rows = client.get(QUEUE_ROUTE + query, headers=SIGNED_IN).json()["requests"]
+            sizes.append(len(rows))
+            if not rows:
+                break
+            seen += [row["id"] for row in rows]
+            query = f"?before={rows[-1]['id']}"
+        assert sizes == [50, 50, 20, 0]
+        assert seen == list(range(120, 0, -1))
 
         # A call's turns come in order, a page at a time after the last turn seen.
         turns: list[int] = []
@@ -982,9 +1092,10 @@ def test_admin_headers_and_schema(
             client.get(f"/admin/api/calls/{cid(2)}", headers=SIGNED_IN),
             client.get("/admin/api/calls/not-a-call", headers=SIGNED_IN),
         ]
+        wrong = basic(ADMIN_USER, TRIED_PASSWORD)
         for _ in range(5):
-            client.get(ROUTES[0])
-        responses.append(client.get(ROUTES[0]))
+            client.get(ROUTES[0], headers=wrong)
+        responses.append(client.get(ROUTES[0], headers=wrong))
     down = create_app(admin_settings(database, postgres_port=closed_port()))
     with client_from(down) as client:
         responses.append(client.get(ROUTES[0], headers=SIGNED_IN))
@@ -1001,6 +1112,12 @@ def test_admin_headers_and_schema(
     ]
     for response in responses:
         assert response.headers["cache-control"] == "no-store", response.status_code
+        assert response.headers["x-content-type-options"] == "nosniff", response.status_code
+        assert response.headers["referrer-policy"] == "no-referrer", response.status_code
+        assert (
+            response.headers["content-security-policy"]
+            == "default-src 'none'; frame-ancestors 'none'"
+        ), response.status_code
 
     # Docs are on in dev, and the admin routes are not in them.
     with client_from(admin_app) as client:
@@ -1037,6 +1154,7 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
         }
         assert client.get(LIVE_ROUTE, headers=SIGNED_IN).json() == {"calls": []}
         assert client.get(TURNS_ROUTE, headers=SIGNED_IN).json() == {"turns": []}
+        assert client.get(QUEUE_ROUTE, headers=SIGNED_IN).json() == {"requests": []}
         # Past the oldest row: nothing.
         seed_identifiers(owner_engine)
         assert client.get("/admin/api/requests?before=1", headers=SIGNED_IN).json() == {
@@ -1049,8 +1167,54 @@ def test_admin_empty_tables(admin_app: FastAPI, owner_engine: Engine) -> None:
         admin_event("/admin/api/appointments"),
         admin_event(LIVE_ROUTE),
         admin_event(TURNS_ROUTE),
+        admin_event(QUEUE_ROUTE),
         admin_event("/admin/api/requests"),
     ]
+
+
+def test_queue_is_newest_received_first(admin_app: FastAPI, owner_engine: Engine) -> None:
+    # Received time decides, not the id; at the same instant the higher id comes first. A page
+    # goes on from the last request of the page before; an id that is not a request's ends it.
+    with owner_engine.begin() as connection:
+        for number, minutes in ((1, 2), (2, 1), (3, 2)):
+            connection.execute(
+                INSERT_REQUEST,
+                {
+                    "id": number,
+                    "call_id": cid(number),
+                    "patient_id": None,
+                    "type": "refill",
+                    "summary": f"Refill number {number}",
+                    "created_at": T0 + timedelta(minutes=minutes),
+                },
+            )
+    with client_from(admin_app) as client:
+        for query, expected in (
+            ("", [3, 1, 2]),
+            ("?before=3", [1, 2]),
+            ("?before=1", [2]),
+            ("?before=2", []),
+            ("?before=99", []),
+            ("?type=callback", []),
+        ):
+            rows = client.get(QUEUE_ROUTE + query, headers=SIGNED_IN).json()["requests"]
+            assert [row["id"] for row in rows] == expected, query
+
+
+def test_a_transcript_whose_names_were_not_masked_is_withheld(
+    admin_app: FastAPI, owner_engine: Engine
+) -> None:
+    with owner_engine.begin() as connection:
+        insert_call(connection, 1, transcript="caller: Jane Doe here.")
+        connection.execute(text("UPDATE call_sessions SET names_masked = false"))
+    with client_from(admin_app) as client:
+        for route in (CALL_ROUTE, DETAIL_ROUTE):
+            response = client.get(route, headers=SIGNED_IN)
+            assert response.status_code == 200, route
+            shown = response.json()["call"]
+            assert shown["transcript"] is None, route
+            assert shown["transcript_withheld"] == "names_not_masked", route
+            assert "Jane" not in response.text, route
 
 
 def test_admin_database_down(database: StartupSettings, caplog: pytest.LogCaptureFixture) -> None:
@@ -1268,3 +1432,57 @@ def test_rate_limiter_keeps_an_address_that_failed_again() -> None:
     assert limiter.record_failure("a") == 3
     # "b" was dropped: it starts again from one (and "c" makes room for it).
     assert limiter.record_failure("b") == 1
+
+
+INSERT_ENDED_CALL = text(
+    "INSERT INTO call_sessions (id, call_id, started_at, ended_at, office_open, verified,"
+    " patient_id, end_reason, turn_count, transcript, transcript_truncated, names_masked)"
+    " VALUES (:id, :call_id, :started_at, :ended_at, true, false, NULL, :end_reason, 1,"
+    " 'agent: Goodbye.', false, true)"
+)
+END_REASONS = (
+    "completed",
+    "emergency",
+    "transferred",
+    "caller_hung_up",
+    "idle_timeout",
+    "max_duration",
+    "error",
+)
+
+
+def test_calls_filter_by_how_they_ended(admin_app: FastAPI, owner_engine: Engine) -> None:
+    # Three calls for each way a call ends, written out by hand, ids in turn.
+    with owner_engine.begin() as connection:
+        for number in range(1, 3 * len(END_REASONS) + 1):
+            connection.execute(
+                INSERT_ENDED_CALL,
+                {
+                    "id": number,
+                    "call_id": cid(number),
+                    "started_at": T0 + timedelta(minutes=number),
+                    "ended_at": T0 + timedelta(minutes=number + 1),
+                    "end_reason": END_REASONS[(number - 1) % len(END_REASONS)],
+                },
+            )
+    with client_from(admin_app) as client:
+        everything = client.get("/admin/api/calls", headers=SIGNED_IN).json()["calls"]
+        assert len(everything) == 21
+        for offset, reason in enumerate(END_REASONS):
+            response = client.get(f"/admin/api/calls?end_reason={reason}", headers=SIGNED_IN)
+            ids = [row["id"] for row in response.json()["calls"]]
+            assert ids == [offset + 15, offset + 8, offset + 1], reason
+            assert {row["end_reason"] for row in response.json()["calls"]} == {reason}
+            # Paging keeps the filter: a page of one at a time.
+            seen: list[int] = []
+            query = f"end_reason={reason}&limit=1"
+            for _ in range(4):
+                rows = client.get(f"/admin/api/calls?{query}", headers=SIGNED_IN).json()["calls"]
+                if not rows:
+                    break
+                seen += [row["id"] for row in rows]
+                query = f"end_reason={reason}&limit=1&before={rows[-1]['id']}"
+            assert seen == ids, reason
+        refused = client.get("/admin/api/calls?end_reason=hung_up", headers=SIGNED_IN)
+        assert refused.status_code == 422
+        assert refused.json() == INVALID_QUERY_BODY

@@ -955,6 +955,10 @@ def test_registration_rules() -> None:
                 Action.ADMIN_READ_GUARDRAILS,
                 Action.ADMIN_READ_METRICS,
                 Action.ADMIN_VERIFY_AUDIT,
+                Action.ADMIN_SIGNED_IN,
+                Action.ADMIN_SIGNED_OUT,
+                Action.ADMIN_READ_CALL_DETAIL,
+                Action.ADMIN_READ_QUEUE,
             )
         ],
         # A tool that may verify the caller: not a patient-data tool, in intake only, and never

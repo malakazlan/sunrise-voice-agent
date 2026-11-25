@@ -40,6 +40,8 @@ Identifiers
     - the id of a `tool`: its registered name, 2 to 40 lower-case letters and underscores, as
       app/agent/tool_registry.py declares tools. A name the model gives that is not a
       registered tool is never recorded.
+    - the admin's browser `session`: none. Its events (the admin signing in and out) name no
+      record, and never the session's id.
     - `actor`: `agent`, or `admin:` and a user name of 1 to 32 letters and underscores,
       starting with a letter (ADMIN_NAME, which ADMIN_USER is held to as well).
 
@@ -123,6 +125,14 @@ class Action(StrEnum):
     ADMIN_VERIFY_AUDIT = "admin_verify_audit"
     ADMIN_READ_CALLS = "admin_read_calls"
     ADMIN_READ_CALL = "admin_read_call"
+    # The admin's browser session (app/api/admin.py): signing in and out; and the reads the
+    # console needs beyond one table: a call with its events, and the requests with their
+    # messages.
+    ADMIN_SIGNED_IN = "admin_signed_in"
+    ADMIN_SIGNED_OUT = "admin_signed_out"
+    ADMIN_READ_CALL_DETAIL = "admin_read_call_detail"
+    ADMIN_READ_QUEUE = "admin_read_queue"
+    # The admin API's reads for the console's next pages (app/audit/console.py).
     ADMIN_READ_LIVE_CALLS = "admin_read_live_calls"
     ADMIN_READ_CALL_TURNS = "admin_read_call_turns"
     ADMIN_READ_APPOINTMENTS = "admin_read_appointments"
@@ -159,7 +169,11 @@ class ResourceType(StrEnum):
     REQUEST = "request"
     MESSAGE = "message"
     AUDIT_EVENT = "audit_event"
+    SESSION = "session"
 
+
+# A session event names no record: no id has this shape.
+NO_ID = re.compile(r"(?!)")
 
 # The shape of each resource type's ids.
 ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
@@ -172,6 +186,7 @@ ID_PATTERNS: dict[ResourceType, re.Pattern[str]] = {
     ResourceType.REQUEST: ROW_ID,
     ResourceType.MESSAGE: ROW_ID,
     ResourceType.AUDIT_EVENT: ROW_ID,
+    ResourceType.SESSION: NO_ID,
 }
 
 

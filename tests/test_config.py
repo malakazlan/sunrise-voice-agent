@@ -16,7 +16,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings, StartupSettings
+from app.config import (
+    ADMIN_FIELDS,
+    STARTUP_CHECK_FIELDS,
+    VOICE_FIELDS,
+    DeploymentSettings,
+    Settings,
+    StartupSettings,
+)
 from app.db.session import create_owner_sync_engine
 from app.main import create_app
 
@@ -28,6 +35,7 @@ COMPOSE = REPO_ROOT / "deploy" / "docker-compose.yml"
 # and nothing of the owner.
 APPLICATION_FIELDS = {
     "app_env",
+    "app_role",
     "log_level",
     "postgres_host",
     "postgres_port",
@@ -44,6 +52,7 @@ APPLICATION_FIELDS = {
     "demo_access_token",
     "admin_password",
     "admin_user",
+    "console_origin",
     "anthropic_api_key",
     "deepgram_api_key",
     "llm_model",
@@ -66,6 +75,30 @@ STARTUP_FIELDS = {
     "postgres_password",
 }
 OWNER_FIELDS = {"postgres_user", "postgres_password"}
+# Without a default, but required by a rule rather than by having none: not given to the
+# admin role.
+REQUIRED_BUT_BY_THE_ADMIN = {"identity_hash_key"}
+# The admin's sign-in and the console's origin: the admin role's, never the voice role's.
+ADMIN_ONLY_FIELDS = {"admin_user", "admin_password", "console_origin"}
+# The admin role's settings: the database as the runtime role, the audit key, the clock and the
+# calls' longest (which the live calls follow), the admin's sign-in and the console's origin.
+# No key of a vendor, no TURN secret, no access token, no identity key.
+ADMIN_ROLE_FIELDS = {
+    "app_env",
+    "app_role",
+    "log_level",
+    "postgres_host",
+    "postgres_port",
+    "postgres_db",
+    "app_db_user",
+    "app_db_password",
+    "audit_hmac_key",
+    "simulated_now",
+    "max_call_seconds",
+    "admin_user",
+    "admin_password",
+    "console_origin",
+}
 
 
 def every_variable() -> set[str]:
@@ -129,9 +162,9 @@ def test_one_env_file_serves_both_settings_classes(
 
 
 def test_settings_check_reports_the_startup_settings(tmp_path: Path) -> None:
-    # `python -m app.config`, the start-up service's first step, given only the start-up
-    # settings' variables. Only what the interpreter needs to start is kept from this
-    # environment.
+    # `python -m app.config`, the start-up service's first step: the start-up steps' settings
+    # and every application setting, checked together as the role that holds them all. Only
+    # what the interpreter needs to start is kept from this environment.
     base = {key: value for key, value in os.environ.items() if key in ("PATH", "SYSTEMROOT")}
     base["PYTHONPATH"] = str(REPO_ROOT)
 
@@ -149,21 +182,26 @@ def test_settings_check_reports_the_startup_settings(tmp_path: Path) -> None:
     assert refused.returncode == 1
     for name in sorted(STARTUP_FIELDS - {"app_env", "log_level", "postgres_port"}):
         assert name in refused.stderr, name
-    assert re.search(r"validation errors? for StartupSettings$", refused.stderr, re.MULTILINE)
-    assert "audit_hmac_key" not in refused.stderr
+    for name in ("audit_hmac_key", "turn_shared_secret", "anthropic_api_key"):
+        assert name in refused.stderr, name
+    assert re.search(r"validation errors? for DeploymentSettings$", refused.stderr, re.MULTILINE)
 
-    startup_only = {
-        key: value for key, value in OFFLINE_DB_ENV.items() if key.lower() in STARTUP_FIELDS
-    }
-    assert "AUDIT_HMAC_KEY" not in startup_only
-    accepted = check({**startup_only, "APP_ENV": "dev"})
+    accepted = check({**OFFLINE_DB_ENV, "APP_ENV": "dev"})
     assert accepted.returncode == 0, accepted.stderr
     assert accepted.stderr == ""
+    # An APP_ROLE given to it changes nothing: every setting is checked as the role all holds,
+    # which a role holding fewer secrets would not refuse.
+    as_all = check({**OFFLINE_DB_ENV, "APP_ENV": "dev", "APP_ROLE": "admin"})
+    assert as_all.returncode == 0, as_all.stderr
+    unset = {key: value for key, value in OFFLINE_DB_ENV.items() if key != "IDENTITY_HASH_KEY"}
+    missing = check({**unset, "APP_ENV": "dev", "APP_ROLE": "admin"})
+    assert missing.returncode == 1
+    assert "identity_hash_key" in missing.stderr
 
 
 # The image serves: uvicorn, started straight by Docker, so it is PID 1 and receives signals.
 SERVE_COMMAND = (
-    'CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",'
+    'CMD ["uvicorn", "app.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",'
     ' "--workers", "1", "--no-access-log"]'
 )
 # The start-up steps, which the one-shot start-up service runs; any failure stops it there.
@@ -195,6 +233,21 @@ def test_the_app_image_serves_and_a_startup_service_prepares() -> None:
     published = app[app.index("ports:") + 1 :]
     entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
     assert entries == ['- "127.0.0.1:${APP_HOST_PORT:-8000}:8000"']
+
+    # The admin API: the same image and command, after the start-up too, on its own loopback
+    # port. The name `console` stays free for the console's own service.
+    admin = compose_service("admin-api")
+    assert "build: *app-image" in admin
+    assert not any(line.startswith("command:") for line in admin)
+    depends = admin[admin.index("depends_on:") :]
+    assert depends[:3] == ["depends_on:", "startup:", "condition: service_completed_successfully"]
+    published = admin[admin.index("ports:") + 1 :]
+    entries = published[: next(i for i, line in enumerate(published) if not line.startswith("- "))]
+    assert entries == ['- "127.0.0.1:${ADMIN_API_HOST_PORT:-8001}:8000"']
+    # The service named console is the Next.js app (console/), never the API's image.
+    console = compose_service("console")
+    assert "context: ../console" in console
+    assert not any("app-image" in line for line in console)
 
 
 def compose_service_lines(name: str) -> list[str]:
@@ -260,20 +313,127 @@ def test_compose_gives_each_service_exactly_its_settings_variables() -> None:
     owner = {name.upper() for name in OWNER_FIELDS}
     assert compose_anchors().keys() >= {"database-credentials", "runtime-database"}
 
-    assert compose_environment("app") == {name.upper() for name in Settings.model_fields}
-    assert compose_environment("startup") == {name.upper() for name in StartupSettings.model_fields}
-    assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
-    # The app's host port is Compose's alone: in no container and no settings class.
-    for service in ("db", "startup", "app", "coturn"):
-        assert "APP_HOST_PORT" not in compose_environment(service), service
-    assert "APP_HOST_PORT" not in every_variable()
+    # The roles' fields, as app/config.py declares them, and as they are written out here. The
+    # start-up check holds every setting of both classes but the role, which it sets itself.
+    assert VOICE_FIELDS == APPLICATION_FIELDS - ADMIN_ONLY_FIELDS
+    assert ADMIN_FIELDS == ADMIN_ROLE_FIELDS
+    assert ADMIN_FIELDS <= set(Settings.model_fields)
+    assert STARTUP_CHECK_FIELDS == (APPLICATION_FIELDS | STARTUP_FIELDS) - {"app_role"}
+    assert set(DeploymentSettings.model_fields) == APPLICATION_FIELDS | STARTUP_FIELDS
 
-    # No other route either: no env_file anywhere in the app service, and the owner's names
-    # nowhere in its text (not even inside another variable's value).
-    app = compose_service_lines("app")
-    assert not any(line.strip().startswith("env_file") for line in app)
-    assert not any(name in line for line in app for name in owner)
-    assert not owner & compose_environment("app")
+    assert compose_environment("app") == {name.upper() for name in VOICE_FIELDS}
+    # One variable that is no setting, read by uvicorn itself: which proxies' forwarded
+    # addresses to trust. The admin API's alone, its sign-in limit counts by address.
+    assert compose_environment("admin-api") == {name.upper() for name in ADMIN_FIELDS} | {
+        "FORWARDED_ALLOW_IPS"
+    }
+    assert "FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}" in compose_service("admin-api")
+    for service in ("db", "startup", "app", "coturn"):
+        assert "FORWARDED_ALLOW_IPS" not in compose_environment(service), service
+    assert "FORWARDED_ALLOW_IPS" not in every_variable()
+    assert compose_environment("startup") == {name.upper() for name in STARTUP_CHECK_FIELDS}
+    assert compose_environment("db") == {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"}
+    # Each service runs the role it is given the fields of.
+    assert "APP_ROLE: voice" in compose_service("app")
+    assert "APP_ROLE: admin" in compose_service("admin-api")
+    # The host ports are Compose's alone: in no container and no settings class.
+    for service in ("db", "startup", "app", "admin-api", "coturn"):
+        for port in ("APP_HOST_PORT", "ADMIN_API_HOST_PORT"):
+            assert port not in compose_environment(service), (service, port)
+    assert not {"APP_HOST_PORT", "ADMIN_API_HOST_PORT"} & every_variable()
+
+    # No other route either: no env_file anywhere in the app or the admin service, and the
+    # owner's names nowhere in their text (not even inside another variable's value).
+    for service in ("app", "admin-api"):
+        lines = compose_service_lines(service)
+        assert not any(line.strip().startswith("env_file") for line in lines), service
+        assert not any(name in line for line in lines for name in owner), service
+        assert not owner & compose_environment(service), service
+
+
+def test_shared_secrets_are_refused_at_startup() -> None:
+    # The one-shot start-up check is the one process given every secret of the deployment: it
+    # refuses the admin password equal to any other, naming both settings and no value. The
+    # long-running roles each hold too few of them to see it.
+    shared = "-".join(["shared", "secret", "not", "for", "logs", "x" * 8])
+    distinct: dict[str, Any] = {
+        "postgres_password": "-".join(["owner", "password", "of", "this", "test"]),
+        "app_db_password": "-".join(["runtime", "password", "of", "this", "test"]),
+        "audit_hmac_key": "-".join(["audit", "key", "of", "this", "test", "y" * 10]),
+        "identity_hash_key": "-".join(["identity", "key", "of", "this", "test", "z" * 10]),
+        "turn_shared_secret": "-".join(["turn", "secret", "of", "this", "test", "w" * 12]),
+        "demo_access_token": "-".join(["access", "token", "of", "this", "test", "v" * 12]),
+        "anthropic_api_key": "-".join(["anthropic", "key", "of", "this", "test"]),
+        "deepgram_api_key": "-".join(["deepgram", "key", "of", "this", "test"]),
+        "elevenlabs_api_key": "-".join(["elevenlabs", "key", "of", "this", "test"]),
+    }
+    base: dict[str, Any] = {
+        "app_env": "prod",
+        "postgres_host": "db.invalid",
+        "postgres_db": "sunrise",
+        "postgres_user": "sunrise",
+        "app_db_user": "sunrise_app",
+        "turn_host": VOICE_SECRETS["TURN_HOST"],
+        "elevenlabs_voice_id": VOICE_SECRETS["ELEVENLABS_VOICE_ID"],
+        "admin_user": "clinic_admin",
+        "admin_password": shared,
+    }
+    accepted = DeploymentSettings(_env_file=None, **base, **distinct)
+    assert accepted.postgres_user == "sunrise"
+    assert accepted.app_role == "all"
+    for name in distinct:
+        with pytest.raises(ValidationError) as refused:
+            DeploymentSettings(_env_file=None, **base, **{**distinct, name: shared})
+        text = str(refused.value)
+        assert re.search(
+            rf"admin_password must differ from {name}|{name} must differ from admin_password", text
+        ), name
+        assert shared not in text, name
+
+    # Not only the admin password: every secret differs from every other, the call access token
+    # and the TURN secret among them, each pair named and no value shown.
+    others = dict(distinct, admin_password="-".join(["admin", "password", "of", "this", "test"]))
+    names = sorted(others)
+    for index, first in enumerate(names):
+        for second in names[index + 1 :]:
+            values = {**base, **others, first: shared, second: shared}
+            with pytest.raises(ValidationError) as refused:
+                DeploymentSettings(_env_file=None, **values)
+            text = str(refused.value)
+            assert re.search(
+                rf"{first} must differ from {second}|{second} must differ from {first}", text
+            ), (first, second)
+            assert shared not in text, (first, second)
+
+
+def test_ci_checks_each_service_against_its_role() -> None:
+    # CI compares the running containers, and Compose's resolved configuration, with the
+    # fields of each service (.github/workflows/ci.yml): the admin API's and the start-up's.
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert 'echo "admin-api $(configured admin-api)"' in workflow
+    assert '"admin-api": {name.upper() for name in ADMIN_FIELDS} | {"FORWARDED_ALLOW_IPS"}' in (
+        workflow
+    )
+    assert '("admin-api", ADMIN_FIELDS | {"forwarded_allow_ips"})' in workflow
+    # The start-up check reports as the deployment's settings, and a failed start-up keeps the
+    # admin API down as it keeps the app down.
+    assert 'grep -q "1 validation error for DeploymentSettings"' in workflow
+    assert "StartupSettings" not in workflow
+    assert 'echo "admin-api container: $state"' in workflow
+    # The checks are Python passed in single quotes: a quote inside one ends the shell string.
+    scripts = re.findall(r" -c '\n(.*?)\n *'", workflow, re.DOTALL)
+    assert len(scripts) >= 3
+    for script in scripts:
+        assert "'" not in script, script[:60]
+    assert '"app": {name.upper() for name in VOICE_FIELDS}' in workflow
+    assert '("app", VOICE_FIELDS)' in workflow
+    assert '"startup": {name.upper() for name in STARTUP_CHECK_FIELDS}' in workflow
+    assert '("startup", STARTUP_CHECK_FIELDS)' in workflow
+    # No settings class's fields as a whole any more: each service is checked by its own list,
+    # and the console's service is not one of them.
+    assert "model_fields" not in workflow
+    assert "configured console" not in workflow
+    assert '("console",' not in workflow
 
 
 def test_the_console_gets_only_the_admin_api_origin() -> None:
@@ -396,8 +556,12 @@ def test_env_example_loads_and_carries_defaults() -> None:
         example = settings_class(_env_file=ENV_EXAMPLE)
 
         for name, field in settings_class.model_fields.items():
-            if not field.is_required():
+            if not field.is_required() and name not in REQUIRED_BUT_BY_THE_ADMIN:
                 assert getattr(example, name) == field.default, name
+    # Required by every role but the admin's, which never holds it: the example sets it.
+    identity_key = Settings(_env_file=ENV_EXAMPLE).identity_hash_key
+    assert identity_key is not None
+    assert identity_key.get_secret_value() == example_value("IDENTITY_HASH_KEY")
 
 
 @pytest.mark.usefixtures("offline_env")
@@ -1514,4 +1678,6 @@ def test_identity_key_differs_from_the_audit_key(monkeypatch: pytest.MonkeyPatch
         assert shared not in str(excinfo.value)
         assert "audit_hmac_key" in str(excinfo.value)
         monkeypatch.setenv("IDENTITY_HASH_KEY", shared + "z")
-        assert Settings(_env_file=None).identity_hash_key.get_secret_value() == shared + "z"
+        identity_key = Settings(_env_file=None).identity_hash_key
+        assert identity_key is not None
+        assert identity_key.get_secret_value() == shared + "z"

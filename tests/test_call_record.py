@@ -51,7 +51,7 @@ from app.db.models import CALL_END_REASONS, MAX_TRANSCRIPT
 from app.db.seed import load_seed_data, seed
 from app.db.session import create_database_engine
 from app.guard.input import GuardAction
-from app.guard.mask import mask
+from app.guard.mask import hide_names, mask
 from app.main import create_app
 from evals.scripted import ScriptedModel, calls, says
 
@@ -347,8 +347,8 @@ def test_the_name_arguments_are_the_tools() -> None:
 
 def test_short_name_words_are_not_hidden() -> None:
     # A one-letter word of a name would hide every such letter in the text.
-    assert call_record._hide_names("a j or a J. Smith", ["J Smith"]) == "a j or a J. <PERSON>"
-    assert call_record._hide_names("Smithson and smith", ["J Smith"]) == "Smithson and <PERSON>"
+    assert hide_names("a j or a J. Smith", ["J Smith"]) == "a j or a J. <PERSON>"
+    assert hide_names("Smithson and smith", ["J Smith"]) == "Smithson and <PERSON>"
 
 
 DIGIT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
