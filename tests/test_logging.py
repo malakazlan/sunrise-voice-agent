@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 import uvicorn
-from conftest import OFFLINE_DB_ENV, REPO_ROOT, offline_settings
+from conftest import OFFLINE_DB_ENV, REPO_ROOT, close_unstarted, offline_settings
+from fastapi import FastAPI
 from loguru import logger as loguru_logger
 from uvicorn.config import LOGGING_CONFIG
 from uvicorn.protocols.http.h11_impl import H11Protocol
@@ -270,7 +271,7 @@ def test_last_resort_is_masked(logged: Callable[..., str]) -> None:
 def test_warnings_still_fail_tests() -> None:
     # pytest's filter turns a warning into an exception before it could be shown, so capturing
     # warnings into logging hides none from it.
-    create_app(offline_settings())
+    close_unstarted(create_app(offline_settings()))
 
     with pytest.raises(UserWarning, match="still an error"):
         warnings.warn("still an error", stacklevel=1)
@@ -311,7 +312,7 @@ def restore_logging() -> Iterator[None]:
     [("DEBUG", logging.WARNING), ("INFO", logging.WARNING), ("ERROR", logging.ERROR)],
 )
 def test_webrtc_stack_logs_warnings_only(log_level: LogLevel, expected: int) -> None:
-    create_app(offline_settings(log_level=log_level))
+    close_unstarted(create_app(offline_settings(log_level=log_level)))
 
     assert [logging.getLogger(name).level for name in WEBRTC_LOGGERS] == [expected, expected]
 
@@ -322,7 +323,7 @@ def test_webrtc_stack_logs_warnings_only(log_level: LogLevel, expected: int) -> 
     [("DEBUG", logging.WARNING), ("INFO", logging.WARNING), ("ERROR", logging.ERROR)],
 )
 def test_vendor_clients_log_warnings_only(log_level: LogLevel, expected: int) -> None:
-    create_app(offline_settings(log_level=log_level))
+    close_unstarted(create_app(offline_settings(log_level=log_level)))
 
     assert [logging.getLogger(name).level for name in VENDOR_LOGGERS] == [expected] * 6
     assert [logging.getLogger(name).level for name in PRESIDIO_LOGGERS] == [expected] * 3
@@ -333,12 +334,17 @@ def test_vendor_clients_log_warnings_only(log_level: LogLevel, expected: int) ->
 def uvicorn_config(log_level: LogLevel, log_config: dict[str, Any] | None) -> uvicorn.Config:
     """The app loaded as the container's uvicorn loads it: uvicorn's own logging set-up first,
     with its access log on, then the factory."""
-    config = uvicorn.Config(
-        app=lambda: create_app(offline_settings(log_level=log_level)),
-        factory=True,
-        log_config=log_config,
-    )
+    built = []
+
+    def factory() -> FastAPI:
+        built.append(create_app(offline_settings(log_level=log_level)))
+        return built[-1]
+
+    config = uvicorn.Config(app=factory, factory=True, log_config=log_config)
     config.load()
+    # The app is loaded and never started.
+    for app in built:
+        close_unstarted(app)
     return config
 
 

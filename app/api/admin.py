@@ -505,7 +505,9 @@ async def _invalid_query(_request: Request, _error: Exception) -> JSONResponse:
     )
 
 
-def _one_value_each(request: Request) -> None:
+async def _one_value_each(request: Request) -> None:
+    # A coroutine: FastAPI would hand a plain function to its thread pool, whose new threads
+    # hold the event loop while they start, the calls' loop too in APP_ROLE=all.
     if len(request.query_params.multi_items()) != len(request.query_params):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid query")
 

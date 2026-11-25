@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.call_record import drain_call_records
@@ -135,14 +135,18 @@ def create_app(
     app.state.vocabulary = vocabulary
     app.state.turns = turns
     app.state.config = config
+    app.state.model = model
+    page = CALL_PAGE.read_bytes()
 
+    # Coroutines, so that nothing here runs in the thread pool, whose new threads hold the
+    # event loop while they start (app/api/offer.py); the page is read once, here.
     @app.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/", include_in_schema=False)
-    def call_page() -> FileResponse:
-        return FileResponse(CALL_PAGE, media_type="text/html")
+    async def call_page() -> Response:
+        return Response(page, media_type="text/html")
 
     app.include_router(build_router(settings, calls, open_call, config, refusals))
 

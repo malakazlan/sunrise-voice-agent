@@ -136,7 +136,10 @@ def build_router(
     config: LiveConfig,
     refusals: CallRefusals,
 ) -> APIRouter:
-    def require_token(request: Request) -> None:
+    # Every route and dependency here is a coroutine: FastAPI hands a plain function to its
+    # thread pool, and starting a worker thread holds the event loop, and every call's audio,
+    # until the thread runs.
+    async def require_token(request: Request) -> None:
         # A dependency of every route here, and no route declares a body, so the token is
         # checked before any of the body is read.
         if not _token_matches(request, settings):
@@ -150,7 +153,7 @@ def build_router(
     router = APIRouter(dependencies=[Depends(require_token)])
 
     @router.get("/ice-servers")
-    def ice_servers(response: Response) -> dict[str, Any]:
+    async def ice_servers(response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         return {"iceServers": browser_ice_servers(settings, now=time.time())}
 

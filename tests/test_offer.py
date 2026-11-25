@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 import pytest
-from conftest import VOICE_SECRETS, offline_settings
+from conftest import VOICE_SECRETS, close_unstarted, offline_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -456,6 +456,7 @@ def test_offer_body_cap_boundary() -> None:
 
     assert len(padded_offer(BODY_LIMIT)) == BODY_LIMIT
     assert asyncio.run(main()) == (200, 413)
+    close_unstarted(app)
 
 
 def test_empty_token_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -558,6 +559,7 @@ def test_slot_released_when_setup_is_cancelled() -> None:
         assert active_calls(app) == 0
 
     asyncio.run(main())
+    close_unstarted(app)
 
 
 async def post_offer(app: FastAPI) -> int:

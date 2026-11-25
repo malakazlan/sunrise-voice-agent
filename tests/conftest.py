@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
 from psycopg import errors
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, text
@@ -137,6 +138,15 @@ def offline_settings(**overrides: Any) -> Settings:
     values["app_env"] = "demo"
     values.update(overrides)
     return Settings(_env_file=None, **values)
+
+
+def close_unstarted(app: FastAPI) -> None:
+    """Close what an application built and never started holds, which its lifespan would
+    have closed: the model's HTTP client. Left open, it is collected when the interpreter
+    exits, after the modules its clean-up needs are gone."""
+    model = app.state.model
+    if model is not None:
+        asyncio.run(model.close(), loop_factory=asyncio.SelectorEventLoop)
 
 
 @pytest.fixture

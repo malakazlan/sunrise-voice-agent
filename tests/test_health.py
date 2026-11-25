@@ -1,10 +1,12 @@
 import importlib
 import logging
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from conftest import offline_settings
+from conftest import close_unstarted, offline_settings
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -20,12 +22,19 @@ def health_settings(app_env: AppEnv, log_level: LogLevel = "INFO") -> Settings:
     return offline_settings(app_env=app_env, log_level=log_level)
 
 
-def make_client(app_env: AppEnv) -> TestClient:
-    return TestClient(create_app(health_settings(app_env)))
+@contextmanager
+def make_client(app_env: AppEnv) -> Iterator[TestClient]:
+    """A client of an app that is never started; what it holds is closed after."""
+    app = create_app(health_settings(app_env))
+    try:
+        yield TestClient(app)
+    finally:
+        close_unstarted(app)
 
 
 def test_health_returns_only_status() -> None:
-    response = make_client("prod").get("/health")
+    with make_client("prod") as client:
+        response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -33,13 +42,15 @@ def test_health_returns_only_status() -> None:
 
 @pytest.mark.parametrize("path", DOCS_PATHS)
 def test_docs_served_in_dev(path: str) -> None:
-    assert make_client("dev").get(path).status_code == 200
+    with make_client("dev") as client:
+        assert client.get(path).status_code == 200
 
 
 @pytest.mark.parametrize("app_env", ["demo", "prod"])
 @pytest.mark.parametrize("path", DOCS_PATHS)
 def test_docs_hidden_outside_dev(app_env: AppEnv, path: str) -> None:
-    assert make_client(app_env).get(path).status_code == 404
+    with make_client(app_env) as client:
+        assert client.get(path).status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -50,7 +61,7 @@ def test_log_level_is_applied(log_level: LogLevel, expected: int) -> None:
     root = logging.getLogger()
     original = root.level
     try:
-        create_app(health_settings("prod", log_level))
+        close_unstarted(create_app(health_settings("prod", log_level)))
         assert root.level == expected
     finally:
         root.setLevel(original)
@@ -81,7 +92,9 @@ def test_factory_reads_settings_from_environment(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("APP_ENV", "prod")
 
-    client = TestClient(create_app())
+    app = create_app()
+    client = TestClient(app)
 
     assert client.get("/health").status_code == 200
     assert client.get("/docs").status_code == 404
+    close_unstarted(app)
