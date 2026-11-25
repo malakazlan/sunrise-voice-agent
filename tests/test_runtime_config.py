@@ -331,6 +331,7 @@ async def test_call_routes_never_hold_the_loop(
     requests = [
         ("GET", "/health", {}),
         ("GET", "/", {}),
+        ("GET", "/fonts/ibm-plex-mono-latin-400.woff2", {}),
         ("GET", "/ice-servers", token),
         ("POST", "/offer", token),
         ("GET", "/admin/api/session", {}),
@@ -349,7 +350,7 @@ async def test_call_routes_never_hold_the_loop(
         probing.cancel()
         # The app was never started: the calls its lifespan would close are closed here.
         await app.state.calls.close()
-    assert [answer.status_code for answer in answers] == [200, 200, 200, 200, 401]
+    assert [answer.status_code for answer in answers] == [200, 200, 200, 200, 200, 401]
     assert started == []
     # The probe ran between every two requests, and nothing held the loop for long.
     assert len(ticks) > len(requests), ticks

@@ -6,10 +6,8 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
-from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.call_record import drain_call_records
@@ -21,6 +19,7 @@ from app.agent.tools import register_tools
 from app.agent.turn import drain_guard_audits
 from app.agent.turn_record import TurnRecorder
 from app.api.offer import CallRefusals, OpenCall, build_router
+from app.api.page import build_page_router
 from app.api.service import mount_admin
 from app.audit.log import AuditLog
 from app.audit.queue import AuditQueue
@@ -36,7 +35,6 @@ from app.voice.vocabulary import Vocabulary
 
 logger = logging.getLogger(__name__)
 
-CALL_PAGE = Path(__file__).resolve().parents[1] / "web" / "index.html"
 # How long shutdown waits, in all, for the turn rows and the refused calls' events still
 # queued: both are drained at once under this one limit, and what is left then is dropped, so a
 # stalled database cannot hold the stop past the container's grace period.
@@ -173,18 +171,15 @@ def create_app(
     app.state.vocabulary = vocabulary
     app.state.turns = turns
     app.state.config = config
-    page = CALL_PAGE.read_bytes()
 
     # Coroutines, so that nothing here runs in the thread pool, whose new threads hold the
-    # event loop while they start (app/api/offer.py); the page is read once, here.
+    # event loop while they start (app/api/offer.py); the call page and its fonts are read
+    # once, as the app is built (app/api/page.py).
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/", include_in_schema=False)
-    async def call_page() -> Response:
-        return Response(page, media_type="text/html")
-
+    app.include_router(build_page_router())
     app.include_router(build_router(settings, calls, open_call, config, refusals))
 
     # The voice role serves no admin page, whatever it is given.
