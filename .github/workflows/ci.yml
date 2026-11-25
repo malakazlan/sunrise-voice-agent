@@ -663,6 +663,63 @@ jobs:
           test "$messages" = "log"
           test "$verbosity" = "terse"
           test "$statements" = "panic"
+      - name: Every variable given to every service, each role ignores the other's secrets
+        run: |
+          . .github/ci-wait.sh
+          # As a platform that adds its env file to every service does (Coolify, some versions).
+          # After the checks of each service's own variables above, which this stack would fail.
+          echo "--- override used only by this step"
+          cat deploy/docker-compose.every-variable.yml
+          export ADMIN_API_ORIGIN=http://127.0.0.1:8001
+          every="docker compose --env-file .env -f deploy/docker-compose.yml"
+          every="$every -f deploy/docker-compose.every-variable.yml"
+          bounded 300 "the stack to start with every variable in every service" $every up -d
+          wait_for_status 120 http://127.0.0.1:8000/health 200 "the app to answer /health"
+          wait_for_status 120 http://127.0.0.1:8001/health 200 "the admin API to answer /health"
+          wait_for_status 120 http://127.0.0.1:3000/health 200 "the console to answer /health"
+          # Each container was given the other role's variables (names only).
+          names() {
+            docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+              "$($every ps -q "$1")" | cut -d= -f1
+          }
+          names app | grep -qx ADMIN_PASSWORD
+          for name in ANTHROPIC_API_KEY TURN_SHARED_SECRET CALL_ACCESS_TOKEN IDENTITY_HASH_KEY; do
+            names admin-api | grep -qx "$name"
+          done
+          # The voice role serves nothing under /admin, the sign-in included.
+          for path in /admin/api/requests /admin/api/session; do
+            status=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "app GET $path -> $status"
+            test "$status" = "404"
+          done
+          admin_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' .env)
+          test -n "$admin_pass"
+          status=$(printf '{"user": "ci_admin", "password": "%s"}' "$admin_pass" \
+            | curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Origin: http://127.0.0.1:8000' -H 'Content-Type: application/json' \
+              --data-binary @- http://127.0.0.1:8000/admin/api/session)
+          echo "app POST /admin/api/session -> $status"
+          test "$status" = "404"
+          # The admin role signs in as in the smoke test.
+          signed=$(printf '{"user": "ci_admin", "password": "%s"}' "$admin_pass" \
+            | curl -s -m 10 -o /dev/null -D - -w '%{http_code}' -X POST \
+              -H 'Origin: http://127.0.0.1:8001' -H 'Content-Type: application/json' \
+              --data-binary @- http://127.0.0.1:8001/admin/api/session)
+          echo "admin-api POST /admin/api/session -> $(echo "$signed" | tail -n 1)"
+          test "$(echo "$signed" | tail -n 1)" = "200"
+          echo "$signed" | grep -qi '^set-cookie: __Host-admin_session=.*; HttpOnly; Path=/; SameSite=strict; Secure'
+          # Each says once what it ignored, by name; the admin password is in no log line.
+          bounded 60 "the app's log" $every logs --no-color app > "$RUNNER_TEMP/every-app-log" 2>&1
+          bounded 60 "the admin API's log" $every logs --no-color admin-api \
+            > "$RUNNER_TEMP/every-admin-log" 2>&1
+          grep -h other_role_settings_ignored "$RUNNER_TEMP/every-app-log" "$RUNNER_TEMP/every-admin-log"
+          test "$(grep -c 'other_role_settings_ignored names=ADMIN_PASSWORD$' "$RUNNER_TEMP/every-app-log")" = 1
+          ignored="ANTHROPIC_API_KEY,CALL_ACCESS_TOKEN,DEEPGRAM_API_KEY,ELEVENLABS_API_KEY,IDENTITY_HASH_KEY,TURN_HOST,TURN_SHARED_SECRET"
+          test "$(grep -c "other_role_settings_ignored names=$ignored\$" "$RUNNER_TEMP/every-admin-log")" = 1
+          if grep -qF "$admin_pass" "$RUNNER_TEMP/every-app-log" "$RUNNER_TEMP/every-admin-log"; then
+            echo "the admin password is in a log"
+            exit 1
+          fi
       - name: Container without APP_ENV must not start
         run: |
           . .github/ci-wait.sh

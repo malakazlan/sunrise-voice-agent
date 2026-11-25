@@ -1,0 +1,19 @@
+# Test only (CI): every variable of the deployment given to every service, as a platform that
+# adds its env file to each service does (Coolify, some versions). Each service must still
+# start; app and admin-api ignore the other role's secrets (app/config.py). The path is the
+# repo root's .env, relative to deploy/.
+#   docker compose --env-file .env -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.every-variable.yml up -d
+services:
+  db:
+    env_file: ../.env
+  startup:
+    env_file: ../.env
+  app:
+    env_file: ../.env
+  admin-api:
+    env_file: ../.env
+  coturn:
+    env_file: ../.env
+  console:
+    env_file: ../.env

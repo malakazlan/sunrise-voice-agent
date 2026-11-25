@@ -38,10 +38,15 @@ clash is reported by field name only. No long-running process holds every secret
 comparison that covers them all, the owner's `POSTGRES_PASSWORD` included, is the start-up
 service's.
 
-Each role refuses the secrets that are not its own, in every environment: `APP_ROLE=voice`
-refuses `ADMIN_PASSWORD`; `APP_ROLE=admin` refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`,
-`CALL_ACCESS_TOKEN` and the three vendor keys. The start-up check reads them all as role `all`,
-and every secret there must differ from every other, the database passwords included.
+Each role ignores the secrets that are not its own, in every environment: `APP_ROLE=voice`
+does not load `ADMIN_PASSWORD`; `APP_ROLE=admin` does not load `IDENTITY_HASH_KEY`,
+`TURN_SHARED_SECRET`, `TURN_HOST`, `CALL_ACCESS_TOKEN` and the three vendor keys. Its settings
+hold none for them whatever the environment says, every rule sees them unset (so they are not
+checked either), and at start-up the service logs their names once, never a value:
+`other_role_settings_ignored names=ADMIN_PASSWORD`. Compose gives each service only its own
+variables; a platform that gives every container every variable (Coolify can) still puts the
+values in each container's environment. The start-up check reads them all as role `all`, and
+every secret there must differ from every other, the database passwords included.
 
 `TURN_HOST` and `TURN_SHARED_SECRET` go together, and configuring TURN requires
 `CALL_ACCESS_TOKEN` in every environment, so TURN credentials are never handed out without the

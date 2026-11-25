@@ -257,8 +257,8 @@ Roles: `APP_ROLE` picks what a process serves, from the same image and command
 | `APP_ROLE` | Serves |
 |---|---|
 | `all` (default) | the calls, and the admin API when `ADMIN_PASSWORD` is set: for development and tests |
-| `voice` | the calls only: no admin route, and no admin sign-in may be set |
-| `admin` | the admin API and `/health` only. No call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It refuses `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `CALL_ACCESS_TOKEN` and the vendors' keys, and starts without them. Without `ADMIN_PASSWORD` it still starts, answers `/health`, answers `404` to everything under `/admin`, and logs `admin_off_no_password` once |
+| `voice` | the calls only: no admin route, whatever it is given. It ignores `ADMIN_PASSWORD` (its settings hold none) and logs `other_role_settings_ignored names=ADMIN_PASSWORD` once when given it |
+| `admin` | the admin API and `/health` only. No call route, and the calls' code (the voice pipeline, Pipecat, the model's client) is never imported. It ignores `IDENTITY_HASH_KEY`, `TURN_SHARED_SECRET`, `TURN_HOST`, `CALL_ACCESS_TOKEN` and the vendors' keys (its settings hold none, and it logs the names of those it was given once), and starts without them. Without `ADMIN_PASSWORD` it still starts, answers `/health`, answers `404` to everything under `/admin`, and logs `admin_off_no_password` once |
 
 In Compose `app` runs `voice` and `admin-api` runs `admin`, each with only its own variables
 (the README's Configuration). Each long-running service holds only some of the secrets, so the one-shot

@@ -3,10 +3,12 @@ import hmac
 import re
 import sys
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
     SecretStr,
     ValidationError,
     ValidationInfo,
@@ -86,10 +88,25 @@ def _admin(info: ValidationInfo) -> bool:
     return info.data.get("app_role") == "admin"
 
 
-def _refused_in_admin(name: str, value: object, info: ValidationInfo) -> None:
-    """The admin role holds no secret of the calls: one given to it stops startup."""
-    if value is not None and _admin(info):
-        raise ValueError(f"{name} is not given to the admin role")
+# What each long-running role never loads, whatever its environment holds: the other role's
+# secrets, and TURN_HOST with the TURN secret (the admin role has no TURN). A platform may give
+# every container every variable of the deployment; the role then holds None for these, every
+# rule sees them unset, and its server names them once at start-up (app/server.py). Role all,
+# and the start-up check, load and check them all.
+OTHER_ROLES_SETTINGS: dict[str, frozenset[str]] = {
+    "voice": frozenset({"admin_password"}),
+    "admin": frozenset(
+        {
+            "identity_hash_key",
+            "turn_shared_secret",
+            "turn_host",
+            "call_access_token",
+            "anthropic_api_key",
+            "deepgram_api_key",
+            "elevenlabs_api_key",
+        }
+    ),
+}
 
 
 # Every secret setting, outside dev, on top of its own length and character rules. The same
@@ -225,13 +242,36 @@ class Settings(DatabaseSettings):
     container is never given the owner's variables (deploy/docker-compose.yml)."""
 
     # What this process serves. First, since the rules of the fields after it depend on it: the
-    # admin role holds no secret of the calls; the voice role holds no admin sign-in.
+    # admin role needs none of the calls' settings. The voice role never loads the admin
+    # password, the admin role never loads the calls' secrets (OTHER_ROLES_SETTINGS).
     app_role: AppRole = "all"
     # The key of the audit log's hash chain (app/audit/log.py).
     audit_hmac_key: SecretStr
     # The key of the identity claims' hashes in verification_attempts (app/agent/claims.py).
-    # Required, but never given to the admin role.
+    # Required, but never loaded by the admin role.
     identity_hash_key: SecretStr | None = Field(default=None, validate_default=True)
+    # The other role's settings this process was given and did not load, by field name.
+    _ignored_settings: tuple[str, ...] = PrivateAttr(default=())
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _other_roles_settings_are_not_loaded(
+        cls, data: dict[str, Any], handler: ModelWrapValidatorHandler[Self]
+    ) -> Self:
+        """The other role's settings are dropped before any rule runs: every rule finds them
+        unset, and no value of theirs reaches the settings, their repr or an error. Only their
+        names are kept."""
+        other = OTHER_ROLES_SETTINGS.get(data.get("app_role", "all"), frozenset())
+        settings = handler({key: value for key, value in data.items() if key not in other})
+        settings._ignored_settings = tuple(
+            sorted(name for name in other if data.get(name) is not None)
+        )
+        return settings
+
+    @property
+    def ignored_settings(self) -> tuple[str, ...]:
+        """The other role's settings this process was given and did not load, by field name."""
+        return self._ignored_settings
 
     # A fixed clock for dev and demo. Set together with app_env=prod, startup stops.
     simulated_now: datetime | None = None
@@ -310,7 +350,6 @@ class Settings(DatabaseSettings):
         cls, value: SecretStr | None, info: ValidationInfo
     ) -> SecretStr | None:
         name = info.field_name or ""
-        _refused_in_admin(name, value, info)
         if value is None:
             if _outside_dev(info) and not _admin(info):
                 raise ValueError(f"{name} is required unless app_env is dev")
@@ -330,7 +369,6 @@ class Settings(DatabaseSettings):
     def _identity_key_unless_admin(
         cls, value: SecretStr | None, info: ValidationInfo
     ) -> SecretStr | None:
-        _refused_in_admin("identity_hash_key", value, info)
         if value is None and not _admin(info):
             raise PydanticCustomError("missing", "Field required")
         return value
@@ -381,7 +419,6 @@ class Settings(DatabaseSettings):
     @field_validator("turn_shared_secret")
     @classmethod
     def _secret_outside_dev(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
-        _refused_in_admin("turn_shared_secret", value, info)
         if value is None and _outside_dev(info) and not _admin(info):
             raise ValueError("turn_shared_secret is required unless app_env is dev")
         if value is not None and not TURN_SECRET_CHARACTERS.fullmatch(value.get_secret_value()):
@@ -406,7 +443,6 @@ class Settings(DatabaseSettings):
     @field_validator("call_access_token")
     @classmethod
     def _token_when_needed(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
-        _refused_in_admin("call_access_token", value, info)
         if value is None:
             if _outside_dev(info) and not _admin(info):
                 raise ValueError("call_access_token is required unless app_env is dev")
@@ -423,8 +459,6 @@ class Settings(DatabaseSettings):
     ) -> SecretStr | None:
         if value is None:
             return None
-        if info.data.get("app_role") == "voice":
-            raise ValueError("admin_password is not given to the voice role")
         password = value.get_secret_value()
         if not password:
             raise ValueError("admin_password must not be empty")
