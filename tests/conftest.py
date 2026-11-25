@@ -53,7 +53,7 @@ OFFLINE_DB_ENV = {
 # Obviously fake voice settings that let a demo or prod configuration validate. Built from
 # short pieces so that no secret scanner reads them as credentials.
 VOICE_SECRETS = {
-    "DEMO_ACCESS_TOKEN": "-".join(["token", "not", "for", "logs"] + ["x" * 4] * 3),
+    "CALL_ACCESS_TOKEN": "-".join(["token", "not", "for", "logs"] + ["x" * 4] * 3),
     "TURN_HOST": "turn.example.test",
     "TURN_SHARED_SECRET": "-".join(["turn", "secret", "not", "for", "logs"] + ["y" * 4] * 3),
     "ANTHROPIC_API_KEY": "-".join(["anthropic", "key", "not", "for", "logs"] + ["z" * 4] * 3),

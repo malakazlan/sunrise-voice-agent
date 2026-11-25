@@ -453,7 +453,7 @@ async def test_refused_calls_are_audited_once_a_minute_per_reason(
     refusals = CallRefusals(queue, clock=clock)
     app = FastAPI()
     settings = offline_settings(
-        app_env="dev", demo_access_token=None, turn_host=None, turn_shared_secret=None
+        app_env="dev", call_access_token=None, turn_host=None, turn_shared_secret=None
     )
     app.include_router(
         build_router(settings, CallRegistry(max_calls=3, max_seconds=600), Opener(), live, refusals)

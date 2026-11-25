@@ -274,7 +274,7 @@ class Settings(DatabaseSettings):
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
     turn_host: HostName | None = Field(default=None, validate_default=True)
-    demo_access_token: SecretStr | None = Field(
+    call_access_token: SecretStr | None = Field(
         default=None, validate_default=True, min_length=MIN_SECRET_LENGTH
     )
     # The admin's sign-in, for the admin API (app/api/admin.py): HTTP Basic, or a browser
@@ -403,17 +403,17 @@ class Settings(DatabaseSettings):
                 raise ValueError("turn_host and turn_shared_secret must be set together")
         return value
 
-    @field_validator("demo_access_token")
+    @field_validator("call_access_token")
     @classmethod
     def _token_when_needed(cls, value: SecretStr | None, info: ValidationInfo) -> SecretStr | None:
-        _refused_in_admin("demo_access_token", value, info)
+        _refused_in_admin("call_access_token", value, info)
         if value is None:
             if _outside_dev(info) and not _admin(info):
-                raise ValueError("demo_access_token is required unless app_env is dev")
+                raise ValueError("call_access_token is required unless app_env is dev")
             if info.data.get("turn_shared_secret") is not None:
-                raise ValueError("demo_access_token is required when TURN is configured")
+                raise ValueError("call_access_token is required when TURN is configured")
         else:
-            _check_strong_secret("demo_access_token", value, info)
+            _check_strong_secret("call_access_token", value, info)
         return value
 
     @field_validator("admin_password")

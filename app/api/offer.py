@@ -96,7 +96,7 @@ class Offer(BaseModel):
 
 
 def _token_matches(request: Request, settings: Settings) -> bool:
-    expected = settings.demo_access_token
+    expected = settings.call_access_token
     if expected is None:
         return True
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
