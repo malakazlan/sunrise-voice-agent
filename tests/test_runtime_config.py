@@ -322,7 +322,7 @@ async def test_call_routes_never_hold_the_loop(
             worst = max(worst, loop.time() - before - 0.005)
 
     probing = asyncio.ensure_future(probe())
-    token = {"Authorization": f"Bearer {VOICE_SECRETS['DEMO_ACCESS_TOKEN']}"}
+    token = {"Authorization": f"Bearer {VOICE_SECRETS['CALL_ACCESS_TOKEN']}"}
     transport = httpx2.ASGITransport(app=app)
     try:
         async with httpx2.AsyncClient(transport=transport, base_url=OWN_ORIGIN) as client:
