@@ -13,7 +13,7 @@ export function PageHeader({
   aside?: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+    <header className="mb-6 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
       <div className="max-w-2xl">
         <h1 className="font-heading text-2xl font-semibold tracking-tight text-balance sm:text-[1.75rem]">
           {title}
