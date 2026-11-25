@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 from admin_client import ADMIN_USER, PASSWORD, SIGNED_IN, admin_settings, client_from
-from conftest import TEST_AUDIT_KEY, VOICE_SECRETS
+from conftest import TEST_AUDIT_KEY, TEST_IDENTITY_KEY, VOICE_SECRETS
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
@@ -50,6 +50,21 @@ ADMIN_HEADERS = {
 # What the admin process must never load: the voice pipeline, the agent's turn loop, Pipecat,
 # the model's client and the transcript masker's NLP.
 VOICE_MODULES = ("pipecat", "app.voice", "app.agent.turn", "app.agent.model", "anthropic", "spacy")
+# What the admin role does not load, written out by hand: the calls' secrets, and TURN_HOST,
+# which goes with the TURN secret. Logged by name, in this order, when given.
+IGNORED_BY_THE_ADMIN = {
+    "identity_hash_key",
+    "turn_shared_secret",
+    "turn_host",
+    "call_access_token",
+    "anthropic_api_key",
+    "deepgram_api_key",
+    "elevenlabs_api_key",
+}
+IGNORED_BY_THE_ADMIN_LOGGED = (
+    "ANTHROPIC_API_KEY,CALL_ACCESS_TOKEN,DEEPGRAM_API_KEY,ELEVENLABS_API_KEY,"
+    "IDENTITY_HASH_KEY,TURN_HOST,TURN_SHARED_SECRET"
+)
 # Strong enough for prod, made of short pieces.
 PROD_APP_DB_PASSWORD = "-".join(["runtime", "role", "pass", "for", "prod"])
 PROD_AUDIT_KEY = "-".join(["audit", "key", "of", "the", "role", "test", "x" * 8])
@@ -83,6 +98,69 @@ def admin_role(database: StartupSettings, **overrides: Any) -> Settings:
     return admin_settings(database, app_role="admin", identity_hash_key=None, **overrides)
 
 
+def settings_from_environment(
+    monkeypatch: pytest.MonkeyPatch, database: StartupSettings, variables: dict[str, str]
+) -> Settings:
+    """A role's settings as its container reads them: from the environment alone, which holds
+    the database as the runtime role, the audit key and the given variables, and no other
+    setting."""
+    for name in Settings.model_fields:
+        monkeypatch.delenv(name.upper(), raising=False)
+    environment = {
+        "APP_ENV": "dev",
+        "POSTGRES_HOST": database.postgres_host,
+        "POSTGRES_PORT": str(database.postgres_port),
+        "POSTGRES_DB": database.postgres_db,
+        "APP_DB_USER": database.app_db_user,
+        "APP_DB_PASSWORD": database.app_db_password.get_secret_value(),
+        "AUDIT_HMAC_KEY": TEST_AUDIT_KEY,
+        **variables,
+    }
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    return Settings(_env_file=None)
+
+
+def fresh_admin_process(tmp_path: Path, variables: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    """A fresh interpreter, as the container starts it: prod, the admin role, its own variables
+    and the given ones. The app is built; returns its output and what it reports: the modules
+    imported, the app's paths, and the settings it holds a value for."""
+    env = {key: value for key, value in os.environ.items() if key in ("PATH", "SYSTEMROOT")}
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    env.update({key.upper(): str(value) for key, value in prod_admin().items()})
+    env.update(variables)
+    script = (
+        "import json, sys\n"
+        "from app.config import Settings\n"
+        "from app.server import create_app\n"
+        "settings = Settings()\n"
+        "app = create_app(settings)\n"
+        "paths = sorted(getattr(route, 'path', '') for route in app.routes)\n"
+        "held = sorted(name for name in Settings.model_fields"
+        " if getattr(settings, name) is not None)\n"
+        "print(json.dumps({'modules': sorted(sys.modules), 'paths': paths, 'held': held}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    found = json.loads(result.stdout.strip().splitlines()[-1])
+    loaded = [
+        name
+        for name in found["modules"]
+        if any(name == banned or name.startswith(banned + ".") for banned in VOICE_MODULES)
+    ]
+    assert loaded == []
+    assert "app.api.admin" in found["modules"]
+    assert found["paths"] == ["/admin/api", "/health"]
+    return result.stdout + result.stderr, found
+
+
 @pytest.mark.usefixtures("clean_env")
 def test_roles_are_settings() -> None:
     assert Settings(_env_file=None, **prod_admin()).app_role == "admin"
@@ -91,29 +169,41 @@ def test_roles_are_settings() -> None:
     for role in ("console", "Admin", ""):
         assert ("literal_error", ("app_role",)) in errors(**prod_admin(app_role=role)), role
     # The admin role may start without the admin's sign-in (it then serves nothing under
-    # /admin), and holds no secret of the calls.
+    # /admin), and holds no secret of the calls: one given to it is not loaded, each on its own.
     off = Settings(_env_file=None, **prod_admin(admin_password=None, admin_user=None))
     assert off.admin_password is None
+    assert off.ignored_settings == ()
     voice_secrets = {
         "identity_hash_key": "-".join(["identity", "key", "of", "the", "role", "test", "y" * 8]),
         "turn_shared_secret": VOICE_SECRETS["TURN_SHARED_SECRET"],
+        "turn_host": VOICE_SECRETS["TURN_HOST"],
         "call_access_token": VOICE_SECRETS["CALL_ACCESS_TOKEN"],
         "anthropic_api_key": VOICE_SECRETS["ANTHROPIC_API_KEY"],
         "deepgram_api_key": VOICE_SECRETS["DEEPGRAM_API_KEY"],
         "elevenlabs_api_key": VOICE_SECRETS["ELEVENLABS_API_KEY"],
     }
+    assert set(voice_secrets) == IGNORED_BY_THE_ADMIN
     for name, value in voice_secrets.items():
-        found = errors(**prod_admin(**{name: value}))
-        assert ("value_error", (name,)) in found, name
-    # The voice role holds no admin sign-in.
+        admin = Settings(_env_file=None, **prod_admin(**{name: value}))
+        assert getattr(admin, name) is None, name
+        assert admin.ignored_settings == (name,), name
+    # The voice role holds no admin sign-in: the password given to it is not loaded, and the
+    # user alone switches nothing on.
     voice = {
         **{key.lower(): value for key, value in VOICE_SECRETS.items()},
         **prod_admin(app_role="voice", admin_user=None, admin_password=None),
         "identity_hash_key": voice_secrets["identity_hash_key"],
     }
     assert Settings(_env_file=None, **voice).app_role == "voice"
-    found = errors(**{**voice, "admin_user": ADMIN_USER, "admin_password": PASSWORD})
-    assert found == [("value_error", ("admin_password",))]
+    given = Settings(
+        _env_file=None, **{**voice, "admin_user": ADMIN_USER, "admin_password": PASSWORD}
+    )
+    assert given.admin_password is None
+    assert given.ignored_settings == ("admin_password",)
+    # Not even a password too weak for prod is looked at.
+    weak = Settings(_env_file=None, **{**voice, "admin_password": "short"})
+    assert weak.admin_password is None
+    assert weak.ignored_settings == ("admin_password",)
     # Every role but the admin's needs the identity key, reported as missing.
     assert ("missing", ("identity_hash_key",)) in errors(**{**voice, "identity_hash_key": None})
 
@@ -287,33 +377,78 @@ def test_all_role_serves_both(database: StartupSettings) -> None:
 
 def test_admin_role_starts_without_vendor_keys(tmp_path: Path) -> None:
     """A fresh interpreter, as the container starts it: prod, the admin role and only its own
-    variables. The app is built, and no module of the calls has been imported."""
-    env = {key: value for key, value in os.environ.items() if key in ("PATH", "SYSTEMROOT")}
-    env["PYTHONPATH"] = str(REPO_ROOT)
-    env.update({key.upper(): str(value) for key, value in prod_admin().items()})
-    script = (
-        "import json, sys\n"
-        "from app.server import create_app\n"
-        "app = create_app()\n"
-        "paths = sorted(getattr(route, 'path', '') for route in app.routes)\n"
-        "print(json.dumps({'modules': sorted(sys.modules), 'paths': paths}))\n"
+    variables. The app is built, no module of the calls has been imported, and nothing is
+    said to be ignored."""
+    output, _found = fresh_admin_process(tmp_path, {})
+    assert TEST_AUDIT_KEY not in output
+    assert "other_role_settings_ignored" not in output
+
+
+def test_voice_role_ignores_the_admin_password(
+    database: StartupSettings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # R1. A platform that gives every container every variable gives the voice role the admin's
+    # sign-in too: the voice role starts, holds no admin password, and serves nothing under
+    # /admin. Its environment cannot switch the admin API on in the calls' process.
+    caplog.set_level(logging.INFO)
+    settings = settings_from_environment(
+        monkeypatch,
+        database,
+        {
+            "APP_ROLE": "voice",
+            "IDENTITY_HASH_KEY": TEST_IDENTITY_KEY,
+            "ADMIN_USER": ADMIN_USER,
+            "ADMIN_PASSWORD": PASSWORD,
+            "CONSOLE_ORIGIN": "https://console.example.test",
+        },
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
+    assert settings.app_role == "voice"
+    assert settings.admin_password is None
+    app = server.create_app(settings)
+    with client_from(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/").status_code == 200
+        for path in ADMIN_PATHS:
+            assert client.get(path, headers=SIGNED_IN).status_code == 404, path
+            assert client.post(path, json={}, headers=SIGNED_IN).status_code == 404, path
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count("other_role_settings_ignored names=ADMIN_PASSWORD") == 1
+    assert not any(PASSWORD in message for message in messages)
+
+
+def test_admin_role_ignores_the_voice_secrets(
+    database: StartupSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    # R2. Given every voice-only secret (and TURN_HOST, which goes with the TURN secret), the
+    # admin role starts and holds none of them; its config page and its logs show none.
+    caplog.set_level(logging.INFO)
+    given = {**VOICE_SECRETS, "IDENTITY_HASH_KEY": TEST_IDENTITY_KEY}
+    secrets = [value for key, value in given.items() if key.endswith(("_KEY", "_SECRET", "_TOKEN"))]
+    assert len(secrets) == 6
+    settings = settings_from_environment(
+        monkeypatch,
+        database,
+        {"APP_ROLE": "admin", "ADMIN_USER": ADMIN_USER, "ADMIN_PASSWORD": PASSWORD, **given},
     )
-    assert result.returncode == 0, result.stderr
-    found = json.loads(result.stdout.strip().splitlines()[-1])
-    loaded = [
-        name
-        for name in found["modules"]
-        if any(name == banned or name.startswith(banned + ".") for banned in VOICE_MODULES)
-    ]
-    assert loaded == []
-    assert "app.api.admin" in found["modules"]
-    assert found["paths"] == ["/admin/api", "/health"]
-    assert TEST_AUDIT_KEY not in result.stdout + result.stderr
+    assert {name: getattr(settings, name) for name in IGNORED_BY_THE_ADMIN} == dict.fromkeys(
+        IGNORED_BY_THE_ADMIN
+    )
+    app = server.create_app(settings)
+    with client_from(app) as client:
+        config = client.get("/admin/api/config", headers=SIGNED_IN)
+        assert config.status_code == 200
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count(f"other_role_settings_ignored names={IGNORED_BY_THE_ADMIN_LOGGED}") == 1
+    for secret in secrets:
+        assert secret not in config.text
+        assert not any(secret in message for message in messages)
+
+    # As the container starts it: prod, a fresh interpreter, every variable of the deployment.
+    output, found = fresh_admin_process(tmp_path, given)
+    assert not IGNORED_BY_THE_ADMIN & set(found["held"])
+    assert output.count(f"other_role_settings_ignored names={IGNORED_BY_THE_ADMIN_LOGGED}") == 1
+    for secret in secrets:
+        assert secret not in output

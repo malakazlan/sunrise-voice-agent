@@ -13,6 +13,10 @@ name: sunrise-voice-agent
 # Compose refuses to start without the owner's credentials or APP_ENV. The services check the
 # rest themselves and stop when a value they need is missing; an empty value counts as unset,
 # so the app's own defaults apply. CI checks each service's variables against app/config.py.
+# A platform that adds its env file to every service gives each container every variable: app
+# and admin-api then ignore the other role's secrets and log their names once (app/config.py),
+# but the values are in the container's environment all the same. CI runs the stack that way
+# too (docker-compose.every-variable.yml).
 #
 # APP_HOST_PORT (default 8000) is the host port the app is published on, for when 8000 is taken
 # (a server's own dashboard, for one). It is Compose's alone, reaches no container and is not an

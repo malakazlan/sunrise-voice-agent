@@ -149,8 +149,11 @@ flowchart LR
   staff <-->|"masked JSON, one audited reveal, session cookie"| admin
 ```
 
-- The voice service serves no admin route and holds no admin password. The admin API holds no
-  vendor key, TURN secret, access token or identity key, and never imports the voice pipeline.
+- The voice service serves no admin route and never loads the admin password into its settings.
+  The admin API never loads a vendor key, TURN secret, access token or identity key, and never
+  imports the voice pipeline. Given the other's secrets, each ignores them and names them once
+  in its log (`other_role_settings_ignored names=…`); on a platform that gives every container
+  every variable, the values are still in its container's environment.
   The console holds no data and no secret: the staff browser fetches masked JSON from the admin
   API directly.
 - Both Python processes connect as a runtime database role that cannot update or delete the
@@ -397,14 +400,14 @@ start, an empty value counts as unset, and an unknown key in `.env` is refused. 
 | `APP_DB_USER` | runtime role: `a-z 0-9 _`, up to 63, not `pg_...`, not `POSTGRES_USER` | none, required |
 | `APP_DB_PASSWORD` | runtime role's password, never logged, not `POSTGRES_PASSWORD` | none, required |
 | `AUDIT_HMAC_KEY` | audit chain key, never logged | none, required |
-| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required; refused by the admin role |
+| `IDENTITY_HASH_KEY` | identity claim hash key, never logged | none, required; ignored by the admin role |
 | `MAX_CONCURRENT_CALLS` | 1 to 20, digits only | `3` |
 | `MAX_CALL_SECONDS` | 1 to 3600 | `600` |
 | `TURN_HOST` | host name, no scheme or port | required unless dev |
 | `TURN_SHARED_SECRET` | 32+ of `A-Z a-z 0-9 . _ ~ + / = -`, never logged | required unless dev |
 | `CALL_ACCESS_TOKEN` | the call page's token, at least 32 characters, never logged | required unless dev, and whenever TURN is set |
 | `ADMIN_USER` | 1 to 32 letters and `_`, starting with a letter | empty; required with `ADMIN_PASSWORD` |
-| `ADMIN_PASSWORD` | admin password, never logged | empty (admin API off); refused by the voice role |
+| `ADMIN_PASSWORD` | admin password, never logged | empty (admin API off); ignored by the voice role |
 | `CONSOLE_ORIGIN` | the console's exact origin: `https://host[:port]` (`http` in dev only), no path | empty (no other origin answered) |
 | `ANTHROPIC_API_KEY` | the model's API key, never logged | required unless dev |
 | `DEEPGRAM_API_KEY` | speech-to-text's API key, never logged | required unless dev |
@@ -462,8 +465,11 @@ Three public origins on one registrable domain, each behind an HTTPS proxy, plus
   server, not through the proxy, and the firewall opens 3478 UDP and TCP and UDP 49160-49359.
   coturn uses host networking, which needs a Linux host.
 - **Secrets.** Generate each with `openssl rand -hex 32`; every secret must differ from every
-  other. The voice role refuses `ADMIN_PASSWORD`; the admin role refuses the vendor keys, the
-  TURN secret, the access token and the identity key. Compose gives each only its own.
+  other. Compose gives each service only its own. Given the other role's, a role ignores them
+  and logs their names once: the voice role `ADMIN_PASSWORD`; the admin role the vendor keys,
+  the TURN secret and `TURN_HOST`, the access token and the identity key. A platform that
+  gives every container every variable still puts the values in each container's
+  environment; only the settings leave them out.
 - **Upgrading.** The call page's access token is now `CALL_ACCESS_TOKEN` (before, its name had
   a `DEMO_` prefix). Rename it in your variables in the same deploy: the old name is not read,
   and outside dev the voice service then refuses to start.
@@ -498,6 +504,8 @@ After a deploy:
 - DNS: one proxied wildcard record covers the three web hosts; the TURN host gets its own
   DNS-only A record.
 - Set `FORWARDED_ALLOW_IPS` for `admin-api` to the network of Coolify's proxy.
+- Coolify can give every container every variable; each role ignores the other's secrets and
+  logs `other_role_settings_ignored names=…` once, which is expected there.
 
 ## Limits and next steps
 

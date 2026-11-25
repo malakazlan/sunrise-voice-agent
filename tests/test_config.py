@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -10,12 +11,13 @@ from typing import Any, get_args
 
 import pytest
 import yaml  # type: ignore[import-untyped]  # PyYAML ships no type information
-from conftest import OFFLINE_DB_ENV, VOICE_SECRETS
+from conftest import OFFLINE_DB_ENV, VOICE_SECRETS, offline_settings
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
+from app import server
 from app.config import (
     ADMIN_FIELDS,
     STARTUP_CHECK_FIELDS,
@@ -406,6 +408,61 @@ def test_shared_secrets_are_refused_at_startup() -> None:
                 rf"{first} must differ from {second}|{second} must differ from {first}", text
             ), (first, second)
             assert shared not in text, (first, second)
+
+
+def test_ignored_settings_are_named_never_shown(caplog: pytest.LogCaptureFixture) -> None:
+    # R3. A role given the other role's secrets names them once, when its app is built, by
+    # variable name only; no value or digest of one is in any log line, in the settings' repr,
+    # or in an error of the settings. Role all ignores nothing and says nothing.
+    caplog.set_level(logging.DEBUG)
+    admin_password = "-".join(["admin", "pass", "ignored", "by", "voice"])
+    voice = offline_settings(
+        app_role="voice", admin_user="clinic_admin", admin_password=admin_password
+    )
+    admin = offline_settings(app_role="admin")
+    every = offline_settings(admin_user="clinic_admin", admin_password=admin_password)
+    assert voice.ignored_settings == ("admin_password",)
+    assert admin.ignored_settings == (
+        "anthropic_api_key",
+        "call_access_token",
+        "deepgram_api_key",
+        "elevenlabs_api_key",
+        "identity_hash_key",
+        "turn_host",
+        "turn_shared_secret",
+    )
+    assert every.ignored_settings == ()
+    for settings in (voice, admin, every):
+        server.create_app(settings)
+    lines = [record.getMessage() for record in caplog.records]
+    assert [line for line in lines if "ignored" in line] == [
+        "other_role_settings_ignored names=ADMIN_PASSWORD",
+        "other_role_settings_ignored names=ANTHROPIC_API_KEY,CALL_ACCESS_TOKEN,DEEPGRAM_API_KEY,"
+        "ELEVENLABS_API_KEY,IDENTITY_HASH_KEY,TURN_HOST,TURN_SHARED_SECRET",
+    ]
+    # An error in the admin role's settings is about its own field alone and shows none either.
+    with pytest.raises(ValidationError) as refused:
+        offline_settings(app_role="admin", max_call_seconds=0)
+    assert [error["loc"] for error in refused.value.errors()] == [("max_call_seconds",)]
+    shown = [
+        *lines,
+        *(repr(settings) for settings in (voice, admin)),
+        *(str(settings.model_dump()) for settings in (voice, admin)),
+        str(refused.value),
+        repr(refused.value.errors()),
+    ]
+    secrets = [
+        admin_password,
+        OFFLINE_DB_ENV["IDENTITY_HASH_KEY"],
+        *(value for key, value in VOICE_SECRETS.items() if key.endswith(("_SECRET", "_TOKEN"))),
+        *(value for key, value in VOICE_SECRETS.items() if key.endswith("_API_KEY")),
+    ]
+    assert len(secrets) == 7
+    for secret in secrets:
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        for each in shown:
+            assert secret not in each
+            assert digest not in each
 
 
 def test_ci_checks_each_service_against_its_role() -> None:
