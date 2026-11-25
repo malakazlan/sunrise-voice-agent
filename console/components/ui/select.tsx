@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { cn } from "cn";
+import { getNonce } from "get-nonce";
 import { Select as SelectPrimitive } from "radix-ui";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 
@@ -69,6 +70,8 @@ function SelectContent({
       >
         <SelectScrollUpButton />
         <SelectPrimitive.Viewport
+          // The viewport adds a <style>; the request's nonce lets the CSP apply it.
+          nonce={getNonce()}
           data-position={position}
           className={cn(
             "data-[position=popper]:h-(--radix-select-trigger-height) data-[position=popper]:w-full data-[position=popper]:min-w-(--radix-select-trigger-width)",
