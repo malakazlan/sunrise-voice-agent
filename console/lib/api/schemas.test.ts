@@ -46,6 +46,8 @@ describe("the answers' schemas", () => {
     expect(guardrailsSchema.safeParse(fixtures.guardrails(7)).success).toBe(true);
     expect(metricsSchema.safeParse(fixtures.metrics(7)).success).toBe(true);
     expect(verificationSchema.safeParse(fixtures.VERIFICATION).success).toBe(true);
+    // Settings that could not be read come as null.
+    expect(sessionSchema.safeParse({ ...fixtures.session(), calls: null }).success).toBe(true);
   });
 
   it("keep a page whose shown-only ids are odd, and a break whose position is not known", () => {
@@ -88,6 +90,7 @@ describe("the answers' schemas", () => {
         { ...fixtures.metrics(7), record_us_p50: 1.5 },
       ],
       ["a session without its token", sessionSchema, { ...fixtures.session(), csrf_token: "" }],
+      ["a calls setting of another value", sessionSchema, { ...fixtures.session(), calls: "maybe" }],
     ];
     for (const [what, schema, value] of refused) {
       expect(schema.safeParse(value).success, what).toBe(false);

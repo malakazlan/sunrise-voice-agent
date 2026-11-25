@@ -41,7 +41,12 @@ export const END_REASONS = [
   "error",
 ] as const;
 export const REQUEST_TYPES = ["refill", "booking", "callback", "doctor_message", "transfer"] as const;
-export const OUTCOMES = ["success", "failure", "refused"] as const;
+// "already" and "unchanged": an admin's write that found it done (the row already marked, the
+// setting already so).
+export const OUTCOMES = ["success", "failure", "refused", "already", "unchanged"] as const;
+export const QUEUE_STATES = ["todo", "handled", "all"] as const;
+export const CALLS_VALUES = ["on", "off"] as const;
+export const OFFICE_VALUES = ["schedule", "open", "closed"] as const;
 export const STAGES = [
   "vad_ms",
   "stt_ms",
@@ -57,14 +62,21 @@ export type EndReason = (typeof END_REASONS)[number];
 export type RequestType = (typeof REQUEST_TYPES)[number];
 export type Stage = (typeof STAGES)[number];
 export type TurnKind = (typeof TURN_KINDS)[number];
+export type QueueState = (typeof QUEUE_STATES)[number];
+export type CallsValue = (typeof CALLS_VALUES)[number];
+export type OfficeValue = (typeof OFFICE_VALUES)[number];
 
 export const sessionSchema = z.object({
   user: z.string().min(1),
   csrf_token: z.string().min(1),
   // Seconds left if the session is not used.
   expires_in: count,
+  // Open for a call starting now: the clinic's clock, or the override staff set.
   office_open: z.boolean(),
   time_zone: z.string().min(1),
+  // Whether the phone assistant takes new calls; every page shows a banner while it is off. Null
+  // when the settings could not be read (office_open is then the schedule's answer).
+  calls: z.enum(CALLS_VALUES).nullable(),
 });
 
 export const liveCallSchema = z.object({
@@ -143,6 +155,9 @@ export const turnSchema = z.object({
 });
 export const turnsSchema = z.object({ turns: z.array(turnSchema) });
 
+// Who marked a request handled, and when.
+const handledMark = z.object({ by: z.string().min(1), at: instant });
+
 export const queueItemSchema = z.object({
   id: count,
   created_at: instant,
@@ -152,8 +167,64 @@ export const queueItemSchema = z.object({
   patient_id: z.string().nullable(),
   callbacks: z.array(z.string().regex(MASKED_CALLBACK)),
   after_hours: z.boolean(),
+  handled: handledMark.nullable(),
 });
 export const queueSchema = z.object({ requests: z.array(queueItemSchema) });
+
+// The writes' answers (POST under a session, with the anti-forgery token).
+export const handledAnswerSchema = z.object({
+  source: z.literal("requests"),
+  id: count,
+  handled: handledMark,
+});
+
+// The one answer that carries a caller's own name and number. It is never cached, stored or
+// logged: the Requests page holds it in one row's component state, briefly.
+export const callbackDetailsSchema = z.object({
+  source: z.literal("requests"),
+  id: count,
+  callbacks: z
+    .array(z.object({ name: z.string().nullable(), callback_number: z.string().min(1).max(40) }))
+    .min(1),
+});
+
+const setting = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.object({
+    value: z.enum(values),
+    changed_by: z.string().nullable(),
+    changed_at: instant.nullable(),
+  });
+
+export const configSchema = z.object({
+  config: z.object({ calls: setting(CALLS_VALUES), office: setting(OFFICE_VALUES) }),
+  applies_within_seconds: count,
+  facts: z.object({
+    environment: z.string(),
+    model: z.string(),
+    speech_to_text: z.string(),
+    text_to_speech: z.string(),
+    max_concurrent_calls: count,
+    max_call_seconds: count,
+    test_clock: z.boolean(),
+  }),
+});
+
+export const configChangeSchema = z.discriminatedUnion("key", [
+  z.object({
+    key: z.literal("calls"),
+    value: z.enum(CALLS_VALUES),
+    changed_by: z.string().nullable(),
+    changed_at: instant.nullable(),
+    applies_within_seconds: count,
+  }),
+  z.object({
+    key: z.literal("office"),
+    value: z.enum(OFFICE_VALUES),
+    changed_by: z.string().nullable(),
+    changed_at: instant.nullable(),
+    applies_within_seconds: count,
+  }),
+]);
 
 export const appointmentSchema = z.object({
   id: count,
@@ -228,3 +299,7 @@ export type Guardrails = z.infer<typeof guardrailsSchema>;
 export type LatencyRow = z.infer<typeof latencyRowSchema>;
 export type Metrics = z.infer<typeof metricsSchema>;
 export type Verification = z.infer<typeof verificationSchema>;
+export type HandledMark = z.infer<typeof handledMark>;
+export type CallbackDetails = z.infer<typeof callbackDetailsSchema>["callbacks"];
+export type Config = z.infer<typeof configSchema>;
+export type ConfigChange = z.infer<typeof configChangeSchema>;

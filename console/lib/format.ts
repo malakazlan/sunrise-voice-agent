@@ -99,6 +99,13 @@ export function percent(part: number, whole: number): string {
   return whole === 0 ? "–" : `${Math.round((part / whole) * 100)}%`;
 }
 
+// A callback number set out for reading: ten digits (spaces aside) as "555 201 3344"; anything
+// else exactly as the API sent it. Nothing but the spacing is ever changed.
+export function phoneForReading(value: string): string {
+  const digits = value.replace(/\s/g, "");
+  return /^\d{10}$/.test(digits) ? `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}` : value;
+}
+
 export function plural(count: number, one: string, many = `${one}s`): string {
   return `${count.toLocaleString("en-US")} ${count === 1 ? one : many}`;
 }

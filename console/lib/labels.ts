@@ -126,6 +126,11 @@ export const AUDIT_ACTIONS = [
   "admin_read_call_detail",
   "admin_signed_in",
   "admin_signed_out",
+  "admin_marked_handled",
+  "admin_revealed_callback",
+  "admin_read_config",
+  "admin_changed_config",
+  "call_refused",
 ] as const;
 
 // The periods Guardrails and Metrics summarise: days at the clinic, today included.
